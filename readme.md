@@ -128,6 +128,8 @@ tex3d/
 - CUDA 11.7+ (tested on NVIDIA A100 80GB)
 - [MuJoCo](https://github.com/google-deepmind/mujoco) 2.3+
 
+> **⚠️ Recommendation:** We strongly recommend setting up each VLA model's environment by following its **official repository instructions** first, rather than installing everything into a single environment. Each model may have conflicting dependencies. Use Tex3D as an add-on within each model's own environment.
+
 ### Step 1 — Clone the Repository
 
 ```bash
@@ -135,26 +137,61 @@ git clone https://github.com/vla-attack/tex3d.git
 cd tex3d
 ```
 
-### Step 2 — Create a Virtual Environment
+### Step 2 — Set Up VLA Model Environments
+
+Please configure each model's environment **from its official repository** before integrating Tex3D:
+
+<details>
+<summary><strong>OpenVLA</strong></summary>
+
+Follow the official setup at: https://github.com/openvla/openvla
 
 ```bash
-conda create -n tex3d python=3.10 -y
-conda activate tex3d
-```
-
-### Step 3 — Install Core Dependencies
-
-```bash
+# After setting up OpenVLA's environment, install Tex3D dependencies into it:
 pip install -r requirements-min.txt
-```
-
-### Step 4 — Install Nvdiffrast (Differentiable Renderer)
-
-```bash
 pip install git+https://github.com/NVlabs/nvdiffrast.git
 ```
+</details>
 
-### Step 5 — Install LIBERO Benchmark
+<details>
+<summary><strong>OpenVLA-OFT</strong></summary>
+
+Follow the official setup at: https://github.com/moojink/openvla-oft
+
+```bash
+# After setting up OFT's environment, install Tex3D dependencies into it:
+pip install -r requirements-min.txt
+pip install git+https://github.com/NVlabs/nvdiffrast.git
+```
+</details>
+
+<details>
+<summary><strong>π0</strong></summary>
+
+Follow the official setup at: https://github.com/Physical-Intelligence/openpi
+
+```bash
+# After setting up π0's environment, install Tex3D dependencies into it:
+pip install -r requirements-min.txt
+pip install git+https://github.com/NVlabs/nvdiffrast.git
+```
+</details>
+
+<details>
+<summary><strong>π0.5</strong></summary>
+
+Follow the official setup at: https://github.com/Physical-Intelligence/openpi (see π0.5 branch/docs)
+
+```bash
+# After setting up π0.5's environment, install Tex3D dependencies into it:
+pip install -r requirements-min.txt
+pip install git+https://github.com/NVlabs/nvdiffrast.git
+```
+</details>
+
+### Step 3 — Install LIBERO Benchmark
+
+Install LIBERO into whichever model environment you are using:
 
 ```bash
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
@@ -162,34 +199,6 @@ cd LIBERO
 pip install -e .
 cd ..
 ```
-
-### Step 6 — Install VLA Models
-
-<details>
-<summary><strong>OpenVLA</strong></summary>
-
-```bash
-pip install git+https://github.com/openvla/openvla.git
-```
-</details>
-
-<details>
-<summary><strong>OpenVLA-OFT</strong></summary>
-
-```bash
-# Follow installation at: https://github.com/moojink/openvla-oft
-pip install transformers accelerate
-```
-</details>
-
-<details>
-<summary><strong>π0 / π0.5</strong></summary>
-
-```bash
-# Install Physical Intelligence's openpi
-pip install git+https://github.com/Physical-Intelligence/openpi.git
-```
-</details>
 
 ---
 
