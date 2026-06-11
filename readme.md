@@ -148,7 +148,6 @@ Follow the official setup at: https://github.com/openvla/openvla
 
 ```bash
 # After setting up OpenVLA's environment, install Tex3D dependencies into it:
-pip install -r requirements-min.txt
 pip install git+https://github.com/NVlabs/nvdiffrast.git
 ```
 </details>
@@ -160,7 +159,6 @@ Follow the official setup at: https://github.com/moojink/openvla-oft
 
 ```bash
 # After setting up OFT's environment, install Tex3D dependencies into it:
-pip install -r requirements-min.txt
 pip install git+https://github.com/NVlabs/nvdiffrast.git
 ```
 </details>
@@ -172,7 +170,6 @@ Follow the official setup at: https://github.com/Physical-Intelligence/openpi
 
 ```bash
 # After setting up π0's environment, install Tex3D dependencies into it:
-pip install -r requirements-min.txt
 pip install git+https://github.com/NVlabs/nvdiffrast.git
 ```
 </details>
@@ -184,7 +181,6 @@ Follow the official setup at: https://github.com/Physical-Intelligence/openpi (s
 
 ```bash
 # After setting up π0.5's environment, install Tex3D dependencies into it:
-pip install -r requirements-min.txt
 pip install git+https://github.com/NVlabs/nvdiffrast.git
 ```
 </details>
