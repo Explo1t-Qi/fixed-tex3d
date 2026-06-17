@@ -122,6 +122,8 @@ tex3d/
 
 ## ⚙️ Environment Setup
 
+> **📦 Docker image coming soon!** Our initial open-source release was put together in a bit of a rush, and we've since identified a few environment-related issues. We're working on packaging everything into a Docker image over the next couple of days to make setup much easier. If you can wait, we'd recommend holding off until then. If you need to get started right away, you can follow the manual setup steps below in the meantime.
+
 ### Prerequisites
 
 - Python 3.8+
