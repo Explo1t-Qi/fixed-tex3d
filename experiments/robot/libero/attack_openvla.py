@@ -5,8 +5,7 @@ import ctypes
 import traceback
 import time
 import json
-import math
-import random
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union, List
@@ -15,9 +14,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import tqdm
-import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast
-import torchvision
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 import draccus
@@ -27,7 +24,6 @@ import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from omegaconf import OmegaConf
 
 print("[INFO] Setting up OSMesa for CPU Rendering...")
 os.environ['MUJOCO_GL'] = 'osmesa'
@@ -38,14 +34,16 @@ try:
 except Exception as e:
     print(f"[WARNING] Failed to load libOSMesa.so: {e}")
 
-PATH_TO_LIBERO_ROOT = "/path/to/LIBERO"
-ASSET_ROOT_SCANNED  = "/path/to/LIBERO/libero/libero/assets/stable_scanned_objects"
-ASSET_ROOT_HOPE     = "/path/to/LIBERO/libero/libero/assets/stable_hope_objects"
+PATH_TO_LIBERO_ROOT = "/data/huangsimin/libero-eval"
+ASSET_ROOT_SCANNED  = "/data/huangsimin/libero-eval/libero/libero/assets/stable_scanned_objects"
+ASSET_ROOT_HOPE     = "/data/huangsimin/libero-eval/libero/libero/assets/stable_hope_objects"
 
 if PATH_TO_LIBERO_ROOT not in sys.path:
     sys.path.append(PATH_TO_LIBERO_ROOT)
 
 from libero.libero import benchmark
+import imageio
+
 
 sys.path.append(str(Path(__file__).parent))
 from libero_utils import (
@@ -53,6 +51,11 @@ from libero_utils import (
     quat2axisangle, save_rollout_video,
 )
 sys.path.append(str(Path(__file__).parent.parent))
+
+OPENVLA_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if OPENVLA_REPO_ROOT not in sys.path:
+    sys.path.insert(0, OPENVLA_REPO_ROOT)
+
 from openvla_utils import get_processor
 from robot_utils import (
     DATE_TIME, get_action, get_image_resize_size, get_model,
@@ -161,17 +164,19 @@ def parse_mesh_scale(xml_path: str) -> List[float]:
 
 class DifferentiableRenderer(nn.Module):
     def __init__(self, mesh_path, orig_texture_path=None, device="cuda",
-                 scale_xyz=None, pos_offset=None, epsilon=128.0 / 255.0):
+                 scale_xyz=None, pos_offset=None, epsilon=64.0 / 255.0):
         super().__init__()
         self.device = device
         self.epsilon = epsilon
-        self.texture_res = 256
+        self.tex_h = 256
+        self.tex_w = 256
         self.pos_offset = torch.tensor(
-            pos_offset or [0.0, 0.0, 0.005], dtype=torch.float32, device=device
+            pos_offset or [0.01, 0.01, 0.025], dtype=torch.float32, device=device
         )
 
         if scale_xyz is None:
             scale_xyz = [1.0, 1.0, 1.0]
+            
         scale_arr = np.array(scale_xyz, dtype=np.float64)
 
         try:
@@ -217,74 +222,220 @@ class DifferentiableRenderer(nn.Module):
         self.glctx = dr.RasterizeCudaContext()
 
         if orig_texture_path and os.path.exists(orig_texture_path):
-            img = (Image.open(orig_texture_path).convert("RGB")
-                        .resize((self.texture_res, self.texture_res))
-                        .transpose(Image.FLIP_TOP_BOTTOM))
+            img_raw = Image.open(orig_texture_path).convert("RGB")
+            self.tex_w, self.tex_h = img_raw.size
+            img = img_raw.transpose(Image.FLIP_TOP_BOTTOM)
             tex = torch.from_numpy(np.array(img)).float() / 255.0
             self.register_buffer("orig_texture",
                 tex.unsqueeze(0).to(device).contiguous())
         else:
             fb = (torch.tensor([0.45, 0.45, 0.45], device=device)
                     .view(1, 1, 1, 3)
-                    .expand(1, self.texture_res, self.texture_res, 3)
+                    .expand(1, self.tex_h, self.tex_w, 3)
                     .contiguous())
             self.register_buffer("orig_texture", fb)
 
-        self.adv_vc_noise = nn.Parameter(
-            torch.zeros((self.num_vertices, 3), dtype=torch.float32, device=device)
+        orig_vc = self._sample_uv_texture_at_vertices()
+        self.register_buffer("orig_vertex_colors", orig_vc)
+        self.adv_noise = nn.Parameter(
+            torch.zeros(self.num_vertices, 3, dtype=torch.float32, device=device)
         )
         self.light_dir = F.normalize(
-            torch.tensor([0.5, 0.5, 1.0], device=device), dim=0
+            torch.tensor([0.2, 0.2, 1.0], device=device), dim=0
         )
+        self.register_buffer("calib_scale", torch.ones(3, device=device))
+        self.register_buffer("calib_bias",  torch.zeros(3, device=device))
+        self.register_buffer("calib_gamma", torch.ones(3, device=device))
+        self.ambient_strength = 0.42
+        self.diffuse_strength = 0.48
+        self.specular_strength = 0.05
+        self.specular_shininess = 24.0
+        self.shadow_strength = 0.15
+        self.shadow_gamma = 1.8
+        self.min_light = 0.16
+
+    def _sample_uv_texture_at_vertices(self):
+        """把 UV 纹理采样到每个顶点，得到每顶点基础颜色 [N_verts, 3]。"""
+        with torch.no_grad():
+            if len(self.uv) == self.num_vertices:
+                uv_verts = self.uv
+            else:
+                uv_sum   = torch.zeros(self.num_vertices, 2, device=self.device)
+                uv_count = torch.zeros(self.num_vertices, 1, device=self.device)
+                face_vi  = self.faces.long()
+                face_ui  = self.uv_idx.long()
+                ones_f   = torch.ones(len(face_vi), 1, device=self.device)
+                for local in range(3):
+                    vi = face_vi[:, local]
+                    ui = face_ui[:, local]
+                    uv_sum.scatter_add_(0, vi.unsqueeze(1).expand(-1, 2), self.uv[ui])
+                    uv_count.scatter_add_(0, vi.unsqueeze(1), ones_f)
+                uv_verts = uv_sum / uv_count.clamp_min(1)
+
+            uv_query = uv_verts.unsqueeze(0).unsqueeze(0)
+            colors   = dr.texture(self.orig_texture.contiguous(),
+                                  uv_query.contiguous(), filter_mode="linear")
+            return colors.squeeze(0).squeeze(0).contiguous()
 
     def get_texture_param(self):
-        return self.adv_vc_noise
+        return self.adv_noise
 
     def reset_texture(self):
         with torch.no_grad():
-            self.adv_vc_noise.data.fill_(0.0)
+            self.adv_noise.data.fill_(0.0)
 
-    def render(self, mvp, resolution=(256, 256), return_clean=False):
+    def calibrate_lighting(self, mvp, mujoco_clean_rgb, ema: float = 0.0, model_rot=None):
+        """
+        用同一帧、同一姿态下真实 MuJoCo 渲染出的干净图(mujoco_clean_rgb，
+        [1,3,H,W]，取值0~1)，对 nvdiffrast 自己那套简化光照做一次性的逐通道
+        gamma+仿射校准(y ≈ a*x^g + b)，强制把训练时看到的渲染结果对齐到 MuJoCo 实际
+        渲染的亮度/色调上，而不是让两边各算各的。
+        """
+        with torch.no_grad():
+            H, W = mujoco_clean_rgb.shape[-2], mujoco_clean_rgb.shape[-1]
+            _, clean_lit, mask = self.render(mvp, resolution=(H, W), return_clean=True,
+                                             model_rot=model_rot)
+            m      = (mask.squeeze(0).squeeze(-1) > 0.5)
+            pred   = clean_lit.squeeze(0)
+            target = mujoco_clean_rgb.squeeze(0).permute(1, 2, 0)
+
+            if m.sum() < 50:
+                print("[WARN] 光照校准: 目标物体在画面里的像素太少，跳过校准，沿用默认光照参数。")
+                return
+
+            scales, biases, gammas = [], [], []
+            for c in range(3):
+                x = pred[..., c][m].clamp(1e-4, 1.0 - 1e-4)
+                y = target[..., c][m]
+                gamma_grid = torch.tensor(
+                    [1.00, 1.15, 1.30, 1.45, 1.60], device=x.device, dtype=x.dtype
+                )
+                best_err = None
+                best_a = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+                best_b = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                best_g = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+                for g in gamma_grid:
+                    xg = x.pow(g)
+                    x_mean, y_mean = xg.mean(), y.mean()
+                    denom = ((xg - x_mean) ** 2).sum().clamp_min(1e-6)
+                    a = (((xg - x_mean) * (y - y_mean)).sum() / denom).clamp(0.85, 1.35)
+                    b = (y_mean - a * x_mean).clamp(-0.12, 0.0)
+                    y_hat = torch.clamp(a * xg + b, 0.0, 1.0)
+                    err = F.mse_loss(y_hat, y)
+                    if best_err is None or err < best_err:
+                        best_err = err
+                        best_a = a
+                        best_b = b
+                        best_g = g
+                scales.append(best_a)
+                biases.append(best_b)
+                gammas.append(best_g)
+
+            new_scale = torch.stack(scales).to(self.calib_scale.device)
+            new_bias = torch.stack(biases).to(self.calib_bias.device)
+            new_gamma = torch.stack(gammas).to(self.calib_gamma.device)
+
+            if ema > 0.0:
+                m_ = float(max(0.0, min(0.999, ema)))
+                self.calib_scale = m_ * self.calib_scale + (1.0 - m_) * new_scale
+                self.calib_bias = m_ * self.calib_bias + (1.0 - m_) * new_bias
+                self.calib_gamma = m_ * self.calib_gamma + (1.0 - m_) * new_gamma
+            else:
+                self.calib_scale = new_scale
+                self.calib_bias = new_bias
+                self.calib_gamma = new_gamma
+            self.calib_bias = self.calib_bias.clamp(-0.12, 0.0)
+            print(f"[INFO] nvdiffrast↔MuJoCo 亮度校准完成: "
+                  f"scale={[round(v, 3) for v in self.calib_scale.tolist()]}, "
+                  f"bias={[round(v, 3) for v in self.calib_bias.tolist()]}, "
+                  f"gamma={[round(v, 3) for v in self.calib_gamma.tolist()]}")
+
+    def render(self, mvp, resolution=(256, 256), return_clean=False, model_rot=None):
         pos      = self.pos + self.pos_offset
         pos_homo = torch.cat([pos, torch.ones_like(pos[..., :1])], dim=-1)
         pos_clip = torch.matmul(pos_homo, mvp.t())
 
-        rast, _      = dr.rasterize(self.glctx, pos_clip.unsqueeze(0),
-                                    self.faces, resolution=resolution)
-        tex_uv, _    = dr.interpolate(self.uv.unsqueeze(0), rast, self.uv_idx)
-        clean_color  = dr.texture(self.orig_texture.contiguous(),
-                                  tex_uv.contiguous(), filter_mode="linear")
+        rast, _ = dr.rasterize(self.glctx, pos_clip.unsqueeze(0),
+                                self.faces, resolution=resolution)
 
-        noise        = torch.tanh(self.adv_vc_noise) * self.epsilon
-        noise_interp, _ = dr.interpolate(noise.unsqueeze(0).contiguous(), rast, self.faces)
-        adv_color    = torch.clamp(clean_color + noise_interp, 0.0, 1.0)
+        noise_param = torch.tanh(self.adv_noise) * self.epsilon
+        adv_vc_raw  = self.orig_vertex_colors + noise_param
+        adv_vc      = adv_vc_raw + (adv_vc_raw.clamp(0, 1) - adv_vc_raw).detach()
 
-        vn_interp, _ = dr.interpolate(self.vn.unsqueeze(0), rast, self.faces)
-        vn_interp    = F.normalize(vn_interp, p=2, dim=-1)
-        diffuse      = torch.clamp(
-            (vn_interp * self.light_dir.view(1, 1, 1, 3)).sum(-1, keepdim=True),
-            0.0, 1.0
+        clean_color, _ = dr.interpolate(
+            self.orig_vertex_colors.unsqueeze(0).contiguous(), rast, self.faces)
+        adv_color, _   = dr.interpolate(
+            adv_vc.unsqueeze(0).contiguous(), rast, self.faces)
+
+        vn_world = (model_rot @ self.vn.T).T if model_rot is not None else self.vn
+        vn_interp, _ = dr.interpolate(vn_world.unsqueeze(0).contiguous(), rast, self.faces)
+        nrm = F.normalize(vn_interp, dim=-1, eps=1e-6)
+
+        l = self.light_dir.view(1, 1, 1, 3)
+        v = F.normalize(torch.tensor([0.0, 0.0, 1.0], device=nrm.device), dim=0).view(1, 1, 1, 3)
+        h = F.normalize(l + v, dim=-1, eps=1e-6)
+        ndotl = torch.clamp((nrm * l).sum(dim=-1, keepdim=True), 0.0, 1.0)
+        ndoth = torch.clamp((nrm * h).sum(dim=-1, keepdim=True), 0.0, 1.0)
+        spec  = ndoth.pow(self.specular_shininess)
+        light = (
+            self.ambient_strength
+            + self.diffuse_strength * ndotl
+            + self.specular_strength * spec
         )
-        lighting = 0.6 + 0.4 * diffuse
+        shadow_mask = (1.0 - ndotl).clamp(0.0, 1.0).pow(self.shadow_gamma)
+        light = light * (1.0 - self.shadow_strength * shadow_mask)
+        light = torch.clamp(light, self.min_light, 1.35)
+
+        clean_shaded = torch.clamp(clean_color * light, 0.0, 1.0)
+        adv_shaded   = torch.clamp(adv_color   * light, 0.0, 1.0)
+
+        calib_scale = self.calib_scale.view(1, 1, 1, 3)
+        calib_bias  = self.calib_bias.view(1, 1, 1, 3)
+        calib_gamma = self.calib_gamma.view(1, 1, 1, 3)
+        clean_base = torch.clamp(clean_shaded, 1e-6, 1.0).pow(calib_gamma)
+        clean_lit  = torch.clamp(clean_base * calib_scale + calib_bias, 0.0, 1.0)
+        adv_base   = torch.clamp(adv_shaded,  1e-6, 1.0).pow(calib_gamma)
+        adv_lit    = torch.clamp(adv_base   * calib_scale + calib_bias, 0.0, 1.0)
 
         mask = (rast[..., 3] > 0).float().unsqueeze(-1)
         if return_clean:
-            return adv_color * lighting, clean_color * lighting, mask
-        return adv_color * lighting, mask
+            return adv_lit, clean_lit, mask
+        return adv_lit, mask
 
     def get_baked_adv_texture(self):
+        """UV-space 光栅化：把对抗顶点颜色完整 bake 到 UV atlas，覆盖全 UV 岛。"""
         with torch.no_grad():
-            uv_clip = self.uv * 2.0 - 1.0
-            uv4     = torch.cat([uv_clip,
-                                  torch.zeros_like(uv_clip[..., :1]),
-                                  torch.ones_like(uv_clip[..., :1])], dim=-1)
-            rast, _ = dr.rasterize(self.glctx, uv4.unsqueeze(0), self.uv_idx,
-                                    resolution=(self.texture_res, self.texture_res))
-            noise   = torch.tanh(self.adv_vc_noise) * self.epsilon
-            baked, _ = dr.interpolate(noise.unsqueeze(0).contiguous(), rast, self.faces)
-            mask    = (rast[..., 3] > 0).float().unsqueeze(-1)
-            result  = torch.clamp(self.orig_texture + baked * mask, 0.0, 1.0)
-            return torch.flip(result, dims=[1])
+            noise_param = torch.tanh(self.adv_noise) * self.epsilon
+            adv_vc = (self.orig_vertex_colors + noise_param).clamp(0, 1)
+
+            H, W   = self.tex_h, self.tex_w
+            n_uv   = self.uv.shape[0]
+            device = self.device
+
+            uv_to_pos = torch.zeros(n_uv, dtype=torch.long, device=device)
+            face_vi = self.faces.long()
+            face_ui = self.uv_idx.long()
+            for c in range(3):
+                uv_to_pos[face_ui[:, c]] = face_vi[:, c]
+            uv_vc = adv_vc[uv_to_pos]
+
+            uv = self.uv
+            uv_clip = torch.zeros(n_uv, 4, device=device)
+            uv_clip[:, 0] = 2.0 * uv[:, 0] - 1.0
+            uv_clip[:, 1] = 2.0 * uv[:, 1] - 1.0
+            uv_clip[:, 3] = 1.0
+
+            rast_uv, _ = dr.rasterize(self.glctx, uv_clip.unsqueeze(0),
+                                       self.uv_idx.int(), resolution=[H, W])
+
+            baked_colors, _ = dr.interpolate(
+                uv_vc.unsqueeze(0).contiguous(), rast_uv, self.uv_idx.int()
+            )
+
+            mask = (rast_uv[..., 3] > 0).unsqueeze(-1).float()
+            baked = mask * baked_colors + (1.0 - mask) * self.orig_texture
+
+            return torch.flip(baked, dims=[1])
 
     def bake_vertex_colors_to_texture(self, resolution=(256, 256)):
         return self.get_baked_adv_texture()
@@ -343,7 +494,13 @@ def get_target_model_matrix(env, search_keywords_list: List[List[str]]):
     return torch.from_numpy(mat).cuda(), target_body_id, found_name
 
 
-def get_render_mvp_from_matrix(env, model_matrix, resolution=(256, 256)):
+def get_render_mvp_from_matrix(
+    env,
+    model_matrix,
+    resolution=(256, 256),
+    proj_flip_x: float = -1.0,
+    proj_flip_y: float = -1.0,
+):
     sim = env.sim if not hasattr(env, "unwrapped") else env.unwrapped.sim
     W, H = resolution
 
@@ -367,8 +524,8 @@ def get_render_mvp_from_matrix(env, model_matrix, resolution=(256, 256)):
     f = 1.0 / np.tan(np.deg2rad(fovy_deg) / 2.0)
 
     proj_mtx = np.zeros((4, 4), dtype=np.float32)
-    proj_mtx[0, 0] = -f / aspect
-    proj_mtx[1, 1] = -f
+    proj_mtx[0, 0] = proj_flip_x * f / aspect
+    proj_mtx[1, 1] = proj_flip_y * f
     proj_mtx[2, 2] = (far + near) / (near - far)
     proj_mtx[2, 3] = (2 * far * near) / (near - far)
     proj_mtx[3, 2] = -1.0
@@ -380,128 +537,39 @@ def get_render_mvp_from_matrix(env, model_matrix, resolution=(256, 256)):
     )
 
 
-def render_and_composite(renderer, bg_tensor, mvp, resolution=(256, 256)):
+def _render_bg_without_target(env, body_id: int, resolution: int):
+    """临时把目标 body 所有 geom 的 alpha 设为 0，渲一帧无目标物体的背景，渲完立刻还原。
+    不影响物理状态/obs，MuJoCo 原生视频/物理推进完全不受影响。"""
+    sim = env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
+    geom_ids = [g for g in range(sim.model.ngeom) if sim.model.geom_bodyid[g] == body_id]
+    if not geom_ids:
+        return None
+    orig_alpha = [float(sim.model.geom_rgba[g, 3]) for g in geom_ids]
+    try:
+        for g in geom_ids:
+            sim.model.geom_rgba[g, 3] = 0.0
+        img = sim.render(width=resolution, height=resolution, camera_name="agentview", mode="offscreen")
+        img = img[::-1, ::-1]
+    finally:
+        for g, a in zip(geom_ids, orig_alpha):
+            sim.model.geom_rgba[g, 3] = a
+    return img
+
+
+def _composite(adv_rgba, mask, bg_tensor):
+    """标准 alpha 合成：nvdiffrast 碗叠在（已无碗的）背景上。"""
+    mask_t = mask.permute(0, 3, 1, 2)
+    return torch.clamp(
+        adv_rgba.permute(0, 3, 1, 2) * mask_t + bg_tensor * (1 - mask_t),
+        0.0, 1.0,
+    )
+
+
+def render_and_composite(renderer, bg_tensor, mvp, resolution=(256, 256), model_rot=None):
     if mvp is None:
         return bg_tensor
-    adv_rgba, mask = renderer.render(mvp, resolution=resolution)
-    adv_rgb  = adv_rgba.permute(0, 3, 1, 2)
-    mask_t   = mask.permute(0, 3, 1, 2)
-    return torch.clamp(adv_rgb * mask_t + bg_tensor * (1 - mask_t), 0.0, 1.0)
-
-
-def load_latent_encoder(config_path: str, ckpt_path: str, device):
-    for taming_root in [Path("./taming-transformers"), Path("./taming-transformers-master")]:
-        if taming_root.exists():
-            s = str(taming_root.resolve())
-            if s not in sys.path:
-                sys.path.insert(0, s)
-            break
-
-    from taming.models.vqgan import VQModel
-
-    cfg = OmegaConf.load(config_path)
-    model_cfg = cfg.model.params if "model" in cfg and "params" in cfg.model else cfg.model
-    latent_model = VQModel(**model_cfg)
-
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    latent_model.load_state_dict(state_dict, strict=False)
-    latent_model.eval().to(device)
-    for p in latent_model.parameters():
-        p.requires_grad = False
-    return latent_model.encoder
-
-
-def extract_latent(encoder, img_np: np.ndarray, device) -> torch.Tensor:
-    img = Image.fromarray(img_np).resize((256, 256))
-    x = torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0).to(device)
-    x = x.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
-    with torch.no_grad():
-        feat = encoder(x).mean(dim=[2, 3]).squeeze(0)
-    return feat.detach()
-
-
-def compute_frame_weights(latent_features: List[torch.Tensor], tau: float) -> torch.Tensor:
-    if len(latent_features) == 0:
-        return torch.tensor([], dtype=torch.float32)
-    if len(latent_features) == 1:
-        return torch.ones(1, dtype=torch.float32)
-
-    feats  = [f.detach().float() for f in latent_features]
-    device = feats[0].device
-    n      = len(feats)
-
-    v = torch.zeros(n, device=device)
-    a = torch.zeros(n, device=device)
-    for t in range(1, n):
-        v[t] = torch.norm(feats[t] - feats[t - 1], p=2) / 2.0
-    for t in range(1, n):
-        a[t] = torch.abs(v[t] - v[t - 1])
-
-    def _minmax(x):
-        return (x - x.min()) / torch.clamp(x.max() - x.min(), min=1e-8)
-
-    s = torch.maximum(_minmax(v), _minmax(a))
-    w = torch.softmax(s / float(max(tau, 1e-6)), dim=0)
-    return w.detach()
-
-
-def _gaussian_kernel2d(kernel_size: int, sigma: float, device, dtype):
-    radius = kernel_size // 2
-    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    g = torch.exp(-0.5 * (x / sigma) ** 2)
-    g = g / g.sum()
-    k2d = torch.outer(g, g)
-    return k2d / k2d.sum()
-
-
-def apply_eot_2d(img_tensor: torch.Tensor) -> torch.Tensor:
-    device, dtype = img_tensor.device, img_tensor.dtype
-    b = random.uniform(-0.2, 0.2)
-    c = random.uniform(0.8, 1.2)
-    m = img_tensor.mean(dim=(2, 3), keepdim=True)
-    y = (img_tensor - m) * c + m + b
-    k     = random.choice([3, 5])
-    sigma = random.uniform(0.5, 1.5)
-    kern  = _gaussian_kernel2d(k, sigma, device=device, dtype=dtype)
-    kern  = kern.view(1, 1, k, k).repeat(3, 1, 1, 1)
-    y = F.conv2d(y, kern, padding=k // 2, groups=3)
-    return torch.clamp(y, 0.0, 1.0)
-
-
-def perturb_mvp(
-    mvp: torch.Tensor,
-    rot_std_deg: float = 5.0,
-    trans_std: float   = 0.02,
-    scale_range: tuple = (0.9, 1.1),
-) -> torch.Tensor:
-    device, dtype = mvp.device, mvp.dtype
-    angles = torch.randn(3, device=device, dtype=dtype) * math.radians(rot_std_deg)
-    cx, cy, cz = torch.cos(angles[0]), torch.cos(angles[1]), torch.cos(angles[2])
-    sx, sy, sz = torch.sin(angles[0]), torch.sin(angles[1]), torch.sin(angles[2])
-
-    Rx = torch.eye(4, device=device, dtype=dtype)
-    Rx[1, 1] = cx;  Rx[1, 2] = -sx
-    Rx[2, 1] = sx;  Rx[2, 2] =  cx
-
-    Ry = torch.eye(4, device=device, dtype=dtype)
-    Ry[0, 0] = cy;  Ry[0, 2] =  sy
-    Ry[2, 0] = -sy; Ry[2, 2] =  cy
-
-    Rz = torch.eye(4, device=device, dtype=dtype)
-    Rz[0, 0] = cz;  Rz[0, 1] = -sz
-    Rz[1, 0] = sz;  Rz[1, 1] =  cz
-
-    T = torch.eye(4, device=device, dtype=dtype)
-    T[:3, 3] = torch.randn(3, device=device, dtype=dtype) * trans_std
-
-    scale = random.uniform(*scale_range)
-    S = torch.eye(4, device=device, dtype=dtype)
-    S[0, 0] = S[1, 1] = S[2, 2] = scale
-
-    return mvp @ Rz @ Ry @ Rx @ T @ S
-
-
+    adv_rgba, mask = renderer.render(mvp, resolution=resolution, model_rot=model_rot)
+    return _composite(adv_rgba, mask, bg_tensor)
 def get_attack_loss(logits, clean_labels):
     ACTION_START = 31744
     ACTION_END   = 32000
@@ -530,83 +598,32 @@ def get_attack_loss(logits, clean_labels):
     return F.cross_entropy(action_logits, opposite_bins)
 
 
-def get_uada_loss_and_metric(logits, labels):
-    ACTION_START, ACTION_END, NUM_BINS = 31744, 32000, 256
-    if logits.shape[1] > labels.shape[1]:
-        logits = logits[:, -labels.shape[1]:, :]
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous().to(logits.device)
-    action_mask  = (
-        (shift_labels >= ACTION_START) &
-        (shift_labels <  ACTION_END)   &
-        (shift_labels != -100)
+def decode_action_from_generated_ids(model, generated_ids, unnorm_key=None):
+    """
+    复刻 `OpenVLAForActionPrediction.predict_action()` 解码尾部的逻辑：把 `generate()`
+    输出的完整 token 序列里最后 action_dim 个 token，解码成反归一化后的连续动作向量。
+    跟真实推理路径(`get_action`/`get_vla_action`)用的完全是同一套反归一化统计量，
+    只是这里直接接收已经生成好的 token id，方便复用 clean / adversarial 两种场景。
+    """
+    action_dim = model.get_action_dim(unnorm_key)
+    predicted_action_token_ids = generated_ids[0, -action_dim:].detach().cpu().numpy()
+    discretized_actions = model.vocab_size - predicted_action_token_ids
+    discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=model.bin_centers.shape[0] - 1)
+    normalized_actions = model.bin_centers[discretized_actions]
+
+    action_norm_stats = model.get_action_stats(unnorm_key)
+    mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+    action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+    return np.where(
+        mask,
+        0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+        normalized_actions,
     )
-    if not action_mask.any():
-        return torch.tensor(0.0, device=logits.device, requires_grad=True), 0.0
-
-    valid_logits  = shift_logits[action_mask]
-    valid_labels  = shift_labels[action_mask]
-    action_logits = (valid_logits[:, :NUM_BINS]
-                     if valid_logits.shape[-1] <= ACTION_END
-                     else valid_logits[:, ACTION_START:ACTION_END])
-
-    probs       = F.softmax(action_logits, dim=-1)
-    reweigh     = torch.arange(1, NUM_BINS + 1, device=logits.device) / float(NUM_BINS)
-    pred_values = (probs * reweigh).sum(dim=-1)
-
-    target_values = torch.zeros_like(pred_values)
-    target_values[valid_labels >  (ACTION_START + NUM_BINS / 2)] = 1.0 / NUM_BINS
-    target_values[valid_labels <= (ACTION_START + NUM_BINS / 2)] = 1.0
-
-    return F.mse_loss(pred_values, target_values), 0.0
-
-
-def _build_adv_samples(
-    cfg, renderer, fdata, RENDER_RES: int
-) -> List[torch.Tensor]:
-    """
-    根据 cfg.use_eot / cfg.eot_mode 构造 adv 图像列表。
-    返回 List of [1,3,H,W]，每个元素保持梯度。
-    eot_mode:
-        "none"  — 不做 EoT，返回单张标准渲染图
-        "2d"    — 只做 2D 图像增强（brightness/contrast/blur）
-        "3d"    — 只做 3D MVP 扰动（视角/平移/缩放）
-        "both"  — 3D 扰动 + 2D 增强
-    """
-    if not cfg.use_eot:
-        adv_rgba, mask = renderer.render(fdata["mvp"], resolution=(RENDER_RES, RENDER_RES))
-        adv = torch.clamp(
-            adv_rgba.permute(0, 3, 1, 2) * mask.permute(0, 3, 1, 2)
-            + fdata["bg_tensor"] * (1 - mask.permute(0, 3, 1, 2)),
-            0.0, 1.0,
-        )
-        return [adv]
-
-    samples = []
-    for _ in range(cfg.eot_num_samples):
-        if cfg.eot_mode in ("3d", "both"):
-            mvp_use = perturb_mvp(
-                fdata["mvp"],
-                rot_std_deg=cfg.eot_rot_std_deg,
-                trans_std=cfg.eot_trans_std,
-                scale_range=(cfg.eot_scale_min, cfg.eot_scale_max),
-            )
-        else:
-            mvp_use = fdata["mvp"]
-
-        adv_rgba, mask = renderer.render(mvp_use, resolution=(RENDER_RES, RENDER_RES))
-        adv = torch.clamp(
-            adv_rgba.permute(0, 3, 1, 2) * mask.permute(0, 3, 1, 2)
-            + fdata["bg_tensor"] * (1 - mask.permute(0, 3, 1, 2)),
-            0.0, 1.0,
-        )
-
-        if cfg.eot_mode in ("2d", "both"):
-            adv = apply_eot_2d(adv)
-
-        samples.append(adv)
-
-    return samples
+def _build_adv_samples(renderer, fdata, RENDER_RES: int) -> List[torch.Tensor]:
+    adv_rgba, mask = renderer.render(fdata["mvp"], resolution=(RENDER_RES, RENDER_RES),
+                                     model_rot=fdata.get("model_rot"))
+    bg = fdata.get("bg_tensor_no_obj") if fdata.get("bg_tensor_no_obj") is not None else fdata["bg_tensor"]
+    return [_composite(adv_rgba, mask, bg)]
 
 
 def train_adversarial_texture(
@@ -614,123 +631,318 @@ def train_adversarial_texture(
     initial_obs_state, task, task_description,
     save_dir, episode_idx,
     search_keywords_list: List[List[str]],
+    xml_path,
     num_iters=20,
+    init_states=None,
 ):
-    print(f"[ATTACK] Training Ep {episode_idx} | TAAO + EoT({cfg.eot_mode}) "
-          f"| {cfg.num_frames_to_attack}-Frame Optimization...")
+    print(f"[ATTACK] Training Ep {episode_idx} | {cfg.num_frames_to_attack}-Frame Optimization...")
     os.makedirs(save_dir, exist_ok=True)
 
     RENDER_RES       = 256
     model_input_size = get_image_resize_size(cfg)
     device           = model.device
 
-    env, _ = get_libero_env(task, cfg.model_family, resolution=RENDER_RES)
-    env.reset()
-    obs = env.set_init_state(initial_obs_state)
-    env.env.sim.forward()
-
     siglip_mean = torch.tensor([0.5,   0.5,   0.5  ], device=device).view(1, 3, 1, 1)
     siglip_std  = torch.tensor([0.5,   0.5,   0.5  ], device=device).view(1, 3, 1, 1)
     dino_mean   = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     dino_std    = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-    latent_encoder = load_latent_encoder(
-        cfg.latent_encoder_config, cfg.latent_encoder_ckpt, device
-    )
+    _avail = init_states if (init_states is not None and len(init_states) > 0) else [initial_obs_state]
+    n_train_states   = min(cfg.num_train_init_states, len(_avail))
+    train_states     = [_avail[i] for i in range(n_train_states)]
+    frames_per_state = max(1, cfg.train_frames_per_state)
+    print(f"[ATTACK] 采帧策略: {n_train_states} 个 init_state × {frames_per_state} 帧 = pool {n_train_states * frames_per_state} 帧，"
+          f"每次迭代随机抽 {cfg.num_frames_to_attack} 帧")
 
-    num_frames = cfg.num_frames_to_attack
-    frame_data = []
-    print(f"[INFO] Collecting {num_frames} frames...")
+    frame_data   = []
+    calib_done   = False
+    calib_count  = 0
 
-    for t in range(num_frames):
-        img_np = get_libero_image(obs, RENDER_RES)
-        if cfg.save_attack_artifacts and t == 0:
-            Image.fromarray(img_np).save(
-                os.path.join(save_dir, f"Ep{episode_idx}_Original_F0.png")
+    for _si, _train_state in enumerate(train_states):
+        print(f"[ATTACK] ── init_state {_si} / {n_train_states} ──")
+        env, _ = get_libero_env(task, cfg.model_family, resolution=RENDER_RES)
+        env.reset()
+        obs = env.set_init_state(_train_state)
+        env.env.sim.forward()
+
+        if cfg.frame_collect_with_policy:
+            for _ in range(cfg.num_steps_wait):
+                obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
+
+        if cfg.collect_grasp_frames:
+            state_frames = deque(maxlen=cfg.grasp_pre_frames)
+            loop_max     = cfg.grasp_max_steps
+            print(f"[INFO] Grasp-window mode: 最多跑 {loop_max} 步，ring buffer={cfg.grasp_pre_frames}")
+        else:
+            state_frames = []
+            loop_max     = frames_per_state
+            print(f"[INFO] Collecting {frames_per_state} frames from state {_si}...")
+
+        grasp_detected = False
+        post_count     = 0
+
+        for t in range(loop_max):
+            img_np = get_libero_image(obs, RENDER_RES)
+            bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
+                         ).permute(2, 0, 1).unsqueeze(0)
+
+            model_matrix, body_id, found_name = get_target_model_matrix(env, search_keywords_list)
+            mvp = (get_render_mvp_from_matrix(env, model_matrix, resolution=(RENDER_RES, RENDER_RES))
+                   if body_id != -1 else None)
+            if body_id != -1:
+                print(f"  [状态{_si} 步{t}] 目标 body: '{found_name}'")
+            else:
+                print(f"  [状态{_si} 步{t}] 未找到目标 body")
+
+            _bg_no_obj_np = _render_bg_without_target(env, body_id, RENDER_RES) if body_id != -1 else None
+            bg_tensor_no_obj = (
+                (torch.from_numpy(_bg_no_obj_np.copy()).float().to(device) / 255.0
+                 ).permute(2, 0, 1).unsqueeze(0)
+                if _bg_no_obj_np is not None else None
             )
 
-        bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
-                     ).permute(2, 0, 1).unsqueeze(0)
+            if mvp is not None and not calib_done and calib_count < cfg.photometric_calib_frames:
+                renderer.calibrate_lighting(mvp, bg_tensor, ema=(0.8 if calib_count > 0 else 0.0),
+                                            model_rot=model_matrix[:3, :3])
+                calib_count += 1
+                if calib_count >= cfg.photometric_calib_frames:
+                    calib_done = True
 
-        model_matrix, body_id, found_name = get_target_model_matrix(env, search_keywords_list)
-        mvp = (get_render_mvp_from_matrix(env, model_matrix, resolution=(RENDER_RES, RENDER_RES))
-               if body_id != -1 else None)
-        if body_id != -1:
-            print(f"  [帧 {t}] 找到目标 body: '{found_name}'")
-        else:
-            print(f"  [帧 {t}] 未找到目标 body")
+            image_pil    = Image.fromarray(img_np).resize((model_input_size, model_input_size))
+            prompt       = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
+            clean_inputs = processor(prompt, images=image_pil).to(device)
+            if "pixel_values" in clean_inputs:
+                clean_inputs["pixel_values"] = clean_inputs["pixel_values"].to(torch.bfloat16)
 
-        image_pil    = Image.fromarray(img_np).resize((model_input_size, model_input_size))
-        prompt       = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
-        clean_inputs = processor(prompt, images=image_pil).to(device)
-        if "pixel_values" in clean_inputs:
-            clean_inputs["pixel_values"] = clean_inputs["pixel_values"].to(torch.bfloat16)
+            with torch.no_grad():
+                with autocast(dtype=torch.bfloat16):
+                    clean_output_ids = model.generate(
+                        **clean_inputs, max_new_tokens=7,
+                        do_sample=False,
+                        pad_token_id=processor.tokenizer.pad_token_id,
+                    )
+                    clean_224 = F.interpolate(bg_tensor, size=(model_input_size, model_input_size),
+                                               mode="bilinear", align_corners=False)
+                    clean_pv  = torch.cat(
+                        [(clean_224 - siglip_mean) / siglip_std,
+                         (clean_224 - dino_mean)   / dino_std], dim=1
+                    ).to(torch.bfloat16)
+                    clean_fwd = model(
+                        input_ids=clean_output_ids,
+                        attention_mask=torch.ones_like(clean_output_ids),
+                        pixel_values=clean_pv,
+                        output_hidden_states=True,
+                    )
+                    clean_hidden = clean_fwd.hidden_states[-1].detach()
+                    clean_action = decode_action_from_generated_ids(model, clean_output_ids, cfg.unnorm_key)
+            executed_action = None
+            if cfg.frame_collect_with_policy:
+                executed_action = normalize_gripper_action(clean_action.copy(), binarize=True)
+                if cfg.model_family == "openvla":
+                    executed_action = invert_gripper_action(executed_action)
 
-        with torch.no_grad():
-            with autocast(dtype=torch.bfloat16):
-                clean_output_ids = model.generate(
-                    **clean_inputs, max_new_tokens=7,
-                    do_sample=False,
-                    pad_token_id=processor.tokenizer.pad_token_id,
-                )
-                clean_224 = F.interpolate(bg_tensor, size=(model_input_size, model_input_size),
-                                           mode="bilinear", align_corners=False)
-                clean_pv  = torch.cat(
-                    [(clean_224 - siglip_mean) / siglip_std,
-                     (clean_224 - dino_mean)   / dino_std], dim=1
-                ).to(torch.bfloat16)
-                clean_fwd = model(
-                    input_ids=clean_output_ids,
-                    attention_mask=torch.ones_like(clean_output_ids),
-                    pixel_values=clean_pv,
-                    output_hidden_states=True,
-                )
-                clean_hidden = clean_fwd.hidden_states[-1].detach()
-            latent_feat = extract_latent(latent_encoder, img_np, device)
 
-        frame_data.append({
-            "bg_tensor":        bg_tensor,
-            "mvp":              mvp,
-            "clean_output_ids": clean_output_ids,
-            "clean_hidden":     clean_hidden,
-            "latent_feat":      latent_feat,
-            "siglip_mean":      siglip_mean,
-            "siglip_std":       siglip_std,
-            "dino_mean":        dino_mean,
-            "dino_std":         dino_std,
-            "model_input_size": model_input_size,
-        })
+            frame_entry = {
+                "bg_tensor":        bg_tensor,
+                "bg_tensor_no_obj": bg_tensor_no_obj,
+                "mvp":              mvp,
+                "model_rot":        model_matrix[:3, :3] if model_matrix is not None else None,
+                "clean_output_ids": clean_output_ids,
+                "prompt_ids":       clean_inputs["input_ids"],
+                "clean_action":     clean_action,
+                "executed_action":  executed_action,
+                "clean_hidden":     clean_hidden,
+                "siglip_mean":      siglip_mean,
+                "siglip_std":       siglip_std,
+                "dino_mean":        dino_mean,
+                "dino_std":         dino_std,
+                "model_input_size": model_input_size,
+            }
 
-        obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
+            if cfg.collect_grasp_frames:
+                _gqpos = obs.get("robot0_gripper_qpos", None)
+                gripper_close = (cfg.frame_collect_with_policy
+                                 and _gqpos is not None
+                                 and float(np.max(_gqpos)) < cfg.grasp_qpos_threshold)
+                if not grasp_detected:
+                    state_frames.append(frame_entry)
+                    if gripper_close and len(state_frames) >= cfg.grasp_pre_frames:
+                        grasp_detected = True
+                        print(f"  [状态{_si} 步{t}] 夹爪首次闭合，ring buffer 锁定"
+                              f"（共 {len(state_frames)} 帧）")
+                else:
+                    if post_count < cfg.grasp_post_frames:
+                        state_frames.append(frame_entry)
+                        post_count += 1
+                    if post_count >= cfg.grasp_post_frames:
+                        break
+            else:
+                state_frames.append(frame_entry)
+                if cfg.frame_collect_with_policy and float(executed_action[-1]) > 0:
+                    print(f"  [状态{_si} 步{t}] 夹爪闭合，停止采帧（{t+1} 帧）")
+                    break
 
-    frame_weights = compute_frame_weights(
-        [f["latent_feat"] for f in frame_data], tau=cfg.tau
-    )
-    print(f"[ATTACK] 关键帧权重: {frame_weights.cpu().numpy().round(4).tolist()}")
+            if cfg.frame_collect_with_policy:
+                obs, _, _, _ = env.step(executed_action.tolist())
+            else:
+                obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
 
-    optimizer = torch.optim.Adam([renderer.get_texture_param()], lr=cfg.attack_lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_iters, eta_min=cfg.attack_lr * 0.1
-    )
+        if cfg.collect_grasp_frames:
+            state_frames = list(state_frames)
+            if not grasp_detected:
+                print(f"[ATTACK] 状态{_si}: 未检测到夹爪闭合，使用末尾 {len(state_frames)} 帧")
+            print(f"[ATTACK] 状态{_si} grasp-window 帧数 = {len(state_frames)}")
+
+        frame_data.extend(state_frames)
+        env.close()
+        print(f"[ATTACK] 状态{_si} 采集 {len(state_frames)} 帧，累计 {len(frame_data)} 帧")
+
+    frame_pool = frame_data
+    pool_size  = len(frame_pool)
+    print(f"[ATTACK] frame_pool 大小 = {pool_size}（来自 {n_train_states} 个 init_state）")
+    batch_size = min(cfg.num_frames_to_attack, pool_size)
+    print(f"[ATTACK] 每次迭代随机抽 {batch_size} 帧做梯度")
+
+    pgd_step = cfg.attack_lr
     loss_history = []
 
     grad_log_path = os.path.join(save_dir, f"Ep{episode_idx}_gradient_log.txt")
     with open(grad_log_path, "w") as f:
         f.write("Iter | Total Loss | Action Loss | Feature Loss | Grad Norm | LR\n")
 
+    def _bake_and_inject_eval_texture(tag):
+        """把当前对抗 texture bake 出来，写进物体的 XML 资产文件里（MuJoCo 实际渲染读的就是这份）。"""
+        with torch.no_grad():
+            baked_tex = renderer.get_baked_adv_texture()
+        tex_path = os.path.join(save_dir, f"Ep{episode_idx}_LiveTexture_{tag}.png")
+        Image.fromarray(
+            (baked_tex.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        ).save(tex_path)
+
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        tex_name = f"tex-{cfg.object_name}"
+        mat_name = f"mat-{cfg.object_name}"
+        for asset_elem in root.findall("asset"):
+            for tex_elem in asset_elem.findall("texture"):
+                if tex_elem.get("name") == tex_name:
+                    tex_elem.set("file", str(Path(tex_path).resolve()))
+                    tex_elem.set("type", "2d")
+                    break
+        for mat_elem in root.findall(".//material"):
+            if mat_elem.get("name") == mat_name:
+                mat_elem.set("texuniform", "false")
+        tree.write(xml_path)
+        return tex_path
+
+    def _run_live_test(i):
+        """边训练边测试：真实跑一次完整 episode，验证当前攻击效果。"""
+        tex_path = _bake_and_inject_eval_texture(f"iter{i:04d}")
+
+        noise_pt_path = os.path.join(save_dir, f"Ep{episode_idx}_noise_iter{i:04d}.pt")
+        torch.save(renderer.adv_noise.data.cpu(), noise_pt_path)
+
+        if init_states is not None and len(init_states) > 1:
+            chosen_state = init_states[np.random.randint(len(init_states))]
+        else:
+            chosen_state = initial_obs_state
+
+        test_env, _ = get_libero_env(
+            task, cfg.model_family, resolution=cfg.live_test_resolution
+        )
+        test_env.reset()
+        test_obs = test_env.set_init_state(chosen_state)
+        test_env.env.sim.forward()
+
+        t2, max_steps, done2 = 0, cfg.live_test_max_steps, False
+        frames = []
+        while t2 < max_steps + cfg.num_steps_wait:
+            if t2 < cfg.num_steps_wait:
+                test_obs, _, _, _ = test_env.step(get_libero_dummy_action(cfg.model_family))
+                t2 += 1
+                continue
+
+            img_np = get_libero_image(test_obs, cfg.live_test_resolution)
+            bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
+                         ).permute(2, 0, 1).unsqueeze(0)
+
+            model_matrix, body_id, _ = get_target_model_matrix(test_env, search_keywords_list)
+            mvp = (get_render_mvp_from_matrix(
+                test_env, model_matrix,
+                resolution=(cfg.live_test_resolution, cfg.live_test_resolution),
+            ) if body_id != -1 else None)
+
+            _bg_no_obj = _render_bg_without_target(test_env, body_id, cfg.live_test_resolution) if body_id != -1 else None
+            composite_bg = (
+                (torch.from_numpy(_bg_no_obj.copy()).float().to(device) / 255.0
+                 ).permute(2, 0, 1).unsqueeze(0)
+                if _bg_no_obj is not None else bg_tensor
+            )
+
+            with torch.no_grad():
+                if mvp is not None:
+                    adv_rgba, mask = renderer.render(
+                        mvp, resolution=(cfg.live_test_resolution, cfg.live_test_resolution),
+                        model_rot=model_matrix[:3, :3]
+                    )
+                    composited = _composite(adv_rgba, mask, composite_bg)
+                else:
+                    composited = bg_tensor
+
+            perceived_np = (
+                composited[0].permute(1, 2, 0).detach().clamp(0, 1).cpu().numpy() * 255
+            ).astype(np.uint8)
+            frames.append(img_np)
+
+            img_model = np.array(
+                Image.fromarray(perceived_np).resize((model_input_size, model_input_size))
+            )
+            observation = {
+                "full_image": img_model,
+                "state": np.concatenate((
+                    test_obs["robot0_eef_pos"],
+                    quat2axisangle(test_obs["robot0_eef_quat"]),
+                    test_obs["robot0_gripper_qpos"],
+                )),
+            }
+            act = get_action(cfg, model, observation, task_description, processor=processor)
+            act = normalize_gripper_action(act, binarize=True)
+            if cfg.model_family == "openvla":
+                act = invert_gripper_action(act)
+
+            test_obs, _, done2, _ = test_env.step(act.tolist())
+            if done2:
+                break
+            t2 += 1
+        test_env.close()
+
+        video_path = os.path.join(
+            save_dir, f"Ep{episode_idx}_LiveTest_iter{i:04d}_success={done2}.mp4"
+        )
+        writer = imageio.get_writer(video_path, fps=30)
+        for fr in frames:
+            writer.append_data(fr)
+        writer.close()
+
+        print(f"[LIVE-TEST] iter={i} success={done2} | video={video_path}")
+        return done2
+
     iterator = tqdm.tqdm(range(num_iters), desc="Optimizing", leave=False)
     for i in iterator:
-        optimizer.zero_grad()
+        renderer.adv_noise.grad = None
         avg_total = avg_action = avg_feat = 0.0
         valid = 0
 
-        for t, fdata in enumerate(frame_data):
+        batch_idx  = np.random.choice(pool_size, batch_size, replace=False)
+        batch_frames = [frame_pool[j] for j in batch_idx]
+
+        for t, fdata in enumerate(batch_frames):
             if fdata["mvp"] is None:
                 continue
 
-            w_t = frame_weights[t].to(device)
+            w_t = torch.tensor(1.0 / batch_size, device=device)
 
-            adv_samples = _build_adv_samples(cfg, renderer, fdata, RENDER_RES)
+            adv_samples = _build_adv_samples(renderer, fdata, RENDER_RES)
 
             if i == 0 and valid == 0 and cfg.save_attack_artifacts:
                 Image.fromarray(
@@ -741,12 +953,13 @@ def train_adversarial_texture(
             sample_action_losses = []
             sample_feat_losses   = []
 
-            for adv_img in adv_samples:
+            for sample_idx, adv_img in enumerate(adv_samples):
                 adv_224 = F.interpolate(
                     adv_img,
                     size=(fdata["model_input_size"], fdata["model_input_size"]),
                     mode="bilinear", align_corners=False,
                 )
+
                 pv = torch.cat(
                     [(adv_224 - fdata["siglip_mean"]) / fdata["siglip_std"],
                      (adv_224 - fdata["dino_mean"])   / fdata["dino_std"]], dim=1
@@ -769,10 +982,10 @@ def train_adversarial_texture(
             frame_loss = w_t * (
                 cfg.alpha_action  * loss_action +
                 cfg.alpha_feature * loss_feature
-            ) / num_frames
+            )
             frame_loss.backward()
 
-            avg_total  += frame_loss.item() * num_frames
+            avg_total  += frame_loss.item()
             avg_action += loss_action.item()
             avg_feat   += loss_feature.item()
             valid += 1
@@ -783,21 +996,24 @@ def train_adversarial_texture(
             avg_feat   /= valid
         loss_history.append(avg_total)
 
-        grad   = renderer.adv_vc_noise.grad
+        grad   = renderer.adv_noise.grad
         g_norm = grad.norm().item() if grad is not None else 0.0
-        cur_lr = optimizer.param_groups[0]["lr"]
 
         with open(grad_log_path, "a") as f:
             f.write(f"{i:02d} | {avg_total:.6f} | {avg_action:.6f} | "
-                    f"{avg_feat:.6f} | {g_norm:.6e} | {cur_lr:.6e}\n")
+                    f"{avg_feat:.6f} | {g_norm:.6e} | {pgd_step:.6e}\n")
 
-        optimizer.step()
-        scheduler.step()
+        with torch.no_grad():
+            renderer.adv_noise.data -= pgd_step * grad.sign()
         iterator.set_postfix(
             act=f"{avg_action:.4f}",
             feat=f"{avg_feat:.4f}",
             gnorm=f"{g_norm:.4f}",
         )
+
+        if (cfg.live_test_enabled and cfg.live_test_every_n_iters > 0
+                and (i + 1) % cfg.live_test_every_n_iters == 0):
+            _run_live_test(i + 1)
 
     if cfg.save_attack_artifacts:
         torch.save(
@@ -818,7 +1034,7 @@ def train_adversarial_texture(
 @dataclass
 class GenerateConfig:
     model_family:          str            = "openvla"
-    pretrained_checkpoint: Union[str, Path] = "/path/to/openvla/checkpoint"
+    pretrained_checkpoint: Union[str, Path] = "/data/huangsimin/openvla-7b-finetuned-libero-spatial"
     load_in_8bit:          bool           = False
     load_in_4bit:          bool           = False
     center_crop:           bool           = True
@@ -829,28 +1045,31 @@ class GenerateConfig:
     override_xml_path:     Optional[str] = None
 
     task_suite_name:     str           = "libero_spatial"
-    task_id:             Optional[int] = None
+    task_id:             Optional[int] = 0
     num_steps_wait:      int           = 10
-    num_trials_per_task: int           = 2
+    num_trials_per_task: int           = 50
 
-    enable_attack:        bool           = False
-    attack_iters:         int            = 5000
+    enable_attack:        bool           = True
+    attack_iters:         int            = 500
     attack_lr:            float          = 0.05
     num_frames_to_attack: int            = 20
+    num_train_init_states: int           = 10
+    train_frames_per_state: int          = 1
     alpha_action:         float          = 1.0
     alpha_feature:        float          = 10.0
+    frame_collect_with_policy: bool       = False
+    collect_grasp_frames:  bool  = False
+    grasp_pre_frames:      int   = 40
+    grasp_post_frames:     int   = 0
+    grasp_max_steps:       int   = 400
+    grasp_qpos_threshold:  float = 0.02
 
-    latent_encoder_config: str   = "./taming-transformers/configs/vqgan_imagenet_f16_16384.yaml"
-    latent_encoder_ckpt:   str   = "./taming-transformers/checkpoints/vqgan_imagenet_f16_16384.ckpt"
-    tau:                   float = 1.0
+    photometric_calib_frames: int = 5
 
-    use_eot:         bool  = False
-    eot_mode:        str   = "both"
-    eot_num_samples: int   = 4
-    eot_rot_std_deg: float = 5.0
-    eot_trans_std:   float = 0.02
-    eot_scale_min:   float = 0.9
-    eot_scale_max:   float = 1.1
+    live_test_enabled:        bool  = True
+    live_test_every_n_iters:  int   = 20
+    live_test_resolution:     int   = 256
+    live_test_max_steps:      int   = 300
 
     save_attack_artifacts: bool           = True
     load_texture_path:     Optional[str]  = None
@@ -869,8 +1088,6 @@ class GenerateConfig:
 def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
 
-    if cfg.use_eot and cfg.eot_mode not in ("none", "2d", "3d", "both"):
-        raise ValueError(f"eot_mode must be one of: none / 2d / 3d / both, got '{cfg.eot_mode}'")
 
     if cfg.object_name not in OBJECTS:
         raise ValueError(f"未知物体 '{cfg.object_name}'，可选: {list(OBJECTS.keys())}")
@@ -883,19 +1100,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     scale_xyz = parse_mesh_scale(xml_path)
 
-    model     = get_model(cfg)
-    processor = get_processor(cfg) if cfg.model_family == "openvla" else None
-
-    renderer = None
-    if cfg.enable_attack and cfg.load_texture_path is None:
-        print("[INFO] Initializing DifferentiableRenderer...")
-        renderer = DifferentiableRenderer(
-            mesh_path=mesh_path,
-            orig_texture_path=texture_path,
-            device=str(model.device),
-            scale_xyz=scale_xyz,
-        ).to(model.device)
-
     run_id = f"EVAL-{task_suite_name}-{DATE_TIME}"
     if cfg.run_id_note:
         run_id = f"{cfg.run_id_note}-{run_id}"
@@ -903,7 +1107,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
     artifact_dir = os.path.join(cfg.local_log_dir, "attack_artifacts", run_id)
     if cfg.enable_attack and cfg.save_attack_artifacts:
         os.makedirs(artifact_dir, exist_ok=True)
-
     log_file     = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
     original_xml = Path(xml_path)
 
@@ -918,11 +1121,62 @@ def eval_libero(cfg: GenerateConfig) -> None:
     shutil.copy(original_xml, global_clean_backup)
     print(f"[INFO] Absolute clean XML backup → {global_clean_backup}")
 
+    import libero as _libero_pkg
+    _libero_file = getattr(_libero_pkg, "__file__", None)
+    if _libero_file is None and hasattr(_libero_pkg, "__path__"):
+        _libero_file = str(list(_libero_pkg.__path__)[0]) + "/__init__.py"
+        _libero_parent = Path(list(_libero_pkg.__path__)[0])
+    elif _libero_file is not None:
+        _libero_parent = Path(_libero_file).parent
+    else:
+        _libero_parent = None
+
+    _real_tex_path = ((_libero_parent / "libero" / "assets" / "stable_scanned_objects"
+                       / cfg.object_name / "texture.png")
+                      if _libero_parent is not None else Path("/nonexistent"))
+    _real_tex_backup = None
+    if _real_tex_path.exists():
+        _real_tex_backup = _real_tex_path.with_name(f"texture_clean_backup_{DATE_TIME}.png")
+        shutil.copy(_real_tex_path, _real_tex_backup)
+        print(f"[INFO] Real MuJoCo texture → {_real_tex_path}")
+        print(f"[INFO] Real MuJoCo texture backup → {_real_tex_backup}")
+    else:
+        print(f"[WARNING] Real MuJoCo texture not found at {_real_tex_path}, MuJoCo video may look clean")
+
+    import signal, atexit
+    def _restore_xml_on_exit():
+        if global_clean_backup.exists():
+            shutil.copy(global_clean_backup, original_xml)
+            global_clean_backup.unlink(missing_ok=True)
+            print("[INFO] (exit handler) Original XML restored.")
+        if _real_tex_backup is not None and _real_tex_backup.exists():
+            shutil.copy(_real_tex_backup, _real_tex_path)
+            _real_tex_backup.unlink(missing_ok=True)
+            print("[INFO] (exit handler) Real MuJoCo texture restored.")
+    def _sig_handler(signum, frame):
+        _restore_xml_on_exit()
+        raise SystemExit(f"Caught signal {signum}, exiting cleanly.")
+    atexit.register(_restore_xml_on_exit)
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT,  _sig_handler)
+
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite_obj = benchmark_dict[task_suite_name]()
     target_tasks   = ([cfg.task_id] if cfg.task_id is not None
                       else range(task_suite_obj.n_tasks))
 
+    model     = get_model(cfg)
+    processor = get_processor(cfg) if cfg.model_family == "openvla" else None
+
+    renderer = None
+    if cfg.enable_attack:
+        print("[INFO] Initializing DifferentiableRenderer...")
+        renderer = DifferentiableRenderer(
+            mesh_path=mesh_path,
+            orig_texture_path=texture_path,
+            device=str(model.device),
+            scale_xyz=scale_xyz,
+        ).to(model.device)
     total_episodes  = 0
     total_successes = 0
 
@@ -935,6 +1189,55 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             task        = task_suite_obj.get_task(task_id)
             init_states = task_suite_obj.get_task_init_states(task_id)
+
+            if cfg.enable_attack and cfg.load_texture_path is not None:
+                print(f"[INFO] Loading pre-trained adversarial noise from {cfg.load_texture_path}")
+                if cfg.load_texture_path.endswith(".pt"):
+                    noise_t = torch.load(cfg.load_texture_path,
+                                         map_location=renderer.adv_noise.device)
+                    renderer.adv_noise.data.copy_(noise_t)
+                    with torch.no_grad():
+                        delta = torch.tanh(noise_t) * renderer.epsilon
+                    print(f"[INFO] adv_noise loaded from .pt: "
+                          f"max_delta={delta.abs().max():.4f}, "
+                          f"nonzero={(delta.abs() > 1e-3).float().mean() * 100:.1f}%")
+                else:
+                    baked_np  = np.array(Image.open(cfg.load_texture_path)).astype(np.float32) / 255.0
+                    baked_t   = torch.from_numpy(baked_np).unsqueeze(0).to(renderer.adv_noise.device)
+                    baked_stored = torch.flip(baked_t, dims=[1])
+                    saved_orig = renderer.orig_texture
+                    renderer.orig_texture = baked_stored.contiguous()
+                    adv_vc_loaded = renderer._sample_uv_texture_at_vertices()
+                    renderer.orig_texture = saved_orig
+                    delta   = (adv_vc_loaded - renderer.orig_vertex_colors).clamp(
+                        -renderer.epsilon + 1e-6, renderer.epsilon - 1e-6)
+                    noise_t = torch.atanh(delta / renderer.epsilon)
+                    renderer.adv_noise.data.copy_(noise_t)
+                    print(f"[INFO] adv_noise loaded from PNG: "
+                          f"max_delta={delta.abs().max():.4f}, "
+                          f"nonzero={(delta.abs() > 1e-3).float().mean() * 100:.1f}%")
+                adv_tex_inj_path = os.path.join(artifact_dir, f"task_{task_id}_adv_tex_loaded.png")
+                with torch.no_grad():
+                    baked_vis = renderer.get_baked_adv_texture()
+                Image.fromarray(
+                    (baked_vis.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                ).save(adv_tex_inj_path)
+                tree = ET.parse(original_xml)
+                root = tree.getroot()
+                for asset_elem in root.findall("asset"):
+                    for tex_elem in asset_elem.findall("texture"):
+                        if tex_elem.get("name") == f"tex-{cfg.object_name}":
+                            tex_elem.set("file", str(Path(adv_tex_inj_path).resolve()))
+                            tex_elem.set("type", "2d")
+                            break
+                for mat_elem in root.findall(".//material"):
+                    if mat_elem.get("name") == f"mat-{cfg.object_name}":
+                        mat_elem.set("texuniform", "false")
+                tree.write(original_xml)
+                print(f"[INFO] MuJoCo XML updated with adversarial texture → {adv_tex_inj_path}")
+                if _real_tex_path.exists() or _real_tex_backup is not None:
+                    shutil.copy(adv_tex_inj_path, _real_tex_path)
+                    print(f"[INFO] Real MuJoCo texture overwritten → {_real_tex_path}")
 
             if cfg.enable_attack and cfg.load_texture_path is None:
                 print(f"[INFO] Attack training for Task {task_id}...")
@@ -950,7 +1253,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     init_states[0], task, train_task_desc,
                     artifact_dir, episode_idx=task_id,
                     search_keywords_list=search_kw,
+                    xml_path=original_xml,
                     num_iters=cfg.attack_iters,
+                    init_states=init_states,
                 )
 
                 with torch.no_grad():
@@ -978,8 +1283,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         mat_elem.set("texuniform", "false")
                 tree.write(original_xml)
                 print(f"[INFO] XML updated for Task {task_id}.")
+                if _real_tex_path.exists() or _real_tex_backup is not None:
+                    shutil.copy(trained_tex_path, _real_tex_path)
+                    print(f"[INFO] Real MuJoCo texture overwritten → {_real_tex_path}")
 
-            for ep in tqdm.tqdm(range(cfg.num_trials_per_task),
+            n_eval = min(cfg.num_trials_per_task, len(init_states))
+            for ep in tqdm.tqdm(range(n_eval),
                                  desc=f"Task {task_id} Episodes"):
                 env, task_description = get_libero_env(
                     task, cfg.model_family, resolution=VIDEO_RES
@@ -1000,12 +1309,37 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             continue
 
                         img_high = get_libero_image(obs, VIDEO_RES)
-                        replay_images.append(img_high)
-
                         model_input_size = get_image_resize_size(cfg)
-                        img_model = np.array(
-                            Image.fromarray(img_high).resize((model_input_size, model_input_size))
-                        )
+
+                        if renderer is not None:
+                            bg = (torch.from_numpy(img_high).float().to(model.device) / 255.0
+                                  ).permute(2, 0, 1).unsqueeze(0)
+                            mm, bid, _ = get_target_model_matrix(env, search_kw)
+                            mvp = (get_render_mvp_from_matrix(env, mm, resolution=(VIDEO_RES, VIDEO_RES))
+                                   if bid != -1 else None)
+                            _bg_np = _render_bg_without_target(env, bid, VIDEO_RES) if bid != -1 else None
+                            composite_bg = (
+                                (torch.from_numpy(_bg_np.copy()).float().to(model.device) / 255.0
+                                 ).permute(2, 0, 1).unsqueeze(0)
+                                if _bg_np is not None else bg
+                            )
+                            with torch.no_grad():
+                                if mvp is not None:
+                                    adv_rgba, mask = renderer.render(
+                                        mvp, resolution=(VIDEO_RES, VIDEO_RES),
+                                        model_rot=mm[:3, :3])
+                                    comp = _composite(adv_rgba, mask, composite_bg)
+                                else:
+                                    comp = bg
+                            frame_np = (comp[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+                            img_model = np.array(Image.fromarray(frame_np).resize(
+                                (model_input_size, model_input_size)))
+                        else:
+                            frame_np = img_high
+                            img_model = np.array(
+                                Image.fromarray(img_high).resize((model_input_size, model_input_size)))
+
+                        replay_images.append(img_high)
 
                         observation = {
                             "full_image": img_model,
@@ -1054,6 +1388,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             shutil.copy(global_clean_backup, original_xml)
             os.remove(global_clean_backup)
             print("[INFO] Original XML restored and backup removed.")
+        if _real_tex_backup is not None and _real_tex_backup.exists():
+            shutil.copy(_real_tex_backup, _real_tex_path)
+            _real_tex_backup.unlink(missing_ok=True)
+            print("[INFO] Real MuJoCo texture restored.")
         log_file.close()
         if cfg.use_wandb:
             wandb.finish()
