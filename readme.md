@@ -122,155 +122,133 @@ tex3d/
 
 ## ⚙️ Environment Setup
 
-> **📦 Docker image coming soon!** Our initial open-source release was put together in a bit of a rush, and we've since identified a few environment-related issues. We're working on packaging everything into a Docker image over the next couple of days to make setup much easier. If you can wait, we'd recommend holding off until then. If you need to get started right away, you can follow the manual setup steps below in the meantime.
+**Requirements:** Docker ≥ 20.10, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html), CUDA 12.1+ driver.
 
-### Prerequisites
+If your user is not in the `docker` group, ask an administrator to run:
+```bash
+sudo usermod -aG docker $USER   # then re-login
+```
 
-- Python 3.8+
-- CUDA 11.7+ (tested on NVIDIA A100 80GB)
-- [MuJoCo](https://github.com/google-deepmind/mujoco) 2.3+
+### OpenVLA
 
-> **⚠️ Recommendation:** We strongly recommend setting up each VLA model's environment by following its **official repository instructions** first, rather than installing everything into a single environment. Each model may have conflicting dependencies. Use Tex3D as an add-on within each model's own environment.
-
-### Step 1 — Clone the Repository
+#### Step 1 — Build the Image
 
 ```bash
 git clone https://github.com/vla-attack/tex3d.git
 cd tex3d
+
+docker build -f docker_openvla/Dockerfile -t tex3d-openvla .
 ```
 
-### Step 2 — Set Up VLA Model Environments
+> **What the image includes:** Python 3.10, CUDA 12.1, PyTorch 2.2.0, MuJoCo 3.4, LIBERO (patched), nvdiffrast, OpenVLA. Headless OSMesa rendering and `PYTHONPATH` are pre-configured.
 
-Please configure each model's environment **from its official repository** before integrating Tex3D:
+#### Step 2 — Prepare Data Mounts
+
+| What | Container path |
+|------|---------------|
+| LIBERO assets (mesh / texture / XML) | `/data/libero-eval` |
+| OpenVLA fine-tuned checkpoint | `/data/openvla-ckpt` |
+
+#### Step 3 — Launch Container
+
+```bash
+docker run --gpus all --rm -it \
+    -v /your/libero-eval:/data/libero-eval \
+    -v /your/openvla-ckpt:/data/openvla-ckpt \
+    -v $(pwd)/experiments/logs:/workspace/tex3d/experiments/logs \
+    tex3d-openvla
+```
 
 <details>
-<summary><strong>OpenVLA</strong></summary>
-
-Follow the official setup at: https://github.com/openvla/openvla
+<summary><strong>Using a custom LIBERO fork</strong></summary>
 
 ```bash
-# After setting up OpenVLA's environment, install Tex3D dependencies into it:
-pip install git+https://github.com/NVlabs/nvdiffrast.git
+LIBERO_SRC=/path/to/your/LIBERO-fork bash docker_openvla/build.sh
 ```
+
 </details>
-
-<details>
-<summary><strong>OpenVLA-OFT</strong></summary>
-
-Follow the official setup at: https://github.com/moojink/openvla-oft
-
-```bash
-# After setting up OFT's environment, install Tex3D dependencies into it:
-pip install git+https://github.com/NVlabs/nvdiffrast.git
-```
-</details>
-
-<details>
-<summary><strong>π0</strong></summary>
-
-Follow the official setup at: https://github.com/Physical-Intelligence/openpi
-
-```bash
-# After setting up π0's environment, install Tex3D dependencies into it:
-pip install git+https://github.com/NVlabs/nvdiffrast.git
-```
-</details>
-
-<details>
-<summary><strong>π0.5</strong></summary>
-
-Follow the official setup at: https://github.com/Physical-Intelligence/openpi (see π0.5 branch/docs)
-
-```bash
-# After setting up π0.5's environment, install Tex3D dependencies into it:
-pip install git+https://github.com/NVlabs/nvdiffrast.git
-```
-</details>
-
-### Step 3 — Install LIBERO Benchmark
-
-Install LIBERO into whichever model environment you are using:
-
-```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-cd LIBERO
-pip install -e .
-cd ..
-```
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Running — OpenVLA (`attack_openvla.py`)
 
-### Untargeted Attack on OpenVLA (LIBERO)
+`experiments/robot/libero/attack_openvla.py` handles both adversarial training and evaluation in a single run. After training finishes, it immediately evaluates on 50 init states (500 total if all tasks are tested).
 
-```bash
-python experiments/robot/libero/attack_openvla.py \
-    --task_suite spatial \
-    --attack_type untargeted \
-    --n_views 4 \
-    --n_epochs 50 \
-    --tau 0.1 \
-    --output_dir outputs/openvla_spatial_untargeted
-```
+### Clean Evaluation (no attack)
 
-### Targeted Attack on OpenVLA (LIBERO)
+Test the unmodified model on a single task:
 
 ```bash
 python experiments/robot/libero/attack_openvla.py \
-    --task_suite spatial \
-    --attack_type targeted \
-    --target_task "place_in_basket" \
-    --n_views 4 \
-    --n_epochs 50 \
-    --tau 0.1 \
-    --output_dir outputs/openvla_spatial_targeted
+    --pretrained_checkpoint /data/openvla-ckpt \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --enable_attack False
 ```
 
-### Attack on OpenVLA-OFT
+Test all tasks in a suite (500 episodes total):
 
 ```bash
-python experiments/robot/libero/attack_oft.py \
-    --task_suite object \
-    --attack_type untargeted \
-    --perturbation_level L3 \
-    --output_dir outputs/oft_object_untargeted
+python experiments/robot/libero/attack_openvla.py \
+    --pretrained_checkpoint /data/openvla-ckpt \
+    --task_suite_name libero_spatial \
+    --task_id None \
+    --enable_attack False
 ```
 
-### Attack on π0
+### Adversarial Attack + Evaluation
+
+Train an adversarial texture on a single task, then evaluate on 50 states:
 
 ```bash
-python experiments/robot/libero/attack_pi.py \
-    --task_suite goal \
-    --attack_type untargeted \
-    --output_dir outputs/pi0_goal_untargeted
+python experiments/robot/libero/attack_openvla.py \
+    --pretrained_checkpoint /data/openvla-ckpt \
+    --object_name akita_black_bowl \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --attack_iters 5000 \
+    --run_id_note my_exp
 ```
 
-### Attack on π0.5
+Train and evaluate on all tasks in a suite:
 
 ```bash
-python experiments/robot/libero/attack_pi05.py \
-    --task_suite long \
-    --attack_type targeted \
-    --output_dir outputs/pi05_long_targeted
+python experiments/robot/libero/attack_openvla.py \
+    --pretrained_checkpoint /data/openvla-ckpt \
+    --object_name akita_black_bowl \
+    --task_suite_name libero_spatial \
+    --task_id None \
+    --attack_iters 5000
 ```
 
----
+Load a pre-trained adversarial texture and skip training:
 
-## 📊 Key Arguments
+```bash
+python experiments/robot/libero/attack_openvla.py \
+    --pretrained_checkpoint /data/openvla-ckpt \
+    --object_name akita_black_bowl \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --load_texture_path /path/to/Ep0_Vertex_Noise.pt
+```
+
+### Key Arguments
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--task_suite` | LIBERO task suite: `spatial`, `object`, `goal`, `long` | `spatial` |
-| `--attack_type` | Attack mode: `untargeted` or `targeted` | `untargeted` |
-| `--perturbation_level` | Budget level: `L0`, `L1`, `L2`, `L3` | `L3` |
-| `--n_views` | Number of sampled viewpoints per step | `4` |
-| `--n_epochs` | Optimization epochs | `50` |
-| `--tau` | Temperature for TAAO frame weighting softmax | `0.1` |
-| `--use_eot` | Enable Expectation over Transformations for physical attack | `False` |
-| `--output_dir` | Directory to save adversarial textures and logs | `outputs/` |
-
----
+| `--pretrained_checkpoint` | Path to OpenVLA fine-tuned checkpoint | — |
+| `--object_name` | Target object to attack | `akita_black_bowl` |
+| `--task_suite_name` | LIBERO suite: `libero_spatial`, `libero_object` | `libero_spatial` |
+| `--task_id` | Task index within the suite, or `None` for all tasks | `0` |
+| `--enable_attack` | `True` to train adversarial texture; `False` for clean eval | `True` |
+| `--attack_iters` | Optimization iterations | `5000` |
+| `--attack_lr` | SignSGD step size | `0.05` |
+| `--num_trials_per_task` | Evaluation episodes per task | `50` |
+| `--load_texture_path` | Load a saved `.pt` noise file and skip training | `None` |
+| `--local_log_dir` | Output directory for logs and artifacts | `./experiments/logs` |
+| `--run_id_note` | Prefix appended to the run ID for easy identification | `None` |
+| `--live_test_enabled` | Run a full rollout every N iters during training | `True` |
+| `--live_test_every_n_iters` | Interval between live tests | `20` |
 
 ## 📈 Main Results
 
@@ -290,15 +268,6 @@ Peak performance: **96.7%** failure rate on OpenVLA Spatial (targeted attack).
 ## 🧪 Evaluation Protocol
 
 Each task is executed for **50 independent trials**. Performance is measured by **Task Failure Rate (FR)** — proportion of failed task completions over all trials.
-
-```bash
-# Run clean evaluation baseline
-python experiments/robot/libero/attack_openvla.py \
-    --attack_type none \
-    --task_suite spatial \
-    --n_trials 50
-```
-
 
 ## 📐 Perturbation Levels
 
