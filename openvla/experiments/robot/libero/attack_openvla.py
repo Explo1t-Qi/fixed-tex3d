@@ -81,6 +81,7 @@ def _hope(name, mesh_file=None, tex_file="texture_map.png"):
     }
 
 
+
 OBJECTS = {
     "akita_black_bowl": {
         **_scanned("akita_black_bowl"),
@@ -89,31 +90,31 @@ OBJECTS = {
         "task_id":    0,
     },
     "alphabet_soup": {
-        **_hope("alphabet_soup", mesh_file="alphabet_soup_col.obj"),
+        **_hope("alphabet_soup", mesh_file="textured.obj"),
         "search":     [["alphabet_soup"], ["soup"]],
         "task_suite": "libero_object",
         "task_id":    0,
     },
     "cream_cheese": {
-        **_hope("cream_cheese", mesh_file="hope_cream_cheese_coll.obj"),
+        **_hope("cream_cheese", mesh_file="cream_cheese.obj"),
         "search":     [["cream_cheese"], ["cheese"]],
         "task_suite": "libero_object",
         "task_id":    1,
     },
     "salad_dressing": {
-        **_hope("salad_dressing", mesh_file="salad_dressing_col.obj"),
+        **_hope("salad_dressing", mesh_file="textured.obj"),
         "search":     [["salad_dressing"], ["dressing"]],
         "task_suite": "libero_object",
         "task_id":    2,
     },
     "bbq_sauce": {
-        **_hope("bbq_sauce", mesh_file="hope_bbq_coll.obj"),
+        **_hope("bbq_sauce", mesh_file="bbq_sauce.obj"),
         "search":     [["bbq_sauce"], ["bbq"], ["sauce"]],
         "task_suite": "libero_object",
         "task_id":    3,
     },
     "ketchup": {
-        **_hope("ketchup", mesh_file="ketchup_col.obj"),
+        **_hope("ketchup", mesh_file="textured.obj"),
         "search":     [["ketchup"]],
         "task_suite": "libero_object",
         "task_id":    4,
@@ -125,30 +126,31 @@ OBJECTS = {
         "task_id":    5,
     },
     "butter": {
-        **_hope("butter", mesh_file="hope_butter_coll.obj"),
+        **_hope("butter", mesh_file="butter.obj"),
         "search":     [["butter"]],
         "task_suite": "libero_object",
         "task_id":    6,
     },
     "milk": {
-        **_hope("milk", mesh_file="milk_col.obj"),
+        **_hope("milk", mesh_file="textured.obj"),
         "search":     [["milk"]],
         "task_suite": "libero_object",
         "task_id":    7,
     },
     "chocolate_pudding": {
-        **_hope("chocolate_pudding", mesh_file="chocolate_pudding_col.obj"),
+        **_hope("chocolate_pudding", mesh_file="textured.obj"),
         "search":     [["chocolate_pudding"], ["chocolate"], ["pudding"]],
         "task_suite": "libero_object",
         "task_id":    8,
     },
     "orange_juice": {
-        **_hope("orange_juice", mesh_file="orange_juice_col.obj"),
+        **_hope("orange_juice", mesh_file="textured.obj"),
         "search":     [["orange_juice"], ["orange"], ["juice"]],
         "task_suite": "libero_object",
         "task_id":    9,
     },
 }
+
 
 
 def parse_mesh_scale(xml_path: str) -> List[float]:
