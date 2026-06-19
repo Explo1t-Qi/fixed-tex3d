@@ -34,9 +34,9 @@ try:
 except Exception as e:
     print(f"[WARNING] Failed to load libOSMesa.so: {e}")
 
-PATH_TO_LIBERO_ROOT = "/data/huangsimin/libero-eval"
-ASSET_ROOT_SCANNED  = "/data/huangsimin/libero-eval/libero/libero/assets/stable_scanned_objects"
-ASSET_ROOT_HOPE     = "/data/huangsimin/libero-eval/libero/libero/assets/stable_hope_objects"
+PATH_TO_LIBERO_ROOT = "./libero-eval"
+ASSET_ROOT_SCANNED  = "./libero-eval/libero/libero/assets/stable_scanned_objects"
+ASSET_ROOT_HOPE     = "./libero-eval/libero/libero/assets/stable_hope_objects"
 
 if PATH_TO_LIBERO_ROOT not in sys.path:
     sys.path.append(PATH_TO_LIBERO_ROOT)
@@ -1013,7 +1013,7 @@ def train_adversarial_texture(
 @dataclass
 class GenerateConfig:
     model_family:          str            = "openvla"
-    pretrained_checkpoint: Union[str, Path] = "/data/huangsimin/openvla-7b-finetuned-libero-spatial"
+    pretrained_checkpoint: Union[str, Path] = "./openvla-7b-finetuned-libero-spatial"
     load_in_8bit:          bool           = False
     load_in_4bit:          bool           = False
     center_crop:           bool           = True
@@ -1024,15 +1024,15 @@ class GenerateConfig:
     override_xml_path:     Optional[str] = None
 
     task_suite_name:     str           = "libero_spatial"
-    task_id:             Optional[int] = 0
+    task_id:             Optional[int] = None
     num_steps_wait:      int           = 10
     num_trials_per_task: int           = 2
 
     enable_attack:        bool           = False
-    attack_iters:         int            = 20
+    attack_iters:         int            = 5000
     attack_lr:            float          = 0.05
-    num_frames_to_attack: int            = 1#20
-    num_train_init_states: int           = 1 #10
+    num_frames_to_attack: int            = 20
+    num_train_init_states: int           = 10
     train_frames_per_state: int          = 1
     alpha_action:         float          = 1.0
     alpha_feature:        float          = 10.0
@@ -1045,8 +1045,8 @@ class GenerateConfig:
 
     photometric_calib_frames: int = 5
 
-    live_test_enabled:        bool  = True
-    live_test_every_n_iters:  int   = 20
+    live_test_enabled:        bool  = False
+    live_test_every_n_iters:  int   = 50
     live_test_resolution:     int   = 256
     live_test_max_steps:      int   = 300
 
