@@ -287,12 +287,6 @@ class DifferentiableRenderer(nn.Module):
             self.adv_noise.data.fill_(0.0)
 
     def calibrate_lighting(self, mvp, mujoco_clean_rgb, ema: float = 0.0, model_rot=None):
-        """
-        用同一帧、同一姿态下真实 MuJoCo 渲染出的干净图(mujoco_clean_rgb，
-        [1,3,H,W]，取值0~1)，对 nvdiffrast 自己那套简化光照做一次性的逐通道
-        gamma+仿射校准(y ≈ a*x^g + b)，强制把训练时看到的渲染结果对齐到 MuJoCo 实际
-        渲染的亮度/色调上，而不是让两边各算各的。
-        """
         with torch.no_grad():
             H, W = mujoco_clean_rgb.shape[-2], mujoco_clean_rgb.shape[-1]
             _, clean_lit, mask = self.render(mvp, resolution=(H, W), return_clean=True,
@@ -536,8 +530,6 @@ def get_render_mvp_from_matrix(
 
 
 def _render_bg_without_target(env, body_id: int, resolution: int):
-    """临时把目标 body 所有 geom 的 alpha 设为 0，渲一帧无目标物体的背景，渲完立刻还原。
-    不影响物理状态/obs，MuJoCo 原生视频/物理推进完全不受影响。"""
     sim = env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
     geom_ids = [g for g in range(sim.model.ngeom) if sim.model.geom_bodyid[g] == body_id]
     if not geom_ids:
@@ -555,7 +547,6 @@ def _render_bg_without_target(env, body_id: int, resolution: int):
 
 
 def _composite(adv_rgba, mask, bg_tensor):
-    """标准 alpha 合成：nvdiffrast 碗叠在（已无碗的）背景上。"""
     mask_t = mask.permute(0, 3, 1, 2)
     return torch.clamp(
         adv_rgba.permute(0, 3, 1, 2) * mask_t + bg_tensor * (1 - mask_t),
