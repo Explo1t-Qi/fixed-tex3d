@@ -352,7 +352,7 @@ python openvla-oft/experiments/robot/libero/attack_oft.py \
 | `--task_suite_name` | LIBERO suite: `libero_spatial`, `libero_object` | `libero_spatial` |
 | `--task_id` | Task index, or `None` for all tasks | `0` |
 | `--enable_attack` | `True` to train adversarial texture; `False` for clean eval | `True` |
-| `--attack_iters` | Optimization iterations | `500` |
+| `--attack_iters` | Optimization iterations | `5000` |
 | `--use_l1_regression` | Use L1 regression action head | `True` |
 | `--use_diffusion` | Use diffusion action head | `False` |
 | `--use_proprio` | Feed robot proprioception (EEF pos/ori + gripper) to the model | `True` |
