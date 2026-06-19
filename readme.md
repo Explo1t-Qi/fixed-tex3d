@@ -92,18 +92,29 @@ Tex3D Framework
 
 ```
 tex3d/
-├── experiments/
-│   └── robot/                      # Robot experiment scripts
-│       ├── __pycache__/
-│       ├── bridge/                 # Bridge robot experiments
-│       └── libero/                 # LIBERO benchmark experiments
-│           ├── __pycache__/
-│           ├── attack_oft.py       # Attack script for OpenVLA-OFT
+├── openvla/                        # OpenVLA attack scripts & Docker
+│   ├── docker_openvla/             # Docker environment for OpenVLA
+│   │   ├── Dockerfile
+│   │   ├── entrypoint.sh
+│   │   ├── build.sh
+│   │   ├── requirements.txt
+│   │   └── patches/
+│   └── experiments/
+│       └── robot/libero/
 │           ├── attack_openvla.py   # Attack script for OpenVLA
-│           ├── attack_pi.py        # Attack script for π0
-│           ├── attack_pi05.py      # Attack script for π0.5
-│           ├── openvla_utils.py    # OpenVLA utility functions
-│           └── robot_utils.py      # Common robot utility functions
+│           └── openvla_utils.py    # OpenVLA utility functions
+│
+├── openvla-oft/                    # OpenVLA-OFT attack scripts & Docker
+│   ├── docker_oft/                 # Docker environment for OpenVLA-OFT
+│   │   ├── Dockerfile
+│   │   ├── entrypoint.sh
+│   │   ├── build.sh
+│   │   ├── requirements.txt
+│   │   └── patches/
+│   └── experiments/
+│       └── robot/libero/
+│           ├── attack_oft.py       # Attack script for OpenVLA-OFT
+│           └── libero_utils.py
 │
 ├── image/                          # Images for project page / paper
 ├── scripts/                        # Helper scripts
@@ -137,7 +148,7 @@ sudo usermod -aG docker $USER   # then re-login
 git clone https://github.com/vla-attack/tex3d.git
 cd tex3d
 
-docker build -f docker_openvla/Dockerfile -t tex3d-openvla .
+docker build -f openvla/docker_openvla/Dockerfile -t tex3d-openvla .
 ```
 
 > **What the image includes:** Python 3.10, CUDA 12.1, PyTorch 2.2.0, MuJoCo 3.4, LIBERO (patched), nvdiffrast, OpenVLA. Headless OSMesa rendering and `PYTHONPATH` are pre-configured.
@@ -163,7 +174,49 @@ docker run --gpus all --rm -it \
 <summary><strong>Using a custom LIBERO fork</strong></summary>
 
 ```bash
-LIBERO_SRC=/path/to/your/LIBERO-fork bash docker_openvla/build.sh
+LIBERO_SRC=/path/to/your/LIBERO-fork bash openvla/docker_openvla/build.sh
+```
+
+</details>
+
+---
+
+### OpenVLA-OFT
+
+#### Step 1 — Build the Image
+
+```bash
+git clone https://github.com/vla-attack/tex3d.git
+cd tex3d
+
+docker build -f openvla-oft/docker_oft/Dockerfile -t tex3d-oft .
+```
+
+> **What the image includes:** Python 3.10, CUDA 12.1, PyTorch 2.2.0, MuJoCo 3.4, LIBERO (patched), nvdiffrast, OpenVLA, OpenVLA-OFT (action head / proprio projector / diffusion head). Conda env is named `torch` to match the server-side setup.
+
+#### Step 2 — Prepare Data Mounts
+
+| What | Container path |
+|------|---------------|
+| LIBERO assets (mesh / texture / XML) | `/data/libero-eval` |
+| OpenVLA-OFT fine-tuned checkpoint | `/data/oft-ckpt` |
+
+#### Step 3 — Launch Container
+
+```bash
+docker run --gpus all --rm -it \
+    -v /your/libero-eval:/data/libero-eval \
+    -v /your/oft-ckpt:/data/oft-ckpt \
+    -v $(pwd)/experiments/logs:/workspace/tex3d/experiments/logs \
+    tex3d-oft
+```
+
+<details>
+<summary><strong>Using a custom openvla-oft or LIBERO fork</strong></summary>
+
+```bash
+OPENVLA_OFT_SRC=/path/to/your/openvla-oft-fork bash openvla-oft/docker_oft/build.sh
+LIBERO_SRC=/path/to/your/LIBERO-fork bash openvla-oft/docker_oft/build.sh
 ```
 
 </details>
@@ -247,8 +300,66 @@ python experiments/robot/libero/attack_openvla.py \
 | `--load_texture_path` | Load a saved `.pt` noise file and skip training | `None` |
 | `--local_log_dir` | Output directory for logs and artifacts | `./experiments/logs` |
 | `--run_id_note` | Prefix appended to the run ID for easy identification | `None` |
-| `--live_test_enabled` | Run a full rollout every N iters during training | `True` |
+| `--live_test_enabled` | Run a full rollout every N iters during training | `False` |
 | `--live_test_every_n_iters` | Interval between live tests | `20` |
+
+---
+
+---
+
+## 🚀 Running — OpenVLA-OFT (`attack_oft.py`)
+
+`openvla-oft/experiments/robot/libero/attack_oft.py` supports L1-regression and diffusion action heads, plus proprioception input.
+
+### Clean Evaluation (no attack)
+
+```bash
+python openvla-oft/experiments/robot/libero/attack_oft.py \
+    --pretrained_checkpoint /data/oft-ckpt \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --enable_attack False
+```
+
+### Adversarial Attack + Evaluation
+
+```bash
+python openvla-oft/experiments/robot/libero/attack_oft.py \
+    --pretrained_checkpoint /data/oft-ckpt \
+    --object_name akita_black_bowl \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --attack_iters 5000
+```
+
+Load a pre-trained adversarial texture and skip training:
+
+```bash
+python openvla-oft/experiments/robot/libero/attack_oft.py \
+    --pretrained_checkpoint /data/oft-ckpt \
+    --object_name akita_black_bowl \
+    --task_suite_name libero_spatial \
+    --task_id 0 \
+    --load_texture_path /path/to/Ep0_Vertex_Noise.pt
+```
+
+### Key Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--pretrained_checkpoint` | Path to OpenVLA-OFT fine-tuned checkpoint | — |
+| `--object_name` | Target object to attack | `akita_black_bowl` |
+| `--task_suite_name` | LIBERO suite: `libero_spatial`, `libero_object` | `libero_spatial` |
+| `--task_id` | Task index, or `None` for all tasks | `0` |
+| `--enable_attack` | `True` to train adversarial texture; `False` for clean eval | `True` |
+| `--attack_iters` | Optimization iterations | `500` |
+| `--use_l1_regression` | Use L1 regression action head | `True` |
+| `--use_diffusion` | Use diffusion action head | `False` |
+| `--use_proprio` | Feed robot proprioception (EEF pos/ori + gripper) to the model | `True` |
+| `--load_texture_path` | Load a saved `.pt` noise file and skip training | `None` |
+| `--local_log_dir` | Output directory for logs and artifacts | `./experiments/logs` |
+
+---
 
 ## 📈 Main Results
 
