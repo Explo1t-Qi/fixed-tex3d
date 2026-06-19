@@ -1,0 +1,48 @@
+# Core rendering & robot learning stack for tex3d / vla_render
+# Install AFTER the editable packages (libero, nvdiffrast, openvla-oft)
+
+# PyTorch (installed separately with --index-url in Dockerfile)
+# torch==2.2.0+cu121
+# torchvision==0.17.0+cu121
+# torchaudio==2.2.0+cu121
+
+# VLA / robotics
+transformers==4.38.2
+tokenizers==0.15.2
+timm==0.9.10
+peft==0.18.1
+accelerate>=0.25.0
+draccus==0.11.5
+omegaconf==2.3.0
+
+# Simulation
+mujoco==3.4.0
+gym==0.26.2
+
+# 3D / rendering
+trimesh==4.10.1
+scipy==1.15.3
+
+# Training utilities
+wandb==0.23.1
+einops==0.8.1
+rich
+
+# VLM / NLP
+sentencepiece==0.1.99
+protobuf
+huggingface-hub==0.21.4
+
+# Data
+h5py==3.15.1
+datasets==4.3.0
+json-numpy
+
+# Misc
+tqdm
+matplotlib
+Pillow
+imageio
+imageio-ffmpeg
+ffmpeg-python
+numpy
