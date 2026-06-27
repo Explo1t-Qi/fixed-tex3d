@@ -81,7 +81,6 @@ def _hope(name, mesh_file=None, tex_file="texture_map.png"):
     }
 
 
-
 OBJECTS = {
     "akita_black_bowl": {
         **_scanned("akita_black_bowl"),
@@ -152,7 +151,6 @@ OBJECTS = {
 }
 
 
-
 def parse_mesh_scale(xml_path: str) -> List[float]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -166,7 +164,7 @@ def parse_mesh_scale(xml_path: str) -> List[float]:
 
 class DifferentiableRenderer(nn.Module):
     def __init__(self, mesh_path, orig_texture_path=None, device="cuda",
-                 scale_xyz=None, pos_offset=None, epsilon=64.0 / 255.0):
+                 scale_xyz=None, pos_offset=None, epsilon=128.0 / 255.0):
         super().__init__()
         self.device = device
         self.epsilon = epsilon
@@ -257,7 +255,6 @@ class DifferentiableRenderer(nn.Module):
         self.min_light = 0.16
 
     def _sample_uv_texture_at_vertices(self):
-        """把 UV 纹理采样到每个顶点，得到每顶点基础颜色 [N_verts, 3]。"""
         with torch.no_grad():
             if len(self.uv) == self.num_vertices:
                 uv_verts = self.uv
@@ -530,6 +527,8 @@ def get_render_mvp_from_matrix(
 
 
 def _render_bg_without_target(env, body_id: int, resolution: int):
+    """临时把目标 body 所有 geom 的 alpha 设为 0，渲一帧无目标物体的背景，渲完立刻还原。
+    不影响物理状态/obs，MuJoCo 原生视频/物理推进完全不受影响。"""
     sim = env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
     geom_ids = [g for g in range(sim.model.ngeom) if sim.model.geom_bodyid[g] == body_id]
     if not geom_ids:
@@ -588,12 +587,6 @@ def get_attack_loss(logits, clean_labels):
 
 
 def decode_action_from_generated_ids(model, generated_ids, unnorm_key=None):
-    """
-    复刻 `OpenVLAForActionPrediction.predict_action()` 解码尾部的逻辑：把 `generate()`
-    输出的完整 token 序列里最后 action_dim 个 token，解码成反归一化后的连续动作向量。
-    跟真实推理路径(`get_action`/`get_vla_action`)用的完全是同一套反归一化统计量，
-    只是这里直接接收已经生成好的 token id，方便复用 clean / adversarial 两种场景。
-    """
     action_dim = model.get_action_dim(unnorm_key)
     predicted_action_token_ids = generated_ids[0, -action_dim:].detach().cpu().numpy()
     discretized_actions = model.vocab_size - predicted_action_token_ids
@@ -1017,12 +1010,12 @@ class GenerateConfig:
     override_xml_path:     Optional[str] = None
 
     task_suite_name:     str           = "libero_spatial"
-    task_id:             Optional[int] = None
+    task_id:             Optional[int] = 7
     num_steps_wait:      int           = 10
-    num_trials_per_task: int           = 2
+    num_trials_per_task: int           = 50
 
-    enable_attack:        bool           = False
-    attack_iters:         int            = 5000
+    enable_attack:        bool           = True
+    attack_iters:         int            = 10
     attack_lr:            float          = 0.05
     num_frames_to_attack: int            = 20
     num_train_init_states: int           = 10
@@ -1038,8 +1031,8 @@ class GenerateConfig:
 
     photometric_calib_frames: int = 5
 
-    live_test_enabled:        bool  = False
-    live_test_every_n_iters:  int   = 50
+    live_test_enabled:        bool  = True
+    live_test_every_n_iters:  int   = 20
     live_test_resolution:     int   = 256
     live_test_max_steps:      int   = 300
 
