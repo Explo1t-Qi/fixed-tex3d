@@ -1085,19 +1085,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     )
     shutil.copy(original_xml, global_clean_backup)
 
-    import libero as _libero_pkg
-    _libero_file = getattr(_libero_pkg, "__file__", None)
-    if _libero_file is None and hasattr(_libero_pkg, "__path__"):
-        _libero_file = str(list(_libero_pkg.__path__)[0]) + "/__init__.py"
-        _libero_parent = Path(list(_libero_pkg.__path__)[0])
-    elif _libero_file is not None:
-        _libero_parent = Path(_libero_file).parent
-    else:
-        _libero_parent = None
-
-    _real_tex_path = ((_libero_parent / "libero" / "assets" / "stable_scanned_objects"
-                       / cfg.object_name / "texture.png")
-                      if _libero_parent is not None else Path("/nonexistent"))
+    _real_tex_path = Path(texture_path)
+    if not _real_tex_path.is_absolute():
+        _real_tex_path = (Path.cwd() / _real_tex_path).resolve()
     _real_tex_backup = None
     if _real_tex_path.exists():
         _real_tex_backup = _real_tex_path.with_name(f"texture_clean_backup_{DATE_TIME}.png")
@@ -1106,15 +1096,22 @@ def eval_libero(cfg: GenerateConfig) -> None:
         print(f"[WARNING] Real MuJoCo texture not found at {_real_tex_path}, MuJoCo video may look clean")
 
     import signal, atexit
-    def _restore_xml_on_exit():
+
+    def _restore_clean_assets(context: str, remove_backups: bool = False):
         if global_clean_backup.exists():
             shutil.copy(global_clean_backup, original_xml)
-            global_clean_backup.unlink(missing_ok=True)
-            print("[INFO] (exit handler) Original XML restored.")
+            if remove_backups:
+                global_clean_backup.unlink(missing_ok=True)
+            print(f"[INFO] {context} Original XML restored.")
         if _real_tex_backup is not None and _real_tex_backup.exists():
             shutil.copy(_real_tex_backup, _real_tex_path)
-            _real_tex_backup.unlink(missing_ok=True)
-            print("[INFO] (exit handler) Real MuJoCo texture restored.")
+            if remove_backups:
+                _real_tex_backup.unlink(missing_ok=True)
+            print(f"[INFO] {context} Real MuJoCo texture restored.")
+
+    def _restore_xml_on_exit():
+        _restore_clean_assets("(exit handler)", remove_backups=True)
+
     def _sig_handler(signum, frame):
         _restore_xml_on_exit()
         raise SystemExit(f"Caught signal {signum}, exiting cleanly.")
@@ -1146,8 +1143,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         VIDEO_RES = 512
 
         for task_id in tqdm.tqdm(target_tasks, desc="Tasks"):
-            shutil.copy(global_clean_backup, original_xml)
-            print(f"\n[INFO] Restored clean XML for Task {task_id}.")
+            _restore_clean_assets(f"Before Task {task_id}", remove_backups=False)
 
             task        = task_suite_obj.get_task(task_id)
             init_states = task_suite_obj.get_task_init_states(task_id)
@@ -1346,14 +1342,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         log_file.write(f"\nFINAL AVG SUCCESS RATE: {avg_sr:.2%}\n")
 
     finally:
-        if global_clean_backup.exists():
-            shutil.copy(global_clean_backup, original_xml)
-            os.remove(global_clean_backup)
-            print("[INFO] Original XML restored and backup removed.")
-        if _real_tex_backup is not None and _real_tex_backup.exists():
-            shutil.copy(_real_tex_backup, _real_tex_path)
-            _real_tex_backup.unlink(missing_ok=True)
-            print("[INFO] Real MuJoCo texture restored.")
+        _restore_clean_assets("Final cleanup", remove_backups=True)
         log_file.close()
         if cfg.use_wandb:
             wandb.finish()
