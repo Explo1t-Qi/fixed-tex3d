@@ -41,6 +41,12 @@
 
 </div>
 
+## 📢 What's NEW!
+
+- 🎉 **[2026]** Our paper **Tex3D** has been **accepted to ACM MM 2026**! See you in the proceedings 🚀
+
+---
+
 ## 📌 Abstract
 
 Vision-Language-Action (VLA) models have shown strong performance in robotic manipulation, yet their robustness to physically realizable adversarial attacks remains underexplored. Existing studies reveal vulnerabilities through language perturbations and 2D visual attacks, but these attack surfaces are either less representative of real deployment or limited in physical realism.
