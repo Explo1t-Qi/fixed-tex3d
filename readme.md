@@ -43,7 +43,7 @@
 
 ## 📢 What's NEW!
 
-- 🎉 **[2026]** Our paper **Tex3D** has been **accepted to ACM MM 2026**! See you in the proceedings 🚀
+- 🎉 **[2026]** Our paper **Tex3D** has been **accepted to ACM MM 2026**! See you at the conference in Rio de Janeiro, Brazil.🚀
 
 ---
 
