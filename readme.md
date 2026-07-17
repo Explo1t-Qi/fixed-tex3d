@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/arXiv-2604.01618-b31b1b?style=for-the-badge&logo=arxiv" alt="arXiv">
+<a href="https://arxiv.org/abs/2604.01618"><img src="https://img.shields.io/badge/arXiv-2604.01618-b31b1b?style=for-the-badge&logo=arxiv" alt="arXiv"></a>
 <img src="https://img.shields.io/badge/Python-3.8+-green?style=for-the-badge&logo=python" alt="Python">
 <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License">
 
@@ -364,6 +364,80 @@ python openvla-oft/experiments/robot/libero/attack_oft.py \
 | `--use_proprio` | Feed robot proprioception (EEF pos/ori + gripper) to the model | `True` |
 | `--load_texture_path` | Load a saved `.pt` noise file and skip training | `None` |
 | `--local_log_dir` | Output directory for logs and artifacts | `./experiments/logs` |
+
+---
+
+## Running - PI0 / PI0.5 (`pi/attack_pi0.py`)
+
+### 1. Environment
+
+The PI0 attack uses the PyTorch PI0.5-LIBERO implementation from [openpi](https://github.com/Physical-Intelligence/openpi). Ubuntu 22.04, Python 3.11, CUDA 12, and an NVIDIA GPU are recommended.
+
+```bash
+git clone --recurse-submodules https://github.com/Physical-Intelligence/openpi.git
+cd openpi
+
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+uv pip install -e third_party/libero
+uv pip install scipy trimesh draccus omegaconf imageio imageio-ffmpeg
+uv pip install "git+https://github.com/NVlabs/nvdiffrast.git"
+
+cp -r src/openpi/models_pytorch/transformers_replace/* \
+    .venv/lib/python3.11/site-packages/transformers/
+```
+
+The checkpoint must be a converted PI0.5-LIBERO PyTorch checkpoint containing `model.safetensors` and `assets/`. Adversarial training additionally requires the VQGAN config and checkpoint used by `taming-transformers`.
+
+Set the LIBERO and object-asset paths at the top of `pi/attack_pi0.py`, then run the following commands from the `openpi` directory. Replace `/path/to/tex3d` with the Tex3D repository path.
+
+### 2. Commands
+
+#### Train the adversarial texture
+
+```bash
+uv run /path/to/tex3d/pi/attack_pi0.py \
+    --run_mode train \
+    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
+    --object_name akita_black_bowl \
+    --attack_iters 5000 \
+    --attack_lr 0.01 \
+    --num_frames 5 \
+    --latent_encoder_config /path/to/taming-transformers/configs/vqgan_imagenet_f16_16384.yaml \
+    --latent_encoder_ckpt /path/to/taming-transformers/checkpoints/vqgan_imagenet_f16_16384.ckpt \
+    --local_log_dir /path/to/outputs/pi0_attacks
+```
+
+#### Adversarial evaluation
+
+```bash
+uv run /path/to/tex3d/pi/attack_pi0.py \
+    --run_mode adv_test \
+    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
+    --object_name akita_black_bowl \
+    --load_texture_path /path/to/Ep0_Texture_Noise.pt \
+    --eval_max_steps 400 \
+    --num_steps_wait 10 \
+    --replan_steps 5 \
+    --local_log_dir /path/to/outputs/pi0_attacks
+```
+
+#### Clean evaluation
+
+```bash
+uv run /path/to/tex3d/pi/attack_pi0.py \
+    --run_mode clean_test \
+    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
+    --object_name akita_black_bowl \
+    --eval_max_steps 400 \
+    --num_steps_wait 10 \
+    --replan_steps 5 \
+    --local_log_dir /path/to/outputs/pi0_attacks
+```
+
+### 3. Policy server
+
+A separate openpi WebSocket policy server is **not required**. The script loads the PyTorch PI0.5 policy directly in the attack process.
 
 ---
 
