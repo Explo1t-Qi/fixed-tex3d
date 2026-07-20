@@ -367,77 +367,142 @@ python openvla-oft/experiments/robot/libero/attack_oft.py \
 
 ---
 
-## Running - PI0 / PI0.5 (`pi/attack_pi0.py`)
 
-### 1. Environment
+## Running - PI0 (`pi/attack_pi.py`)
 
-The PI0 attack uses the PyTorch PI0.5-LIBERO implementation from [openpi](https://github.com/Physical-Intelligence/openpi). Ubuntu 22.04, Python 3.11, CUDA 12, and an NVIDIA GPU are recommended.
+The maintained PI0 implementation, validated Docker image, host-venv setup, exact
+checkpoint link, rendering behavior, training commands, single-task tests, clean
+baselines, and automatic 10-task Object evaluation are documented in
+this section.
 
-```bash
-git clone --recurse-submodules https://github.com/Physical-Intelligence/openpi.git
-cd openpi
+This code uses the `pi0_libero` configuration with the PyTorch SFT checkpoint
+[`RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`](https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT).
+It loads the policy directly; no OpenPI WebSocket server is required.
 
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-uv pip install -e third_party/libero
-uv pip install scipy trimesh draccus omegaconf imageio imageio-ffmpeg
-uv pip install "git+https://github.com/NVlabs/nvdiffrast.git"
-
-cp -r src/openpi/models_pytorch/transformers_replace/* \
-    .venv/lib/python3.11/site-packages/transformers/
-```
-
-The checkpoint must be a converted PI0.5-LIBERO PyTorch checkpoint containing `model.safetensors` and `assets/`. Adversarial training additionally requires the VQGAN config and checkpoint used by `taming-transformers`.
-
-Set the LIBERO and object-asset paths at the top of `pi/attack_pi0.py`, then run the following commands from the `openpi` directory. Replace `/path/to/tex3d` with the Tex3D repository path.
-
-### 2. Commands
-
-#### Train the adversarial texture
+Quick host-venv examples:
 
 ```bash
-uv run /path/to/tex3d/pi/attack_pi0.py \
-    --run_mode train \
-    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
-    --object_name akita_black_bowl \
-    --attack_iters 5000 \
-    --attack_lr 0.01 \
-    --num_frames 5 \
-    --latent_encoder_config /path/to/taming-transformers/configs/vqgan_imagenet_f16_16384.yaml \
-    --latent_encoder_ckpt /path/to/taming-transformers/checkpoints/vqgan_imagenet_f16_16384.ckpt \
-    --local_log_dir /path/to/outputs/pi0_attacks
+source /path/to/RLinf/.venv/bin/activate
+cd /path/to/tex3d
+
+# Train one object.
+ATTACK_GPU_ID=1 pi/run_attack_pi.sh \
+  --run_mode train --object_name alphabet_soup --attack_iters 5000
+
+# Test all ten LIBERO-Object tasks using their latest trained textures.
+ATTACK_GPU_ID=1 pi/run_all_object_pi.sh adv_test \
+  --eval_num_trials 50 --replan_steps 5
 ```
 
-#### Adversarial evaluation
+### PI0 runtime and model
+
+The validated runtime is Python 3.11.14, PyTorch 2.6.0+cu124, OpenPI RLinf fork
+commit `c5dc4b9296a1a4739bf52828f28a579f12dce763`, Transformers 4.53.2, MuJoCo
+3.8.1, robosuite 1.4.1, and nvdiffrast 0.4.0. The required model is the
+[`RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`](https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT)
+PyTorch checkpoint, not `pi0_base`:
 
 ```bash
-uv run /path/to/tex3d/pi/attack_pi0.py \
-    --run_mode adv_test \
-    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
-    --object_name akita_black_bowl \
-    --load_texture_path /path/to/Ep0_Texture_Noise.pt \
-    --eval_max_steps 400 \
-    --num_steps_wait 10 \
-    --replan_steps 5 \
-    --local_log_dir /path/to/outputs/pi0_attacks
+hf download RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT \
+  --local-dir /path/to/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
 ```
 
-#### Clean evaluation
+Adversarial training also requires the VQGAN checkpoint in your taming-transformers
+checkpoints directory:
 
 ```bash
-uv run /path/to/tex3d/pi/attack_pi0.py \
-    --run_mode clean_test \
-    --pretrained_checkpoint /path/to/pi05_libero_pytorch \
-    --object_name akita_black_bowl \
-    --eval_max_steps 400 \
-    --num_steps_wait 10 \
-    --replan_steps 5 \
-    --local_log_dir /path/to/outputs/pi0_attacks
+wget -O /path/to/taming-transformers/checkpoints/vqgan_imagenet_f16_16384.ckpt \
+  https://ommer-lab.com/files/latent-diffusion/vqgan_imagenet_f16_16384.ckpt
 ```
 
-### 3. Policy server
+### Docker
 
-A separate openpi WebSocket policy server is **not required**. The script loads the PyTorch PI0.5 policy directly in the attack process.
+Build from the repository root. Mount the project, LIBERO assets, model, and VQGAN
+directories at the paths configured for your checkout (or edit the path constants in
+`pi/attack_pi.py`):
+
+```bash
+docker build -f docker_pi/Dockerfile -t tex3d-pi0:final .
+docker run --gpus all --rm -it --ipc=host \
+  -v /path/to/your/data-root:/data/your-data-root \
+  -e ATTACK_PYTHON=/opt/venv/bin/python \
+  -e ATTACK_GPU_ID=1 tex3d-pi0:final bash
+```
+
+Inside the container, verify the runtime before running an experiment:
+
+```bash
+python /opt/verify_environment.py
+```
+
+If Docker exposes only one GPU with `--gpus '"device=1"'`, use
+`-e ATTACK_GPU_ID=0 -e ATTACK_EGL_DEVICE_ID=0` inside the container.
+
+### Host environment without Docker
+
+The existing environment can be activated directly:
+
+```bash
+source /path/to/RLinf/.venv/bin/activate
+cd /path/to/tex3d
+```
+
+For a fresh environment, use RLinf's OpenPI installer, then pin the OpenPI fork and
+install the additional dependencies from `docker_pi/requirements.txt`:
+
+```bash
+git clone https://github.com/RLinf/RLinf.git
+cd RLinf
+bash requirements/install.sh embodied --model openpi --env maniskill_libero
+source .venv/bin/activate
+uv pip install 'git+https://github.com/RLinf/openpi.git@c5dc4b9296a1a4739bf52828f28a579f12dce763'
+cd /path/to/tex3d
+uv pip install --prerelease=allow -r docker_pi/requirements.txt
+```
+
+Copy OpenPI's `models_pytorch/transformers_replace` files into the installed
+Transformers package and install nvdiffrast v0.4.0 as described by the pinned
+runtime above.
+
+### Training and testing
+
+Train one Spatial black-bowl task or one Object task:
+
+```bash
+ATTACK_GPU_ID=1 pi/run_attack_pi.sh --run_mode train \
+  --object_name akita_black_bowl --attack_iters 5000
+ATTACK_GPU_ID=1 pi/run_attack_pi.sh --run_mode train \
+  --object_name bbq_sauce --attack_iters 5000
+```
+
+Test one Object task (alphabet soup is task 0):
+
+```bash
+ATTACK_GPU_ID=1 pi/run_attack_pi.sh --run_mode adv_test \
+  --object_name alphabet_soup --eval_task_id 0 --eval_num_trials 50 \
+  --replan_steps 5 --load_texture_path /path/to/Ep0_Texture_Noise.pt
+```
+
+Test all ten Object tasks with each object's newest trained texture:
+
+```bash
+ATTACK_GPU_ID=1 pi/run_all_object_pi.sh adv_test \
+  --eval_num_trials 50 --replan_steps 5
+```
+
+Run clean baselines:
+
+```bash
+ATTACK_GPU_ID=1 pi/run_attack_pi.sh --run_mode clean_test \
+  --object_name alphabet_soup --eval_task_id 0 --eval_num_trials 50 \
+  --replan_steps 5
+ATTACK_GPU_ID=1 pi/run_all_object_pi.sh clean_test \
+  --eval_num_trials 50 --replan_steps 5
+```
+
+For `libero_object`, do not use one object's texture with `--eval_all_tasks`; each
+task has a different target object. The batch script handles this mapping. Results
+are written under `experiments/pi0_attacks/` and updated after each episode.
 
 ---
 
