@@ -8,11 +8,11 @@ import xml.etree.ElementTree as ET
 import dataclasses
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Literal, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import tqdm
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy.spatial.transform import Rotation as R
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ import nvdiffrast.torch as dr
 import draccus
 from omegaconf import OmegaConf
 
-PATH_TO_LIBERO_ROOT = "/path/to/LIBERO"
+PATH_TO_LIBERO_ROOT = "/data/huangsimin/LIBERO-pi"
 if PATH_TO_LIBERO_ROOT not in sys.path:
     sys.path.append(PATH_TO_LIBERO_ROOT)
 
@@ -37,8 +37,12 @@ try:
 except ImportError:
     raise ImportError("请确保已在 openpi 环境下运行此脚本")
 
-ASSET_ROOT_SCANNED = "/path/to/LIBERO/libero/libero/assets/stable_scanned_objects"
-ASSET_ROOT_HOPE    = "/path/to/LIBERO/libero/libero/assets/stable_hope_objects"
+ASSET_ROOT_SCANNED = (
+    "/data/huangsimin/LIBERO-pi/libero/libero/assets/stable_scanned_objects"
+)
+ASSET_ROOT_HOPE = (
+    "/data/huangsimin/LIBERO-pi/libero/libero/assets/stable_hope_objects"
+)
 
 
 def _scanned(name, mesh_file=None, tex_file="texture.png"):
@@ -172,13 +176,15 @@ def get_target_model_matrix(env, search_keywords_list: List[List[str]]):
     return torch.from_numpy(mat).cuda(), target_body_id, found_name
 
 
-def build_mvp(env, model_matrix: torch.Tensor, resolution=(256, 256)) -> torch.Tensor:
+def build_mvp(
+    env, model_matrix: torch.Tensor, resolution=(256, 256), camera_name="agentview"
+) -> torch.Tensor:
     sim = env.sim if not hasattr(env, "unwrapped") else env.unwrapped.sim
     W, H = resolution
 
     cam_id = 0
     try:
-        cam_id = sim.model.camera_name2id("agentview")
+        cam_id = sim.model.camera_name2id(camera_name)
     except Exception:
         pass
 
@@ -228,6 +234,19 @@ def _get_libero_env(task, resolution, seed=7):
     return env, task_description
 
 
+def _close_libero_env(env):
+    """Release MuJoCo's EGL context before dropping the LIBERO wrapper."""
+    if env is None:
+        return
+    try:
+        sim = getattr(getattr(env, "env", None), "sim", None)
+        if sim is not None:
+            sim.free()
+            env.env.sim = None
+    finally:
+        env.close()
+
+
 def get_libero_image(obs, resolution=256):
     return np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
 
@@ -240,9 +259,18 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * np.arccos(quat[3])) / den
 
 
-def build_raw_inputs(obs_env, task_description, adv_image_np=None, resolution=256):
+def build_raw_inputs(
+    obs_env,
+    task_description,
+    adv_image_np=None,
+    adv_wrist_image_np=None,
+    resolution=256,
+):
     img = get_libero_image(obs_env, resolution) if adv_image_np is None else adv_image_np
-    wrist = np.ascontiguousarray(obs_env["robot0_eye_in_hand_image"][::-1, ::-1])
+    if adv_wrist_image_np is None:
+        wrist = np.ascontiguousarray(obs_env["robot0_eye_in_hand_image"][::-1, ::-1])
+    else:
+        wrist = np.ascontiguousarray(adv_wrist_image_np)
     state = np.concatenate((
         obs_env["robot0_eef_pos"],
         _quat2axisangle(obs_env["robot0_eef_quat"]),
@@ -439,6 +467,7 @@ def render_mujoco_background_without_target(
     body_id: int,
     resolution: int,
     search_keywords_list: Optional[List[List[str]]] = None,
+    camera_name="agentview",
 ):
     """Render MuJoCo normally, but temporarily hide the target object.
 
@@ -469,7 +498,7 @@ def render_mujoco_background_without_target(
     try:
         sim.forward()
         image = sim.render(
-            camera_name="agentview",
+            camera_name=camera_name,
             height=resolution,
             width=resolution,
         )
@@ -534,6 +563,8 @@ def find_target_texture_id(
 
 def _upload_mujoco_texture(sim, texture_id: int) -> bool:
     """Upload modified model.tex_rgb data to every available MuJoCo GL context."""
+    import mujoco
+
     contexts = []
     for attr in ("render_contexts", "_render_context_offscreen", "render_context_offscreen"):
         value = getattr(sim, attr, None)
@@ -550,10 +581,15 @@ def _upload_mujoco_texture(sim, texture_id: int) -> bool:
         if id(context) in seen:
             continue
         seen.add(id(context))
-        upload = getattr(context, "upload_texture", None)
-        if upload is None:
+        con = getattr(context, "con", None)
+        context_model = getattr(context, "model", None)
+        if con is None or context_model is None:
             continue
-        upload(texture_id)
+        gl_context = getattr(context, "gl_ctx", None)
+        if gl_context is not None:
+            gl_context.make_current()
+        native_model = getattr(context_model, "_model", context_model)
+        mujoco.mjr_uploadTexture(native_model, con, texture_id)
         uploaded = True
     return uploaded
 
@@ -563,10 +599,21 @@ def inject_mujoco_texture(sim, texture_id: int, texture_rgb: np.ndarray):
     if texture_id < 0:
         raise ValueError("Invalid MuJoCo texture id")
 
-    height = int(sim.model.tex_height[texture_id])
-    width = int(sim.model.tex_width[texture_id])
-    offset = int(sim.model.tex_adr[texture_id])
-    byte_count = height * width * 3
+    # robosuite's compatibility MjModel forwards most MuJoCo arrays, but not
+    # tex_rgb in this release. Read all texture storage from the native model.
+    native_model = getattr(sim.model, "_model", sim.model)
+    height = int(native_model.tex_height[texture_id])
+    width = int(native_model.tex_width[texture_id])
+    offset = int(native_model.tex_adr[texture_id])
+    channels = int(native_model.tex_nchannel[texture_id]) if hasattr(
+        native_model, "tex_nchannel"
+    ) else 3
+    byte_count = height * width * channels
+    texture_storage = getattr(
+        native_model, "tex_data", getattr(native_model, "tex_rgb", None)
+    )
+    if texture_storage is None:
+        raise RuntimeError("MuJoCo model exposes neither tex_data nor tex_rgb")
 
     texture_rgb = np.asarray(texture_rgb, dtype=np.uint8)
     if texture_rgb.ndim != 3 or texture_rgb.shape[2] != 3:
@@ -576,11 +623,16 @@ def inject_mujoco_texture(sim, texture_id: int, texture_rgb: np.ndarray):
             Image.fromarray(texture_rgb).resize((width, height), Image.BILINEAR),
             dtype=np.uint8,
         )
+    if channels == 4:
+        alpha = np.full((*texture_rgb.shape[:2], 1), 255, dtype=np.uint8)
+        texture_rgb = np.concatenate([texture_rgb, alpha], axis=2)
+    elif channels != 3:
+        raise ValueError(f"Unsupported MuJoCo texture channel count: {channels}")
 
     original = np.asarray(
-        sim.model.tex_rgb[offset:offset + byte_count], dtype=np.uint8
+        texture_storage[offset:offset + byte_count], dtype=np.uint8
     ).copy()
-    sim.model.tex_rgb[offset:offset + byte_count] = texture_rgb.reshape(-1)
+    texture_storage[offset:offset + byte_count] = texture_rgb.reshape(-1)
     uploaded = _upload_mujoco_texture(sim, texture_id)
     if not uploaded:
         print(
@@ -591,7 +643,13 @@ def inject_mujoco_texture(sim, texture_id: int, texture_rgb: np.ndarray):
 
 
 def restore_mujoco_texture(sim, texture_id: int, original, offset: int, byte_count: int):
-    sim.model.tex_rgb[offset:offset + byte_count] = original
+    native_model = getattr(sim.model, "_model", sim.model)
+    texture_storage = getattr(
+        native_model, "tex_data", getattr(native_model, "tex_rgb", None)
+    )
+    if texture_storage is None:
+        raise RuntimeError("MuJoCo model exposes neither tex_data nor tex_rgb")
+    texture_storage[offset:offset + byte_count] = original
     _upload_mujoco_texture(sim, texture_id)
 
 
@@ -610,6 +668,18 @@ def save_hires(tensor, path, hires=1024):
         tensor = F.interpolate(tensor, size=(hires, hires), mode="bilinear", align_corners=False)
     arr = (tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
     Image.fromarray(arr).save(path)
+
+
+def annotate_video_frames(frames, label):
+    """Burn a short evaluation label into each saved video frame."""
+    annotated = []
+    for frame in frames:
+        image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, min(image.width, 360), 24), fill=(0, 0, 0))
+        draw.text((6, 5), label, fill=(255, 255, 255))
+        annotated.append(np.asarray(image))
+    return annotated
 
 
 def render_and_composite(
@@ -760,6 +830,8 @@ def _extract_first_action(policy_output):
 
 def load_latent_encoder(config_path, ckpt_path, device):
     taming_candidates = [
+        Path("/data/huangsimin/taming-transformers-master"),
+        Path("/data/huangsimin/openvla/taming-transformers"),
         Path("./taming-transformers"),
         Path("./taming-transformers-master"),
     ]
@@ -774,6 +846,10 @@ def load_latent_encoder(config_path, ckpt_path, device):
 
     cfg = OmegaConf.load(config_path)
     model_cfg = cfg.model.params if "model" in cfg and "params" in cfg.model else cfg.model
+    # We only use VQModel.encoder for a frozen perceptual feature. The original
+    # training loss constructs LPIPS/VGG16 and downloads separate VGG weights,
+    # which is unnecessary for encoding and breaks on read-only home caches.
+    model_cfg.lossconfig = OmegaConf.create({"target": "torch.nn.Identity"})
     latent_model = VQModel(**model_cfg)
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -1105,12 +1181,29 @@ def train_adversarial_texture_feature_attack(cfg, policy, renderer, initial_obs_
     frame_weights = compute_frame_weights(
         [f["latent_feat"] for f in frame_data], tau=cfg.tau
     )
+    valid_frame_mask = torch.tensor(
+        [f["mvp"] is not None for f in frame_data],
+        device=frame_weights.device,
+        dtype=frame_weights.dtype,
+    )
+    frame_weights = frame_weights * valid_frame_mask
+    if frame_weights.sum() <= 0:
+        raise RuntimeError("没有找到包含目标物体的有效攻击帧")
+    frame_weights = frame_weights / frame_weights.sum()
+    valid_frame_count = int(valid_frame_mask.sum().item())
     print(f"[攻击] 关键帧权重: {frame_weights.cpu().numpy().round(4).tolist()}")
 
-    optimizer = torch.optim.Adam([renderer.get_texture_param()], lr=cfg.attack_lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_iters, eta_min=cfg.attack_lr * 0.1
-    )
+    optimizer_mode = getattr(cfg, "optimizer_mode", "sign_pgd")
+    if optimizer_mode == "adam":
+        optimizer = torch.optim.Adam([renderer.get_texture_param()], lr=cfg.attack_lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_iters, eta_min=cfg.attack_lr * 0.1
+        )
+    elif optimizer_mode == "sign_pgd":
+        optimizer = None
+        scheduler = None
+    else:
+        raise ValueError("optimizer_mode must be 'sign_pgd' or 'adam'")
 
     loss_history  = []
     grad_log_path = os.path.join(save_dir, f"Ep{episode_idx}_gradient_log.txt")
@@ -1121,7 +1214,9 @@ def train_adversarial_texture_feature_attack(cfg, policy, renderer, initial_obs_
     iterator = tqdm.tqdm(range(num_iters), desc="Image Feature Attack", leave=False)
 
     for i in iterator:
-        optimizer.zero_grad()
+        renderer.get_texture_param().grad = None
+        if optimizer is not None:
+            optimizer.zero_grad()
         avg_taao = avg_nat = avg_total = 0.0
         valid = 0
 
@@ -1186,35 +1281,56 @@ def train_adversarial_texture_feature_attack(cfg, policy, renderer, initial_obs_
 
             taao_loss = torch.stack(taao_sample_losses).mean()
 
-            total_loss = frame_weights[t] * taao_loss + lambda_nat * nat_loss
-            (total_loss / num_frames).backward()
+            # frame_weights already sum to one. Dividing the whole expression
+            # by num_frames again would suppress the attack term by another
+            # factor of N while leaving the accumulated naturalness term at
+            # its mean, making the regularizer dominate for multi-frame runs.
+            weighted_taao = frame_weights[t] * taao_loss
+            weighted_nat = lambda_nat * nat_loss / valid_frame_count
+            total_loss = weighted_taao + weighted_nat
+            total_loss.backward()
 
-            avg_taao  += taao_loss.item()
-            avg_nat   += nat_loss.item()
+            avg_taao  += weighted_taao.item()
+            avg_nat   += nat_loss.item() / valid_frame_count
             avg_total += total_loss.item()
             valid += 1
 
         if valid > 0:
-            avg_taao  /= valid
-            avg_nat   /= valid
-            avg_total /= valid
             loss_history.append(avg_total)
 
         grad       = renderer.adv_vc_noise.grad
         g_norm     = grad.norm().item() if grad is not None else 0.0
-        current_lr = optimizer.param_groups[0]["lr"]
+        current_lr = (
+            optimizer.param_groups[0]["lr"] if optimizer is not None else cfg.attack_lr
+        )
         with open(grad_log_path, "a") as f:
             f.write(f"{i:02d} | {avg_total:.6f} | {avg_taao:.6f} | {avg_nat:.6f} "
                     f"| {g_norm:.6e} | {current_lr:.6e}\n")
 
-        optimizer.step()
-        scheduler.step()
+        if optimizer_mode == "sign_pgd":
+            # Match the OpenVLA/OFT attack: fixed-step sign update. This keeps
+            # progress visible even when the model feature gradient is tiny.
+            with torch.no_grad():
+                renderer.get_texture_param().sub_(
+                    cfg.attack_lr * renderer.get_texture_param().grad.sign()
+                )
+                renderer.get_texture_param().clamp_(-5.0, 5.0)
+        else:
+            optimizer.step()
+            scheduler.step()
         iterator.set_postfix(TAAO=f"{avg_taao:.3f}", Nat=f"{avg_nat:.4f}", GNorm=f"{g_norm:.4f}")
 
     if cfg.save_attack_artifacts:
         torch.save(
             renderer.get_texture_param().detach().cpu(),
             os.path.join(save_dir, f"Ep{episode_idx}_Texture_Noise.pt"),
+        )
+        baked_texture = renderer.get_baked_adv_texture()
+        baked_texture_np = (
+            baked_texture.squeeze(0).detach().cpu().numpy() * 255.0
+        ).round().clip(0, 255).astype(np.uint8)
+        Image.fromarray(baked_texture_np).save(
+            os.path.join(save_dir, f"Ep{episode_idx}_Adversarial_Texture.png")
         )
         np.save(os.path.join(save_dir, f"Ep{episode_idx}_loss_history.npy"),
                 np.array(loss_history))
@@ -1352,6 +1468,8 @@ def evaluate_dual_renderer_policy(
     render_res = 256
     success = False
     frames = []
+    policy_frames = []
+    wrist_policy_frames = []
     action_plan = deque()
     sim = env.env.sim
     injected_texture = None
@@ -1392,6 +1510,7 @@ def evaluate_dual_renderer_policy(
         # the baked adversarial texture, so the saved video is 100% MuJoCo render.
         mujoco_video_frame = get_libero_image(obs, render_res)
         model_img_np = mujoco_video_frame
+        wrist_input = None
 
         if use_adversarial:
             model_matrix, body_id, _ = get_target_model_matrix(
@@ -1427,12 +1546,54 @@ def evaluate_dual_renderer_policy(
         # The policy sees model_img_np (dual renderer in adversarial mode), while
         # the video always records the complete MuJoCo camera render.
         frames.append(mujoco_video_frame.copy())
+        policy_frames.append(model_img_np.copy())
 
         if not action_plan:
+            wrist_input = None
+            if use_adversarial:
+                wrist_camera = "robot0_eye_in_hand"
+                try:
+                    sim.model.camera_name2id(wrist_camera)
+                    # Keep the complete MuJoCo scene, including the plate.
+                    # Hide only the target and replace it with the nvdiffrast
+                    # adversarial rendering for the wrist policy input.
+                    wrist_bg_np = render_mujoco_background_without_target(
+                        env,
+                        body_id,
+                        render_res,
+                        search_keywords_list=search_keywords_list,
+                        camera_name=wrist_camera,
+                    )
+                    wrist_bg = (
+                        torch.from_numpy(wrist_bg_np).float().to(device) / 255.0
+                    ).permute(2, 0, 1).unsqueeze(0)
+                    wrist_mvp = build_mvp(
+                        env,
+                        model_matrix,
+                        resolution=(render_res, render_res),
+                        camera_name=wrist_camera,
+                    )
+                    with torch.no_grad():
+                        wrist_adv = render_and_composite(
+                            renderer,
+                            wrist_bg,
+                            wrist_mvp,
+                            resolution=(render_res, render_res),
+                            model_rot=model_matrix[:3, :3],
+                        )
+                    wrist_input = (
+                        wrist_adv[0].permute(1, 2, 0).cpu().numpy() * 255.0
+                    ).round().clip(0, 255).astype(np.uint8)
+                except Exception as exc:
+                    print(
+                        "[warning] wrist nvdiffrast view unavailable; "
+                        f"using MuJoCo wrist image: {exc}"
+                    )
             raw_inputs = build_raw_inputs(
                 obs,
                 task_description,
                 adv_image_np=model_img_np,
+                adv_wrist_image_np=wrist_input,
                 resolution=render_res,
             )
             with torch.no_grad():
@@ -1449,6 +1610,14 @@ def evaluate_dual_renderer_policy(
                 raise RuntimeError("PI0 returned an empty action chunk")
             action_plan.extend(action_chunk[:min(replan_steps, len(action_chunk))])
 
+        # Retained for rollout diagnostics, although policy-input videos are
+        # no longer written to disk.
+        wrist_policy_frames.append(
+            wrist_input.copy()
+            if wrist_input is not None
+            else np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+        )
+
         action = np.asarray(action_plan.popleft(), dtype=np.float32)
         obs, _, done, _ = env.step(action.tolist())
         if done or env.env._check_success():
@@ -1464,13 +1633,18 @@ def evaluate_dual_renderer_policy(
             sim, texture_id, original, offset, byte_count
         )
         print(f"[evaluation] restored MuJoCo texture tex_id={texture_id}")
-    return success, frames
+    return success, frames, policy_frames, wrist_policy_frames
 
 
 @dataclass
 class GenerateConfig:
-    pretrained_checkpoint: str = "/path/to/checkpoints/pi05_libero_pytorch"
-    run_mode: Literal["train", "adv_test", "clean_test", "all"] = "all"
+    pretrained_checkpoint: str = (
+        "/data/huangsimin/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
+    )
+    # draccus 0.8.0 cannot decode typing.Literal values from the CLI.
+    # Keep these as strings and validate them explicitly at startup instead.
+    model_config: str = "pi0_libero"
+    run_mode: str = "all"
     load_texture_path: Optional[str] = None
 
     object_name:           str          = "akita_black_bowl"
@@ -1479,15 +1653,22 @@ class GenerateConfig:
     override_xml_path:     Optional[str] = None
 
     attack_iters: int   = 5000
-    attack_lr:    float = 0.01
+    attack_lr:    float = 0.05
+    optimizer_mode: str = "sign_pgd"
     num_frames:   int   = 20
     lambda_feat:  float = 1.0
     lambda_nat:   float = 0.01
 
     save_attack_artifacts: bool = True
-    local_log_dir:         str  = "./experiments/pi0_attacks"
-    latent_encoder_config: str  = "./taming-transformers/configs/vqgan_imagenet_f16_16384.yaml"
-    latent_encoder_ckpt:   str  = "./taming-transformers/checkpoints/vqgan_imagenet_f16_16384.ckpt"
+    local_log_dir: str = "/data/huangsimin/tex3d/experiments/pi0_attacks"
+    latent_encoder_config: str = (
+        "/data/huangsimin/openvla/taming-transformers/configs/"
+        "vqgan_imagenet_f16_16384.yaml"
+    )
+    latent_encoder_ckpt: str = (
+        "/data/huangsimin/openvla/taming-transformers/checkpoints/"
+        "vqgan_imagenet_f16_16384.ckpt"
+    )
     tau:                   float = 1.0
     attack_mode:           str   = "untargeted"  # "untargeted" or "targeted"
     target_action_mode:    str   = "sign_flip_xyz"
@@ -1498,13 +1679,32 @@ class GenerateConfig:
     eot_scale_min:         float = 0.9
     eot_scale_max:         float = 1.1
     eval_max_steps:        int   = 400
+    eval_num_trials:       int   = 1
+    eval_all_tasks:        bool  = False
+    # If set, test only this task id. It takes precedence over eval_all_tasks.
+    eval_task_id:          Optional[int] = None
     num_steps_wait:        int   = 10
-    replan_steps:          int   = 5
+    # Execute one action from each PI0 50-step prediction, then replan from
+    # the newest observation. The model horizon itself remains 50.
+    replan_steps:          int   = 1
     evaluate_clean:        bool  = True
 
 
 @draccus.wrap()
 def run_whitebox_attack(cfg: GenerateConfig):
+    valid_model_configs = {"pi0_libero", "pi05_libero"}
+    if cfg.model_config not in valid_model_configs:
+        raise ValueError(
+            f"未知 model_config '{cfg.model_config}'，可选: "
+            f"{sorted(valid_model_configs)}"
+        )
+
+    valid_run_modes = {"train", "adv_test", "clean_test", "all"}
+    if cfg.run_mode not in valid_run_modes:
+        raise ValueError(
+            f"未知 run_mode '{cfg.run_mode}'，可选: {sorted(valid_run_modes)}"
+        )
+
     if cfg.object_name not in OBJECTS:
         raise ValueError(f"未知物体 '{cfg.object_name}'，可选: {list(OBJECTS.keys())}")
     obj_cfg = OBJECTS[cfg.object_name]
@@ -1526,8 +1726,11 @@ def run_whitebox_attack(cfg: GenerateConfig):
     scale_xyz = parse_mesh_scale(xml_path)
     print(f"[配置] mesh scale (from xml): {scale_xyz}")
 
-    print(f"\n加载 Pi0.5 checkpoint: {cfg.pretrained_checkpoint}")
-    config = training_config.get_config("pi05_libero")
+    print(
+        f"\n加载 {cfg.model_config} checkpoint: "
+        f"{cfg.pretrained_checkpoint}"
+    )
+    config = training_config.get_config(cfg.model_config)
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.config.disable = True
@@ -1554,7 +1757,9 @@ def run_whitebox_attack(cfg: GenerateConfig):
     task_suite_obj    = benchmark_dict[task_suite]()
     train_task        = task_suite_obj.get_task(task_id)
     train_init_states = task_suite_obj.get_task_init_states(task_id)
-    _, train_task_desc = _get_libero_env(train_task, resolution=256)
+    # The description is already stored on the task. Creating an environment
+    # merely to read it leaks an offscreen EGL context until interpreter exit.
+    train_task_desc = train_task.language
 
     DATE_TIME    = time.strftime("%Y%m%d_%H%M%S")
     artifact_dir = os.path.join(cfg.local_log_dir, f"attack_{cfg.object_name}_{DATE_TIME}")
@@ -1589,7 +1794,7 @@ def run_whitebox_attack(cfg: GenerateConfig):
             )
             print(f"[train] artifacts saved to: {artifact_dir}")
             try:
-                env.close()
+                _close_libero_env(env)
             except Exception:
                 pass
             return
@@ -1623,48 +1828,134 @@ def run_whitebox_attack(cfg: GenerateConfig):
             use_adversarial = False
             video_name = "Clean_MuJoCo_Rollout.mp4"
 
-        eval_env, _ = _get_libero_env(train_task, resolution=256)
-        success, frames = evaluate_dual_renderer_policy(
-            eval_env,
-            policy,
-            renderer,
-            train_task_desc,
-            train_init_states[0],
-            search_keywords_list=search_kw,
-            use_adversarial=use_adversarial,
-            max_steps=cfg.eval_max_steps,
-            num_steps_wait=cfg.num_steps_wait,
-            replan_steps=cfg.replan_steps,
-        )
-
-        if frames:
-            import imageio
-
-            video_path = os.path.join(artifact_dir, video_name)
-            writer = imageio.get_writer(
-                video_path, fps=15, codec="libx264", quality=8
-            )
-            for frame in frames:
-                writer.append_data(frame)
-            writer.close()
-            print(f"[test] video saved to: {video_path}")
-
+        if cfg.eval_num_trials < 1:
+            raise ValueError("eval_num_trials must be at least 1")
+        if cfg.eval_task_id is not None:
+            if not 0 <= cfg.eval_task_id < task_suite_obj.n_tasks:
+                raise ValueError(
+                    f"eval_task_id must be in [0, {task_suite_obj.n_tasks - 1}], "
+                    f"got {cfg.eval_task_id}"
+                )
+            eval_task_ids = [cfg.eval_task_id]
+        elif cfg.eval_all_tasks:
+            eval_task_ids = list(range(task_suite_obj.n_tasks))
+        else:
+            eval_task_ids = [task_id]
+        total_successes = 0
+        total_episodes = 0
+        task_results = []
         result_path = os.path.join(artifact_dir, "evaluation_result.txt")
         with open(result_path, "w", encoding="utf-8") as result_file:
             result_file.write(f"run_mode={cfg.run_mode}\n")
             result_file.write(f"object_name={cfg.object_name}\n")
             result_file.write(f"task_suite={task_suite}\n")
-            result_file.write(f"task_id={task_id}\n")
-            result_file.write(f"task_description={train_task_desc}\n")
-            result_file.write(f"success={success}\n")
-            result_file.write(f"num_video_frames={len(frames)}\n")
+            result_file.write(f"eval_task_ids={eval_task_ids}\n")
+            result_file.write(f"eval_num_trials={cfg.eval_num_trials}\n")
             if cfg.load_texture_path:
                 result_file.write(f"texture_noise={cfg.load_texture_path}\n")
+            result_file.write("\n# Live results (updated after every episode)\n")
+            result_file.flush()
+            os.fsync(result_file.fileno())
+
+        for eval_task_id in eval_task_ids:
+            eval_task = task_suite_obj.get_task(eval_task_id)
+            eval_init_states = task_suite_obj.get_task_init_states(eval_task_id)
+            eval_task_desc = eval_task.language
+            if cfg.eval_num_trials > len(eval_init_states):
+                raise ValueError(
+                    f"Task {eval_task_id} only has {len(eval_init_states)} init "
+                    f"states, but eval_num_trials={cfg.eval_num_trials}"
+                )
+            task_successes = 0
+            task_dir = os.path.join(artifact_dir, f"task_{eval_task_id:02d}")
+            os.makedirs(task_dir, exist_ok=True)
+
+            for episode_idx in range(cfg.eval_num_trials):
+                print(
+                    f"[test] task={eval_task_id}/{eval_task_ids[-1]} "
+                    f"episode={episode_idx + 1}/{cfg.eval_num_trials}: "
+                    f"{eval_task_desc}"
+                )
+                eval_env, _ = _get_libero_env(eval_task, resolution=256)
+                try:
+                    success, frames, policy_frames, wrist_policy_frames = evaluate_dual_renderer_policy(
+                        eval_env,
+                        policy,
+                        renderer,
+                        eval_task_desc,
+                        eval_init_states[episode_idx],
+                        search_keywords_list=search_kw,
+                        use_adversarial=use_adversarial,
+                        max_steps=cfg.eval_max_steps,
+                        num_steps_wait=cfg.num_steps_wait,
+                        replan_steps=cfg.replan_steps,
+                    )
+                finally:
+                    _close_libero_env(eval_env)
+
+                task_successes += int(success)
+                total_successes += int(success)
+                total_episodes += 1
+
+                # Record the current success rate immediately, so partial runs
+                # still leave an up-to-date result on disk.
+                with open(result_path, "a", encoding="utf-8") as result_file:
+                    result_file.write(
+                        f"task_{eval_task_id} episode={episode_idx + 1}/"
+                        f"{cfg.eval_num_trials} success={success} "
+                        f"task_rate={task_successes}/{episode_idx + 1} "
+                        f"({task_successes / (episode_idx + 1):.6f}) "
+                        f"overall={total_successes}/{total_episodes} "
+                        f"({total_successes / total_episodes:.6f})\n"
+                    )
+                    result_file.flush()
+                    os.fsync(result_file.fileno())
+
+                if cfg.save_attack_artifacts and frames:
+                    import imageio
+
+                    stem = os.path.splitext(video_name)[0]
+                    video_path = os.path.join(
+                        task_dir,
+                        f"episode_{episode_idx:02d}_{stem}_success_{success}.mp4",
+                    )
+                    labeled_frames = annotate_video_frames(
+                        frames, f"{cfg.run_mode} | success={success}"
+                    )
+                    writer = imageio.get_writer(
+                        video_path, fps=15, codec="libx264", quality=8
+                    )
+                    for frame in labeled_frames:
+                        writer.append_data(frame)
+                    writer.close()
+
+            task_results.append(
+                (eval_task_id, eval_task_desc, task_successes, cfg.eval_num_trials)
+            )
+            print(
+                f"[test] task {eval_task_id} success: "
+                f"{task_successes}/{cfg.eval_num_trials} "
+                f"({task_successes / cfg.eval_num_trials:.2%})"
+            )
+
+        with open(result_path, "a", encoding="utf-8") as result_file:
+            result_file.write("\n# Final summary\n")
+            for result_task_id, desc, successes, episodes in task_results:
+                result_file.write(
+                    f"task_{result_task_id}={successes}/{episodes} "
+                    f"({successes / episodes:.6f}) | {desc}\n"
+                )
+            result_file.write(
+                f"overall={total_successes}/{total_episodes} "
+                f"({total_successes / total_episodes:.6f})\n"
+            )
+            result_file.flush()
+            os.fsync(result_file.fileno())
+        print(
+            f"[test] overall success: {total_successes}/{total_episodes} "
+            f"({total_successes / total_episodes:.2%})"
+        )
         print(f"[test] result saved to: {result_path}")
-        try:
-            eval_env.close()
-        except Exception:
-            pass
         return
 
     print(f"\n开始图像特征空间攻击: [{train_task_desc}]")
@@ -1682,7 +1973,7 @@ def run_whitebox_attack(cfg: GenerateConfig):
     clean_frames = []
     if cfg.evaluate_clean:
         policy._sample_kwargs = dict(default_sample_kwargs)
-        clean_success, clean_frames = evaluate_dual_renderer_policy(
+        clean_success, clean_frames, clean_policy_frames, clean_wrist_policy_frames = evaluate_dual_renderer_policy(
             env,
             policy,
             renderer,
@@ -1697,7 +1988,7 @@ def run_whitebox_attack(cfg: GenerateConfig):
 
     policy._sample_kwargs["num_steps"] = 1
     print("[adv_test] PI0 denoising steps: 1")
-    is_success, frames = evaluate_dual_renderer_policy(
+    is_success, frames, policy_frames, wrist_policy_frames = evaluate_dual_renderer_policy(
         env,
         policy,
         renderer,
@@ -1716,9 +2007,14 @@ def run_whitebox_attack(cfg: GenerateConfig):
 
     if cfg.save_attack_artifacts and frames:
         import imageio
-        mp4_path = os.path.join(artifact_dir, "Adversarial_Rollout.mp4")
+        labeled_frames = annotate_video_frames(
+            frames, f"adv_test | success={is_success} | MuJoCo"
+        )
+        mp4_path = os.path.join(
+            artifact_dir, f"Adversarial_Rollout_success_{is_success}.mp4"
+        )
         writer   = imageio.get_writer(mp4_path, fps=15, codec="libx264", quality=8)
-        for frame in frames:
+        for frame in labeled_frames:
             writer.append_data(frame)
         writer.close()
         if clean_frames:
@@ -1733,7 +2029,7 @@ def run_whitebox_attack(cfg: GenerateConfig):
         print(f"录像保存: {mp4_path}")
 
     try:
-        env.close()
+        _close_libero_env(env)
     except Exception:
         pass
 
