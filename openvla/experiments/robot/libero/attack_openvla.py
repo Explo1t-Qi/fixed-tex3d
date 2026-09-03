@@ -58,9 +58,16 @@ if OPENVLA_REPO_ROOT not in sys.path:
 
 from openvla_image_transform import DifferentiableOpenVLAImageProcessor
 from openvla_model_inputs import ensure_trailing_empty_token
+from openvla_policy_view import (
+    DEFAULT_DEPLOYMENT_VIEW,
+    POLICY_SOURCE_RESOLUTION,
+    PolicyViewTransform,
+    build_policy_and_replay_views,
+    resize_policy_pre_crop_canvas,
+)
 from openvla_utils import get_processor
 from robot_utils import (
-    DATE_TIME, get_action, get_image_resize_size, get_model,
+    DATE_TIME, get_action, get_model,
     invert_gripper_action, normalize_gripper_action, set_seed_everywhere,
 )
 
@@ -622,13 +629,13 @@ def train_adversarial_texture(
     print(f"[ATTACK] Training Ep {episode_idx} | {cfg.num_frames_to_attack}-Frame Optimization...")
     os.makedirs(save_dir, exist_ok=True)
 
-    RENDER_RES       = 256
-    model_input_size = get_image_resize_size(cfg)
+    RENDER_RES       = POLICY_SOURCE_RESOLUTION
     device           = model.device
     image_preprocessor = DifferentiableOpenVLAImageProcessor.from_checkpoint(
         model=model,
         processor=processor,
     )
+    policy_view = PolicyViewTransform(DEFAULT_DEPLOYMENT_VIEW)
 
     _avail = init_states if (init_states is not None and len(init_states) > 0) else [initial_obs_state]
     n_train_states   = min(cfg.num_train_init_states, len(_avail))
@@ -686,10 +693,14 @@ def train_adversarial_texture(
                 if calib_count >= cfg.photometric_calib_frames:
                     calib_done = True
 
-            image_pil    = Image.fromarray(img_np).resize((model_input_size, model_input_size))
+            image_pil = Image.fromarray(
+                resize_policy_pre_crop_canvas(
+                    img_np, specification=DEFAULT_DEPLOYMENT_VIEW
+                )
+            )
             prompt       = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
             clean_inputs = processor(prompt, images=image_pil).to(device)
-            clean_pv = image_preprocessor(bg_tensor).to(torch.bfloat16)
+            clean_pv = image_preprocessor(policy_view(bg_tensor)).to(torch.bfloat16)
             clean_inputs["pixel_values"] = clean_pv
             clean_inputs = ensure_trailing_empty_token(clean_inputs)
 
@@ -725,7 +736,6 @@ def train_adversarial_texture(
                 "clean_action":     clean_action,
                 "executed_action":  executed_action,
                 "clean_hidden":     clean_hidden,
-                "model_input_size": model_input_size,
             }
 
             if cfg.collect_grasp_frames:
@@ -811,7 +821,7 @@ def train_adversarial_texture(
             chosen_state = initial_obs_state
 
         test_env, _ = get_libero_env(
-            task, cfg.model_family, resolution=cfg.live_test_resolution
+            task, cfg.model_family, resolution=POLICY_SOURCE_RESOLUTION
         )
         test_env.reset()
         test_obs = test_env.set_init_state(chosen_state)
@@ -825,17 +835,19 @@ def train_adversarial_texture(
                 t2 += 1
                 continue
 
-            img_np = get_libero_image(test_obs, cfg.live_test_resolution)
+            img_np = get_libero_image(test_obs, POLICY_SOURCE_RESOLUTION)
             bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
                          ).permute(2, 0, 1).unsqueeze(0)
 
             model_matrix, body_id, _ = get_target_model_matrix(test_env, search_keywords_list)
             mvp = (get_render_mvp_from_matrix(
                 test_env, model_matrix,
-                resolution=(cfg.live_test_resolution, cfg.live_test_resolution),
+                resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
             ) if body_id != -1 else None)
 
-            _bg_no_obj = _render_bg_without_target(test_env, body_id, cfg.live_test_resolution) if body_id != -1 else None
+            _bg_no_obj = _render_bg_without_target(
+                test_env, body_id, POLICY_SOURCE_RESOLUTION
+            ) if body_id != -1 else None
             composite_bg = (
                 (torch.from_numpy(_bg_no_obj.copy()).float().to(device) / 255.0
                  ).permute(2, 0, 1).unsqueeze(0)
@@ -845,7 +857,8 @@ def train_adversarial_texture(
             with torch.no_grad():
                 if mvp is not None:
                     adv_rgba, mask = renderer.render(
-                        mvp, resolution=(cfg.live_test_resolution, cfg.live_test_resolution),
+                        mvp,
+                        resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
                         model_rot=model_matrix[:3, :3]
                     )
                     composited = _composite(adv_rgba, mask, composite_bg)
@@ -855,11 +868,12 @@ def train_adversarial_texture(
             perceived_np = (
                 composited[0].permute(1, 2, 0).detach().clamp(0, 1).cpu().numpy() * 255
             ).astype(np.uint8)
-            frames.append(img_np)
-
-            img_model = np.array(
-                Image.fromarray(perceived_np).resize((model_input_size, model_input_size))
+            img_model, replay_image = build_policy_and_replay_views(
+                perceived_np,
+                replay_resolution=cfg.live_test_resolution,
+                specification=DEFAULT_DEPLOYMENT_VIEW,
             )
+            frames.append(replay_image)
             observation = {
                 "full_image": img_model,
                 "state": np.concatenate((
@@ -911,7 +925,7 @@ def train_adversarial_texture(
             sample_feat_losses   = []
 
             for sample_idx, adv_img in enumerate(adv_samples):
-                pv = image_preprocessor(adv_img)
+                pv = image_preprocessor(policy_view(adv_img))
 
                 with autocast(dtype=torch.bfloat16):
                     outputs = model(
@@ -1018,6 +1032,7 @@ class GenerateConfig:
     live_test_every_n_iters:  int   = 20
     live_test_resolution:     int   = 256
     live_test_max_steps:      int   = 300
+    replay_resolution:        int   = 512
 
     save_attack_artifacts: bool           = True
     load_texture_path:     Optional[str]  = None
@@ -1123,7 +1138,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     total_successes = 0
 
     try:
-        VIDEO_RES = 512
+        VIDEO_RES = cfg.replay_resolution
 
         for task_id in tqdm.tqdm(target_tasks, desc="Tasks"):
             _restore_clean_assets(f"Before Task {task_id}", remove_backups=False)
@@ -1232,7 +1247,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             for ep in tqdm.tqdm(range(n_eval),
                                  desc=f"Task {task_id} Episodes"):
                 env, task_description = get_libero_env(
-                    task, cfg.model_family, resolution=VIDEO_RES
+                    task, cfg.model_family, resolution=POLICY_SOURCE_RESOLUTION
                 )
                 env.reset()
                 obs = env.set_init_state(init_states[ep])
@@ -1249,16 +1264,20 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             t += 1
                             continue
 
-                        img_high = get_libero_image(obs, VIDEO_RES)
-                        model_input_size = get_image_resize_size(cfg)
-
+                        img_high = get_libero_image(obs, POLICY_SOURCE_RESOLUTION)
                         if renderer is not None:
                             bg = (torch.from_numpy(img_high).float().to(model.device) / 255.0
                                   ).permute(2, 0, 1).unsqueeze(0)
                             mm, bid, _ = get_target_model_matrix(env, search_kw)
-                            mvp = (get_render_mvp_from_matrix(env, mm, resolution=(VIDEO_RES, VIDEO_RES))
+                            mvp = (get_render_mvp_from_matrix(
+                                env,
+                                mm,
+                                resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
+                            )
                                    if bid != -1 else None)
-                            _bg_np = _render_bg_without_target(env, bid, VIDEO_RES) if bid != -1 else None
+                            _bg_np = _render_bg_without_target(
+                                env, bid, POLICY_SOURCE_RESOLUTION
+                            ) if bid != -1 else None
                             composite_bg = (
                                 (torch.from_numpy(_bg_np.copy()).float().to(model.device) / 255.0
                                  ).permute(2, 0, 1).unsqueeze(0)
@@ -1267,20 +1286,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             with torch.no_grad():
                                 if mvp is not None:
                                     adv_rgba, mask = renderer.render(
-                                        mvp, resolution=(VIDEO_RES, VIDEO_RES),
+                                        mvp,
+                                        resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
                                         model_rot=mm[:3, :3])
                                     comp = _composite(adv_rgba, mask, composite_bg)
                                 else:
                                     comp = bg
                             frame_np = (comp[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
-                            img_model = np.array(Image.fromarray(frame_np).resize(
-                                (model_input_size, model_input_size)))
                         else:
                             frame_np = img_high
-                            img_model = np.array(
-                                Image.fromarray(img_high).resize((model_input_size, model_input_size)))
-
-                        replay_images.append(img_high)
+                        img_model, replay_image = build_policy_and_replay_views(
+                            frame_np,
+                            replay_resolution=VIDEO_RES,
+                            specification=DEFAULT_DEPLOYMENT_VIEW,
+                        )
+                        replay_images.append(replay_image)
 
                         observation = {
                             "full_image": img_model,
