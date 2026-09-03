@@ -14,6 +14,8 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
+from openvla_model_inputs import ensure_trailing_empty_token
+
 # Initialize important constants and pretty-printing mode in NumPy.
 ACTION_DIM = 7
 DATE = time.strftime("%Y_%m_%d")
@@ -166,6 +168,7 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
 
     # Process inputs.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    inputs = ensure_trailing_empty_token(inputs)
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
