@@ -56,6 +56,8 @@ OPENVLA_REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if OPENVLA_REPO_ROOT not in sys.path:
     sys.path.insert(0, OPENVLA_REPO_ROOT)
 
+from openvla_image_transform import DifferentiableOpenVLAImageProcessor
+from openvla_model_inputs import ensure_trailing_empty_token
 from openvla_utils import get_processor
 from robot_utils import (
     DATE_TIME, get_action, get_image_resize_size, get_model,
@@ -623,11 +625,10 @@ def train_adversarial_texture(
     RENDER_RES       = 256
     model_input_size = get_image_resize_size(cfg)
     device           = model.device
-
-    siglip_mean = torch.tensor([0.5,   0.5,   0.5  ], device=device).view(1, 3, 1, 1)
-    siglip_std  = torch.tensor([0.5,   0.5,   0.5  ], device=device).view(1, 3, 1, 1)
-    dino_mean   = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    dino_std    = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    image_preprocessor = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=model,
+        processor=processor,
+    )
 
     _avail = init_states if (init_states is not None and len(init_states) > 0) else [initial_obs_state]
     n_train_states   = min(cfg.num_train_init_states, len(_avail))
@@ -688,8 +689,9 @@ def train_adversarial_texture(
             image_pil    = Image.fromarray(img_np).resize((model_input_size, model_input_size))
             prompt       = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
             clean_inputs = processor(prompt, images=image_pil).to(device)
-            if "pixel_values" in clean_inputs:
-                clean_inputs["pixel_values"] = clean_inputs["pixel_values"].to(torch.bfloat16)
+            clean_pv = image_preprocessor(bg_tensor).to(torch.bfloat16)
+            clean_inputs["pixel_values"] = clean_pv
+            clean_inputs = ensure_trailing_empty_token(clean_inputs)
 
             with torch.no_grad():
                 with autocast(dtype=torch.bfloat16):
@@ -698,12 +700,6 @@ def train_adversarial_texture(
                         do_sample=False,
                         pad_token_id=processor.tokenizer.pad_token_id,
                     )
-                    clean_224 = F.interpolate(bg_tensor, size=(model_input_size, model_input_size),
-                                               mode="bilinear", align_corners=False)
-                    clean_pv  = torch.cat(
-                        [(clean_224 - siglip_mean) / siglip_std,
-                         (clean_224 - dino_mean)   / dino_std], dim=1
-                    ).to(torch.bfloat16)
                     clean_fwd = model(
                         input_ids=clean_output_ids,
                         attention_mask=torch.ones_like(clean_output_ids),
@@ -729,10 +725,6 @@ def train_adversarial_texture(
                 "clean_action":     clean_action,
                 "executed_action":  executed_action,
                 "clean_hidden":     clean_hidden,
-                "siglip_mean":      siglip_mean,
-                "siglip_std":       siglip_std,
-                "dino_mean":        dino_mean,
-                "dino_std":         dino_std,
                 "model_input_size": model_input_size,
             }
 
@@ -919,16 +911,7 @@ def train_adversarial_texture(
             sample_feat_losses   = []
 
             for sample_idx, adv_img in enumerate(adv_samples):
-                adv_224 = F.interpolate(
-                    adv_img,
-                    size=(fdata["model_input_size"], fdata["model_input_size"]),
-                    mode="bilinear", align_corners=False,
-                )
-
-                pv = torch.cat(
-                    [(adv_224 - fdata["siglip_mean"]) / fdata["siglip_std"],
-                     (adv_224 - fdata["dino_mean"])   / fdata["dino_std"]], dim=1
-                )
+                pv = image_preprocessor(adv_img)
 
                 with autocast(dtype=torch.bfloat16):
                     outputs = model(
