@@ -65,6 +65,12 @@ from openvla_policy_view import (
     build_policy_and_replay_views,
     resize_policy_pre_crop_canvas,
 )
+from openvla_renderer_contracts import (
+    DEFAULT_RENDERER_POSITION_OFFSET,
+    capture_frontmost_instance_masks,
+    compose_visibility_masked_renderer_delta,
+    find_target_body_poses,
+)
 from openvla_utils import get_processor
 from robot_utils import (
     DATE_TIME, get_action, get_model,
@@ -180,7 +186,9 @@ class DifferentiableRenderer(nn.Module):
         self.tex_h = 256
         self.tex_w = 256
         self.pos_offset = torch.tensor(
-            pos_offset or [0.02, 0.01, 0.025], dtype=torch.float32, device=device
+            DEFAULT_RENDERER_POSITION_OFFSET if pos_offset is None else pos_offset,
+            dtype=torch.float32,
+            device=device,
         )
 
         if scale_xyz is None:
@@ -611,10 +619,34 @@ def decode_action_from_generated_ids(model, generated_ids, unnorm_key=None):
         normalized_actions,
     )
 def _build_adv_samples(renderer, fdata, RENDER_RES: int) -> List[torch.Tensor]:
-    adv_rgba, mask = renderer.render(fdata["mvp"], resolution=(RENDER_RES, RENDER_RES),
-                                     model_rot=fdata.get("model_rot"))
-    bg = fdata.get("bg_tensor_no_obj") if fdata.get("bg_tensor_no_obj") is not None else fdata["bg_tensor"]
-    return [_composite(adv_rgba, mask, bg)]
+    instance_renders = [
+        renderer.render(
+            mvp,
+            resolution=(RENDER_RES, RENDER_RES),
+            return_clean=True,
+            model_rot=model_rotation,
+        )
+        for mvp, model_rotation in zip(
+            fdata["mvps"], fdata["model_rotations"], strict=True
+        )
+    ]
+    renderer_adversarial = torch.cat(
+        [render[0].permute(0, 3, 1, 2) for render in instance_renders], dim=0
+    )
+    renderer_clean = torch.cat(
+        [render[1].permute(0, 3, 1, 2) for render in instance_renders], dim=0
+    )
+    renderer_masks = torch.cat(
+        [render[2].permute(0, 3, 1, 2) for render in instance_renders], dim=0
+    )
+    composited = compose_visibility_masked_renderer_delta(
+        fdata["bg_tensor"],
+        fdata["instance_visibility"],
+        renderer_adversarial,
+        renderer_clean,
+        renderer_masks,
+    )
+    return [composited]
 
 
 def train_adversarial_texture(
@@ -671,24 +703,42 @@ def train_adversarial_texture(
             bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
                          ).permute(2, 0, 1).unsqueeze(0)
 
-            model_matrix, body_id, found_name = get_target_model_matrix(env, search_keywords_list)
-            mvp = (get_render_mvp_from_matrix(env, model_matrix, resolution=(RENDER_RES, RENDER_RES))
-                   if body_id != -1 else None)
-            if body_id != -1:
-                print(f"  [状态{_si} 步{t}] 目标 body: '{found_name}'")
+            target_poses = find_target_body_poses(
+                env, search_keywords_list, device=device
+            )
+            mvps = tuple(
+                get_render_mvp_from_matrix(
+                    env,
+                    pose.model_matrix,
+                    resolution=(RENDER_RES, RENDER_RES),
+                )
+                for pose in target_poses
+            )
+            model_rotations = tuple(
+                pose.model_matrix[:3, :3] for pose in target_poses
+            )
+            if target_poses:
+                instance_names = [pose.body_name for pose in target_poses]
+                print(
+                    f"  [状态{_si} 步{t}] 共享纹理实例 "
+                    f"({len(instance_names)}): {instance_names}"
+                )
+                instance_visibility = capture_frontmost_instance_masks(
+                    env,
+                    body_ids=tuple(pose.body_id for pose in target_poses),
+                    resolution=RENDER_RES,
+                ).to(device)
             else:
                 print(f"  [状态{_si} 步{t}] 未找到目标 body")
+                instance_visibility = None
 
-            _bg_no_obj_np = _render_bg_without_target(env, body_id, RENDER_RES) if body_id != -1 else None
-            bg_tensor_no_obj = (
-                (torch.from_numpy(_bg_no_obj_np.copy()).float().to(device) / 255.0
-                 ).permute(2, 0, 1).unsqueeze(0)
-                if _bg_no_obj_np is not None else None
-            )
-
-            if mvp is not None and not calib_done and calib_count < cfg.photometric_calib_frames:
-                renderer.calibrate_lighting(mvp, bg_tensor, ema=(0.8 if calib_count > 0 else 0.0),
-                                            model_rot=model_matrix[:3, :3])
+            if mvps and not calib_done and calib_count < cfg.photometric_calib_frames:
+                renderer.calibrate_lighting(
+                    mvps[0],
+                    bg_tensor,
+                    ema=(0.8 if calib_count > 0 else 0.0),
+                    model_rot=model_rotations[0],
+                )
                 calib_count += 1
                 if calib_count >= cfg.photometric_calib_frames:
                     calib_done = True
@@ -727,10 +777,10 @@ def train_adversarial_texture(
 
 
             frame_entry = {
-                "bg_tensor":        bg_tensor,
-                "bg_tensor_no_obj": bg_tensor_no_obj,
-                "mvp":              mvp,
-                "model_rot":        model_matrix[:3, :3] if model_matrix is not None else None,
+                "bg_tensor":          bg_tensor,
+                "mvps":               mvps,
+                "model_rotations":    model_rotations,
+                "instance_visibility": instance_visibility,
                 "clean_output_ids": clean_output_ids,
                 "prompt_ids":       clean_inputs["input_ids"],
                 "clean_action":     clean_action,
@@ -914,7 +964,7 @@ def train_adversarial_texture(
         batch_frames = [frame_pool[j] for j in batch_idx]
 
         for t, fdata in enumerate(batch_frames):
-            if fdata["mvp"] is None:
+            if not fdata["mvps"]:
                 continue
 
             w_t = torch.tensor(1.0 / batch_size, device=device)
