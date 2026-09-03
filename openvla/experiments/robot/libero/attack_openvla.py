@@ -16,7 +16,6 @@ import numpy as np
 import tqdm
 from torch.cuda.amp import autocast
 from PIL import Image
-from scipy.spatial.transform import Rotation as R
 import draccus
 import nvdiffrast.torch as dr
 import trimesh
@@ -70,6 +69,10 @@ from openvla_renderer_contracts import (
     capture_frontmost_instance_masks,
     compose_visibility_masked_renderer_delta,
     find_target_body_poses,
+)
+from openvla_runtime_assets import (
+    activate_runtime_texture,
+    resolve_runtime_texture_binding,
 )
 from openvla_utils import get_processor
 from robot_utils import (
@@ -447,59 +450,6 @@ class DifferentiableRenderer(nn.Module):
         return self.get_baked_adv_texture()
 
 
-def get_obj_name(mod, idx, obj_type):
-    short_type_map = {
-        "texture": "tex", "material": "mat",
-        "geom": "geom", "body": "body", "camera": "cam",
-    }
-    short_type = short_type_map.get(obj_type, obj_type)
-    func_name = f"{short_type}_id2name"
-    if hasattr(mod, func_name):
-        try:
-            return getattr(mod, func_name)(idx)
-        except Exception:
-            pass
-    if hasattr(mod, "id2name"):
-        try:
-            return mod.id2name(idx, obj_type)
-        except Exception:
-            pass
-    return None
-
-
-def get_target_model_matrix(env, search_keywords_list: List[List[str]]):
-    sim = env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
-    target_body_id = -1
-    found_name = None
-
-    for keywords in search_keywords_list:
-        if hasattr(sim.model, "nbody"):
-            for i in range(sim.model.nbody):
-                name = get_obj_name(sim.model, i, "body")
-                if not name or "vis" in name or "site" in name:
-                    continue
-                if all(k in name for k in keywords):
-                    target_body_id = i
-                    found_name = name
-                    break
-        if target_body_id != -1:
-            break
-
-    if target_body_id == -1:
-        print(f"[WARNING] Could not find target body for {search_keywords_list}. Using fallback matrix.")
-        fallback = torch.eye(4).cuda()
-        fallback[2, 3] = 0.85
-        return fallback, -1, None
-
-    pos  = sim.data.body_xpos[target_body_id]
-    quat = sim.data.body_xquat[target_body_id]
-    rot  = R.from_quat([quat[1], quat[2], quat[3], quat[0]])
-    mat  = np.eye(4, dtype=np.float32)
-    mat[:3, :3] = rot.as_matrix()
-    mat[:3,  3] = pos
-    return torch.from_numpy(mat).cuda(), target_body_id, found_name
-
-
 def get_render_mvp_from_matrix(
     env,
     model_matrix,
@@ -543,38 +493,6 @@ def get_render_mvp_from_matrix(
     )
 
 
-def _render_bg_without_target(env, body_id: int, resolution: int):
-    """临时把目标 body 所有 geom 的 alpha 设为 0，渲一帧无目标物体的背景，渲完立刻还原。
-    不影响物理状态/obs，MuJoCo 原生视频/物理推进完全不受影响。"""
-    sim = env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
-    geom_ids = [g for g in range(sim.model.ngeom) if sim.model.geom_bodyid[g] == body_id]
-    if not geom_ids:
-        return None
-    orig_alpha = [float(sim.model.geom_rgba[g, 3]) for g in geom_ids]
-    try:
-        for g in geom_ids:
-            sim.model.geom_rgba[g, 3] = 0.0
-        img = sim.render(width=resolution, height=resolution, camera_name="agentview", mode="offscreen")
-        img = img[::-1, ::-1]
-    finally:
-        for g, a in zip(geom_ids, orig_alpha):
-            sim.model.geom_rgba[g, 3] = a
-    return img
-
-
-def _composite(adv_rgba, mask, bg_tensor):
-    mask_t = mask.permute(0, 3, 1, 2)
-    return torch.clamp(
-        adv_rgba.permute(0, 3, 1, 2) * mask_t + bg_tensor * (1 - mask_t),
-        0.0, 1.0,
-    )
-
-
-def render_and_composite(renderer, bg_tensor, mvp, resolution=(256, 256), model_rot=None):
-    if mvp is None:
-        return bg_tensor
-    adv_rgba, mask = renderer.render(mvp, resolution=resolution, model_rot=model_rot)
-    return _composite(adv_rgba, mask, bg_tensor)
 def get_attack_loss(logits, clean_labels):
     ACTION_START = 31744
     ACTION_END   = 32000
@@ -655,6 +573,7 @@ def train_adversarial_texture(
     save_dir, episode_idx,
     search_keywords_list: List[List[str]],
     xml_path,
+    runtime_texture_binding,
     num_iters=20,
     init_states=None,
 ):
@@ -704,7 +623,10 @@ def train_adversarial_texture(
                          ).permute(2, 0, 1).unsqueeze(0)
 
             target_poses = find_target_body_poses(
-                env, search_keywords_list, device=device
+                env,
+                search_keywords_list,
+                device=device,
+                texture_name=runtime_texture_binding.texture_name,
             )
             mvps = tuple(
                 get_render_mvp_from_matrix(
@@ -843,20 +765,7 @@ def train_adversarial_texture(
             (baked_tex.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
         ).save(tex_path)
 
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        tex_name = f"tex-{cfg.object_name}"
-        mat_name = f"mat-{cfg.object_name}"
-        for asset_elem in root.findall("asset"):
-            for tex_elem in asset_elem.findall("texture"):
-                if tex_elem.get("name") == tex_name:
-                    tex_elem.set("file", str(Path(tex_path).resolve()))
-                    tex_elem.set("type", "2d")
-                    break
-        for mat_elem in root.findall(".//material"):
-            if mat_elem.get("name") == mat_name:
-                mat_elem.set("texuniform", "false")
-        tree.write(xml_path)
+        activate_runtime_texture(xml_path, runtime_texture_binding, tex_path)
         return tex_path
 
     def _run_live_test(i):
@@ -886,40 +795,8 @@ def train_adversarial_texture(
                 continue
 
             img_np = get_libero_image(test_obs, POLICY_SOURCE_RESOLUTION)
-            bg_tensor = (torch.from_numpy(img_np).float().to(device) / 255.0
-                         ).permute(2, 0, 1).unsqueeze(0)
-
-            model_matrix, body_id, _ = get_target_model_matrix(test_env, search_keywords_list)
-            mvp = (get_render_mvp_from_matrix(
-                test_env, model_matrix,
-                resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
-            ) if body_id != -1 else None)
-
-            _bg_no_obj = _render_bg_without_target(
-                test_env, body_id, POLICY_SOURCE_RESOLUTION
-            ) if body_id != -1 else None
-            composite_bg = (
-                (torch.from_numpy(_bg_no_obj.copy()).float().to(device) / 255.0
-                 ).permute(2, 0, 1).unsqueeze(0)
-                if _bg_no_obj is not None else bg_tensor
-            )
-
-            with torch.no_grad():
-                if mvp is not None:
-                    adv_rgba, mask = renderer.render(
-                        mvp,
-                        resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
-                        model_rot=model_matrix[:3, :3]
-                    )
-                    composited = _composite(adv_rgba, mask, composite_bg)
-                else:
-                    composited = bg_tensor
-
-            perceived_np = (
-                composited[0].permute(1, 2, 0).detach().clamp(0, 1).cpu().numpy() * 255
-            ).astype(np.uint8)
             img_model, replay_image = build_policy_and_replay_views(
-                perceived_np,
+                img_np,
                 replay_resolution=cfg.live_test_resolution,
                 specification=DEFAULT_DEPLOYMENT_VIEW,
             )
@@ -1128,6 +1005,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     if not original_xml.exists():
         raise FileNotFoundError(f"XML asset not found at {original_xml}")
+    runtime_texture_binding = resolve_runtime_texture_binding(
+        original_xml,
+        texture_path,
+        object_name=cfg.object_name,
+    )
     global_clean_backup = original_xml.with_name(
         f"{original_xml.stem}_clean_backup_{DATE_TIME}{original_xml.suffix}"
     )
@@ -1228,22 +1110,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 Image.fromarray(
                     (baked_vis.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
                 ).save(adv_tex_inj_path)
-                tree = ET.parse(original_xml)
-                root = tree.getroot()
-                for asset_elem in root.findall("asset"):
-                    for tex_elem in asset_elem.findall("texture"):
-                        if tex_elem.get("name") == f"tex-{cfg.object_name}":
-                            tex_elem.set("file", str(Path(adv_tex_inj_path).resolve()))
-                            tex_elem.set("type", "2d")
-                            break
-                for mat_elem in root.findall(".//material"):
-                    if mat_elem.get("name") == f"mat-{cfg.object_name}":
-                        mat_elem.set("texuniform", "false")
-                tree.write(original_xml)
+                activate_runtime_texture(
+                    original_xml, runtime_texture_binding, adv_tex_inj_path
+                )
                 print(f"[INFO] MuJoCo XML updated with adversarial texture → {adv_tex_inj_path}")
-                if _real_tex_path.exists() or _real_tex_backup is not None:
-                    shutil.copy(adv_tex_inj_path, _real_tex_path)
-                    print(f"[INFO] Real MuJoCo texture overwritten → {_real_tex_path}")
 
             if cfg.enable_attack and cfg.load_texture_path is None:
                 print(f"[INFO] Attack training for Task {task_id}...")
@@ -1260,6 +1130,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     artifact_dir, episode_idx=task_id,
                     search_keywords_list=search_kw,
                     xml_path=original_xml,
+                    runtime_texture_binding=runtime_texture_binding,
                     num_iters=cfg.attack_iters,
                     init_states=init_states,
                 )
@@ -1274,24 +1145,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     ).save(trained_tex_path)
                 print(f"[INFO] Task {task_id} texture saved → {trained_tex_path}")
 
-                tree = ET.parse(original_xml)
-                root = tree.getroot()
-                tex_name = f"tex-{cfg.object_name}"
-                mat_name = f"mat-{cfg.object_name}"
-                for asset_elem in root.findall("asset"):
-                    for tex_elem in asset_elem.findall("texture"):
-                        if tex_elem.get("name") == tex_name:
-                            tex_elem.set("file", str(Path(trained_tex_path).resolve()))
-                            tex_elem.set("type", "2d")
-                            break
-                for mat_elem in root.findall(".//material"):
-                    if mat_elem.get("name") == mat_name:
-                        mat_elem.set("texuniform", "false")
-                tree.write(original_xml)
+                activate_runtime_texture(
+                    original_xml, runtime_texture_binding, trained_tex_path
+                )
                 print(f"[INFO] XML updated for Task {task_id}.")
-                if _real_tex_path.exists() or _real_tex_backup is not None:
-                    shutil.copy(trained_tex_path, _real_tex_path)
-                    print(f"[INFO] Real MuJoCo texture overwritten → {_real_tex_path}")
 
             n_eval = min(cfg.num_trials_per_task, len(init_states))
             for ep in tqdm.tqdm(range(n_eval),
@@ -1315,38 +1172,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             continue
 
                         img_high = get_libero_image(obs, POLICY_SOURCE_RESOLUTION)
-                        if renderer is not None:
-                            bg = (torch.from_numpy(img_high).float().to(model.device) / 255.0
-                                  ).permute(2, 0, 1).unsqueeze(0)
-                            mm, bid, _ = get_target_model_matrix(env, search_kw)
-                            mvp = (get_render_mvp_from_matrix(
-                                env,
-                                mm,
-                                resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
-                            )
-                                   if bid != -1 else None)
-                            _bg_np = _render_bg_without_target(
-                                env, bid, POLICY_SOURCE_RESOLUTION
-                            ) if bid != -1 else None
-                            composite_bg = (
-                                (torch.from_numpy(_bg_np.copy()).float().to(model.device) / 255.0
-                                 ).permute(2, 0, 1).unsqueeze(0)
-                                if _bg_np is not None else bg
-                            )
-                            with torch.no_grad():
-                                if mvp is not None:
-                                    adv_rgba, mask = renderer.render(
-                                        mvp,
-                                        resolution=(POLICY_SOURCE_RESOLUTION, POLICY_SOURCE_RESOLUTION),
-                                        model_rot=mm[:3, :3])
-                                    comp = _composite(adv_rgba, mask, composite_bg)
-                                else:
-                                    comp = bg
-                            frame_np = (comp[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
-                        else:
-                            frame_np = img_high
                         img_model, replay_image = build_policy_and_replay_views(
-                            frame_np,
+                            img_high,
                             replay_resolution=VIDEO_RES,
                             specification=DEFAULT_DEPLOYMENT_VIEW,
                         )

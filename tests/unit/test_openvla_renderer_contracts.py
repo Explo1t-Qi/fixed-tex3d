@@ -27,14 +27,21 @@ from openvla_renderer_contracts import (  # noqa: E402
 class _Model:
     nbody = 4
     ngeom = 4
+    nmat = 2
     body_parentid = np.array([0, 0, 0, 0])
     geom_bodyid = np.array([0, 1, 2, 3])
+    geom_matid = np.array([1, 0, 0, 1])
+    mat_texid = np.array([0, 1])
 
     @staticmethod
     def body_id2name(body_id: int) -> str:
         return ("world", "akita_black_bowl_1", "akita_black_bowl_2", "plate")[
             body_id
         ]
+
+    @staticmethod
+    def tex_name2id(name: str) -> int:
+        return {"shared-akita": 0, "other": 1}[name]
 
 
 def _environment() -> SimpleNamespace:
@@ -53,7 +60,10 @@ def test_renderer_default_position_offset_is_exact_zero() -> None:
 
 def test_all_shared_texture_instances_are_discovered() -> None:
     poses = find_target_body_poses(
-        _environment(), (("akita_black_bowl",), ("bowl",)), device="cpu"
+        _environment(),
+        (("akita_black_bowl",), ("bowl",)),
+        device="cpu",
+        texture_name="shared-akita",
     )
 
     assert [pose.body_id for pose in poses] == [1, 2]

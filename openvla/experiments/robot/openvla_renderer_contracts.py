@@ -59,6 +59,7 @@ def find_target_body_poses(
     search_keywords: Sequence[Sequence[str]],
     *,
     device: Any,
+    texture_name: str | None = None,
 ) -> tuple[TargetBodyPose, ...]:
     """Return every body matching the first successful keyword group.
 
@@ -66,13 +67,45 @@ def find_target_body_poses(
     unlike the baseline helper, this function never stops at the first body.
     """
     simulation = _simulation(env)
+    texture_body_ids: set[int] | None = None
+    if texture_name is not None:
+        model = simulation.model
+        try:
+            texture_id = (
+                model.tex_name2id(texture_name)
+                if hasattr(model, "tex_name2id")
+                else model.name2id(texture_name, "texture")
+            )
+        except Exception as error:
+            raise ValueError(
+                f"MuJoCo model does not contain texture {texture_name!r}"
+            ) from error
+        material_texture_ids = np.asarray(model.mat_texid)
+        material_ids = set(
+            int(index)
+            for index in np.flatnonzero(
+                (material_texture_ids == int(texture_id)).reshape(
+                    material_texture_ids.shape[0], -1
+                ).any(axis=1)
+            )
+        )
+        geometry_material_ids = np.asarray(model.geom_matid, dtype=np.int64)
+        geometry_body_ids = np.asarray(model.geom_bodyid, dtype=np.int64)
+        texture_body_ids = {
+            int(geometry_body_ids[geometry_id])
+            for geometry_id, material_id in enumerate(geometry_material_ids)
+            if int(material_id) in material_ids
+        }
     for keyword_group in search_keywords:
         matches: list[TargetBodyPose] = []
         for body_id in range(int(simulation.model.nbody)):
             name = _body_name(simulation.model, body_id)
             if not name or "vis" in name or "site" in name:
                 continue
-            if all(keyword in name for keyword in keyword_group):
+            if all(keyword in name for keyword in keyword_group) and (
+                texture_body_ids is None
+                or bool(_descendant_bodies(simulation.model, body_id) & texture_body_ids)
+            ):
                 matches.append(
                     _pose_from_id(simulation, body_id, name, device)
                 )
