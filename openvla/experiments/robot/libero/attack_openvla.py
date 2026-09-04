@@ -24,18 +24,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-print("[INFO] Setting up OSMesa for CPU Rendering...")
-os.environ['MUJOCO_GL'] = 'osmesa'
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
+os.environ.setdefault('MUJOCO_GL', 'osmesa')
+os.environ.setdefault('PYOPENGL_PLATFORM', 'osmesa')
+print(f"[INFO] MuJoCo rendering backend: {os.environ['MUJOCO_GL']}")
 
-try:
-    ctypes.CDLL("libOSMesa.so")
-except Exception as e:
-    print(f"[WARNING] Failed to load libOSMesa.so: {e}")
+if os.environ['MUJOCO_GL'] == 'osmesa':
+    try:
+        ctypes.CDLL("libOSMesa.so")
+    except Exception as e:
+        print(f"[WARNING] Failed to load libOSMesa.so: {e}")
 
-PATH_TO_LIBERO_ROOT = "./libero-eval"
-ASSET_ROOT_SCANNED  = "./libero-eval/libero/libero/assets/stable_scanned_objects"
-ASSET_ROOT_HOPE     = "./libero-eval/libero/libero/assets/stable_hope_objects"
+PATH_TO_LIBERO_ROOT = os.environ.get("LIBERO_ROOT", "./libero-eval")
+LIBERO_ASSET_ROOT = os.path.join(PATH_TO_LIBERO_ROOT, "libero/libero/assets")
+ASSET_ROOT_SCANNED = os.path.join(LIBERO_ASSET_ROOT, "stable_scanned_objects")
+ASSET_ROOT_HOPE = os.path.join(LIBERO_ASSET_ROOT, "stable_hope_objects")
 
 if PATH_TO_LIBERO_ROOT not in sys.path:
     sys.path.append(PATH_TO_LIBERO_ROOT)
@@ -650,6 +652,14 @@ def train_adversarial_texture(
                     body_ids=tuple(pose.body_id for pose in target_poses),
                     resolution=RENDER_RES,
                 ).to(device)
+                visible_pixel_counts = [
+                    int(instance_visibility[index].sum().item())
+                    for index in range(len(target_poses))
+                ]
+                print(
+                    "  front-most visible pixels: "
+                    f"{dict(zip(instance_names, visible_pixel_counts, strict=True))}"
+                )
             else:
                 print(f"  [状态{_si} 步{t}] 未找到目标 body")
                 instance_visibility = None
@@ -703,6 +713,12 @@ def train_adversarial_texture(
                 "mvps":               mvps,
                 "model_rotations":    model_rotations,
                 "instance_visibility": instance_visibility,
+                "instance_names":      tuple(
+                    pose.body_name for pose in target_poses
+                ),
+                "visible_pixel_counts": tuple(
+                    visible_pixel_counts if target_poses else ()
+                ),
                 "clean_output_ids": clean_output_ids,
                 "prompt_ids":       clean_inputs["input_ids"],
                 "clean_action":     clean_action,
@@ -748,6 +764,27 @@ def train_adversarial_texture(
     frame_pool = frame_data
     pool_size  = len(frame_pool)
     batch_size = min(cfg.num_frames_to_attack, pool_size)
+    frame_contract_path = os.path.join(
+        save_dir, f"Ep{episode_idx}_frame_contract.json"
+    )
+    with open(frame_contract_path, "w") as f:
+        json.dump(
+            [
+                {
+                    "frame_index": frame_index,
+                    "instance_count": len(frame["instance_names"]),
+                    "instance_names": list(frame["instance_names"]),
+                    "visible_pixel_counts": list(frame["visible_pixel_counts"]),
+                    "policy_source_resolution": RENDER_RES,
+                    "pre_crop_resolution": DEFAULT_DEPLOYMENT_VIEW.pre_crop_resolution,
+                    "deployment_crop_area": DEFAULT_DEPLOYMENT_VIEW.crop_area,
+                }
+                for frame_index, frame in enumerate(frame_pool)
+            ],
+            f,
+            indent=2,
+            sort_keys=True,
+        )
 
 
     pgd_step = cfg.attack_lr
@@ -756,6 +793,10 @@ def train_adversarial_texture(
     grad_log_path = os.path.join(save_dir, f"Ep{episode_idx}_gradient_log.txt")
     with open(grad_log_path, "w") as f:
         f.write("Iter | Total Loss | Action Loss | Feature Loss | Grad Norm | LR\n")
+    step_metrics_path = os.path.join(
+        save_dir, f"Ep{episode_idx}_step_metrics.jsonl"
+    )
+    Path(step_metrics_path).write_text("")
 
     def _bake_and_inject_eval_texture(tag):
         with torch.no_grad():
@@ -834,8 +875,10 @@ def train_adversarial_texture(
     iterator = tqdm.tqdm(range(num_iters), desc="Optimizing", leave=False)
     for i in iterator:
         renderer.adv_noise.grad = None
+        parameter_before = renderer.adv_noise.detach().clone()
         avg_total = avg_action = avg_feat = 0.0
         valid = 0
+        image_gradient_norms = []
 
         batch_idx  = np.random.choice(pool_size, batch_size, replace=False)
         batch_frames = [frame_pool[j] for j in batch_idx]
@@ -852,6 +895,7 @@ def train_adversarial_texture(
             sample_feat_losses   = []
 
             for sample_idx, adv_img in enumerate(adv_samples):
+                adv_img.retain_grad()
                 pv = image_preprocessor(policy_view(adv_img))
 
                 with autocast(dtype=torch.bfloat16):
@@ -872,7 +916,16 @@ def train_adversarial_texture(
                 cfg.alpha_action  * loss_action +
                 cfg.alpha_feature * loss_feature
             )
+            if not bool(torch.isfinite(frame_loss)):
+                raise RuntimeError("Tex3D objective produced NaN/Inf")
             frame_loss.backward()
+            for adv_img in adv_samples:
+                if adv_img.grad is None or not bool(torch.isfinite(adv_img.grad).all()):
+                    raise RuntimeError("Tex3D image gradient is missing or non-finite")
+                image_gradient_norm = float(adv_img.grad.norm().item())
+                if image_gradient_norm == 0.0:
+                    raise RuntimeError("Tex3D image gradient is zero")
+                image_gradient_norms.append(image_gradient_norm)
 
             avg_total  += frame_loss.item()
             avg_action += loss_action.item()
@@ -885,8 +938,14 @@ def train_adversarial_texture(
             avg_feat   /= valid
         loss_history.append(avg_total)
 
-        grad   = renderer.adv_noise.grad
-        g_norm = grad.norm().item() if grad is not None else 0.0
+        if valid == 0:
+            raise RuntimeError("Tex3D step has no valid renderer frames")
+        grad = renderer.adv_noise.grad
+        if grad is None or not bool(torch.isfinite(grad).all()):
+            raise RuntimeError("Tex3D texture gradient is missing or non-finite")
+        g_norm = float(grad.norm().item())
+        if g_norm == 0.0:
+            raise RuntimeError("Tex3D texture gradient is zero")
 
         with open(grad_log_path, "a") as f:
             f.write(f"{i:02d} | {avg_total:.6f} | {avg_action:.6f} | "
@@ -894,6 +953,26 @@ def train_adversarial_texture(
 
         with torch.no_grad():
             renderer.adv_noise.data -= pgd_step * grad.sign()
+            parameter_after = renderer.adv_noise.detach().clone()
+            maximum_texture_perturbation = float(
+                (torch.tanh(parameter_after) * renderer.epsilon).abs().max().item()
+            )
+        step_metrics = {
+            "iteration": i,
+            "action_loss": avg_action,
+            "feature_loss": avg_feat,
+            "total_loss": avg_total,
+            "image_gradient_norm_max": max(image_gradient_norms),
+            "texture_gradient_norm": g_norm,
+            "parameter_before_linf": float(parameter_before.abs().max().item()),
+            "parameter_after_linf": float(parameter_after.abs().max().item()),
+            "parameter_change_linf": float(
+                (parameter_after - parameter_before).abs().max().item()
+            ),
+            "maximum_texture_perturbation": maximum_texture_perturbation,
+        }
+        with open(step_metrics_path, "a") as f:
+            f.write(json.dumps(step_metrics, sort_keys=True) + "\n")
         iterator.set_postfix(
             act=f"{avg_action:.4f}",
             feat=f"{avg_feat:.4f}",

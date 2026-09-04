@@ -22,6 +22,13 @@ from openvla_renderer_contracts import (  # noqa: E402
     compose_visibility_masked_renderer_delta,
     find_target_body_poses,
 )
+from openvla_image_transform import (  # noqa: E402
+    DifferentiableOpenVLAImageProcessor,
+)
+from openvla_policy_view import (  # noqa: E402
+    DeploymentViewSpecification,
+    PolicyViewTransform,
+)
 
 
 class _Model:
@@ -155,3 +162,45 @@ def test_visibility_gates_delta_and_shared_parameter_gradients_accumulate() -> N
     composited.sum().backward()
     assert parameter.grad is not None
     assert float(parameter.grad) == 6.0
+
+
+def test_compositor_deployment_and_preprocessing_chain_has_finite_texture_gradient(
+) -> None:
+    parameter = torch.tensor(0.1, requires_grad=True)
+    clean = torch.full((1, 3, 8, 8), 0.4, dtype=torch.float32)
+    alpha = torch.ones((1, 1, 8, 8), dtype=torch.float32)
+    renderer_clean = torch.full((1, 3, 8, 8), 0.3, dtype=torch.float32)
+    renderer_adv = renderer_clean + parameter
+    renderer_mask = torch.ones((1, 1, 8, 8), dtype=torch.float32)
+    composited = compose_visibility_masked_renderer_delta(
+        clean, alpha, renderer_adv, renderer_clean, renderer_mask
+    )
+    view_specification = DeploymentViewSpecification(
+        source_resolution=8, pre_crop_resolution=6, crop_area=0.9
+    )
+    effective_view = PolicyViewTransform(view_specification)(composited)
+    processor_config = SimpleNamespace(
+        image_resize_strategy="resize-naive",
+        input_sizes=((3, 6, 6),),
+        tvf_resize_params=(
+            {"size": (6, 6), "interpolation": 3, "antialias": True},
+        ),
+        tvf_crop_params=({"output_size": (6, 6)},),
+        tvf_normalize_params=(
+            {"mean": (0.5, 0.5, 0.5), "std": (0.5, 0.5, 0.5)},
+        ),
+    )
+    preprocessor = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=SimpleNamespace(
+            config=SimpleNamespace(timm_model_ids=("vision-branch",))
+        ),
+        processor=SimpleNamespace(image_processor=processor_config),
+    )
+
+    loss = preprocessor(effective_view).square().mean()
+    loss.backward()
+
+    assert bool(torch.isfinite(loss))
+    assert parameter.grad is not None
+    assert bool(torch.isfinite(parameter.grad))
+    assert float(parameter.grad.abs()) > 0.0
