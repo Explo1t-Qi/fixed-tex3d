@@ -157,9 +157,11 @@ def _load_pairs(pairs_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             "scene_state_identical",
             "camera_state_identical",
             "robot_state_identical",
-            "wrist_rgb_identical",
+            "pi05_wrist_rgb_held_fixed",
         )):
             raise ValueError(f"pair scene contract failed for {sample_id}")
+        if metadata.get("pi05_wrist_rgb_source") != "clean_capture":
+            raise ValueError(f"pi0.5 fixed wrist source mismatch for {sample_id}")
         loaded.append(
             {
                 "sample_id": sample_id,

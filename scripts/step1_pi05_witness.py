@@ -139,7 +139,7 @@ def _policy_input(
 
 
 def _load_pairs(pairs_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    from step1_o2_p2 import load_pair_metadata, verify_pair_identity
+    from step1_o2_p2 import load_pair_metadata, sha256_rgb, verify_pair_identity
 
     manifest = json.loads((pairs_dir / "manifest.json").read_text(encoding="utf-8"))
     records = manifest.get("records")
@@ -174,6 +174,18 @@ def _load_pairs(pairs_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             raise ValueError("fixed wrist RGB must be uint8 [512,512,3]")
         if robot_state.shape != (8,) or not np.all(np.isfinite(robot_state)):
             raise ValueError("fixed pi0.5 robot state must be finite [8]")
+        if any(metadata.get(name) is not True for name in (
+            "no_policy_action_between_observations",
+            "scene_state_identical",
+            "camera_state_identical",
+            "robot_state_identical",
+            "pi05_wrist_rgb_held_fixed",
+        )):
+            raise ValueError(f"pair scene contract failed for {metadata['sample_id']}")
+        if metadata.get("pi05_wrist_rgb_source") != "clean_capture":
+            raise ValueError("pi0.5 fixed wrist must come from the clean capture")
+        if metadata.get("pi05_fixed_wrist_rgb_sha256") != sha256_rgb(wrist):
+            raise ValueError("pi0.5 fixed wrist RGB identity mismatch")
         if (
             metadata.get("openvla_attacked_camera_field") != "agentview_image"
             or metadata.get("pi05_corresponding_image_field") != "base_0_rgb"

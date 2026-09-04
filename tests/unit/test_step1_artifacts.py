@@ -37,11 +37,16 @@ def _capture(**changes):
     return collector._Capture(**values)
 
 
-def test_pair_scene_check_allows_only_primary_rgb_to_change() -> None:
+def test_pair_scene_check_allows_texture_to_change_both_captured_camera_images() -> None:
     clean = _capture()
-    changed_rgb = clean.base_rgb.copy()
-    changed_rgb[0, 0, 0] = 1
-    collector._validate_scene_pair(clean, _capture(base_rgb=changed_rgb))
+    changed_base = clean.base_rgb.copy()
+    changed_base[0, 0, 0] = 1
+    changed_wrist = clean.wrist_rgb.copy()
+    changed_wrist[0, 0, 0] = 2
+    collector._validate_scene_pair(
+        clean,
+        _capture(base_rgb=changed_base, wrist_rgb=changed_wrist),
+    )
 
     changed_state = clean.scene_state.copy()
     changed_state[0] += 1
@@ -82,9 +87,10 @@ def _write_pair_tree(root: Path) -> tuple[np.ndarray, np.ndarray]:
     adversarial[0, 0] = (1, 2, 3)
     Image.fromarray(clean).save(state_dir / "clean.png")
     Image.fromarray(adversarial).save(state_dir / "adversarial.png")
+    fixed_wrist = np.zeros((512, 512, 3), dtype=np.uint8)
     np.savez_compressed(
         state_dir / "fixed_inputs.npz",
-        wrist_rgb_raw=np.zeros((512, 512, 3), dtype=np.uint8),
+        wrist_rgb_raw=fixed_wrist,
         robot_state=np.zeros(8, dtype=np.float64),
         scene_state=np.zeros(4, dtype=np.float64),
         camera_state=np.zeros(13, dtype=np.float64),
@@ -98,11 +104,13 @@ def _write_pair_tree(root: Path) -> tuple[np.ndarray, np.ndarray]:
         "task_description": "pick up the bowl",
         "openvla_attacked_camera_field": "agentview_image",
         "pi05_corresponding_image_field": "base_0_rgb",
+        "pi05_wrist_rgb_source": "clean_capture",
+        "pi05_fixed_wrist_rgb_sha256": collector.sha256_rgb(fixed_wrist),
+        "pi05_wrist_rgb_held_fixed": True,
         "no_policy_action_between_observations": True,
         "scene_state_identical": True,
         "camera_state_identical": True,
         "robot_state_identical": True,
-        "wrist_rgb_identical": True,
     }
     (state_dir / "metadata.json").write_text(json.dumps(metadata))
     (root / "manifest.json").write_text(
@@ -114,6 +122,18 @@ def _write_pair_tree(root: Path) -> tuple[np.ndarray, np.ndarray]:
         )
     )
     return clean, adversarial
+
+
+def test_pi05_consumer_fails_closed_on_fixed_wrist_hash(tmp_path) -> None:
+    pairs = tmp_path / "pairs"
+    _write_pair_tree(pairs)
+    metadata_path = pairs / "state_10/metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["pi05_fixed_wrist_rgb_sha256"] = "sha256:" + "0" * 64
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="fixed wrist RGB identity mismatch"):
+        pi05_consumer._load_pairs(pairs)
 
 
 def test_both_consumers_fail_closed_on_the_same_pair_hashes(tmp_path) -> None:

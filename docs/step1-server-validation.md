@@ -13,12 +13,12 @@ LOG_ROOT=/data/xiaomengqi/logs/step1
 OPENVLA_PY=/home/xiaomengqi/miniconda3/envs/tex3d-openvla/bin/python
 OPENVLA_CKPT=/data/huangsimin/openvla-7b-finetuned-libero-spatial
 OPENPI_ROOT=/data/xiaomengqi/src/openpi
-OPENPI_PY=/data/xiaomengqi/src/openpi/.venv/bin/python
+JOINT_PY=/data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python
 PI05_CKPT=/data/xiaomengqi/checkpoints/pi05_libero/openpi-assets/checkpoints/pi05_libero
 SHARED_ROOT=/data/xiaomengqi/src/shared-feature-tex3d
 ```
 
-Before running, verify that `OPENPI_PY`, `OPENPI_ROOT`, and `SHARED_ROOT` match
+Before running, verify that `JOINT_PY`, `OPENPI_ROOT`, and `SHARED_ROOT` match
 the existing validated joint environment. Do not install or upgrade packages
 inside the authoritative OpenVLA environment.
 
@@ -32,7 +32,7 @@ for path in \
   "$OPENVLA_PY" \
   "$OPENVLA_CKPT" \
   "$OPENPI_ROOT" \
-  "$OPENPI_PY" \
+  "$JOINT_PY" \
   "$PI05_CKPT" \
   "$SHARED_ROOT"
 do
@@ -50,7 +50,7 @@ print("openvla transformers", transformers.__version__)
 print("openvla tokenizers", tokenizers.__version__)
 print("openvla cuda", torch.cuda.is_available(), torch.cuda.device_count())
 PY
-"$OPENPI_PY" - <<'PY'
+"$JOINT_PY" - <<'PY'
 import jax, torch
 print("openpi jax", jax.__version__)
 print("openpi backend", jax.default_backend())
@@ -83,7 +83,7 @@ cd "$REPO"
 RUN_TAG=$(date +%Y%m%d-%H%M%S)
 SOURCE_SMOKE="$LOG_ROOT/source-smoke-$RUN_TAG"
 test ! -e "$SOURCE_SMOKE"
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
@@ -167,7 +167,7 @@ cd "$REPO"
 Run the OpenVLA consumer only in the authoritative OpenVLA environment:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
@@ -182,10 +182,10 @@ Only after that process exits, run the separate pi0.5 witness process:
 
 ```bash
 cd "$REPO"
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONNOUSERSITE=1 \
 PYTHONDONTWRITEBYTECODE=1 \
-"$OPENPI_PY" scripts/step1_pi05_witness.py \
+"$JOINT_PY" scripts/step1_pi05_witness.py \
   --pairs-dir "$SOURCE_SMOKE/heldout_pairs" \
   --output-dir "$SOURCE_SMOKE/pi05" \
   --openpi-root "$OPENPI_ROOT" \
@@ -212,7 +212,7 @@ test ! -e "$FORMAL_ROOT"
 Run the single frozen configuration:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
@@ -249,7 +249,7 @@ consumer exactly as in the witness smoke:
   --libero-root "$LIBERO_ROOT_PATH" \
   --state-ids 10-19
 
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
@@ -259,17 +259,17 @@ PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
   --pretrained-checkpoint "$OPENVLA_CKPT" \
   --libero-root "$LIBERO_ROOT_PATH"
 
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONNOUSERSITE=1 \
 PYTHONDONTWRITEBYTECODE=1 \
-"$OPENPI_PY" scripts/step1_pi05_witness.py \
+"$JOINT_PY" scripts/step1_pi05_witness.py \
   --pairs-dir "$FORMAL_ROOT/heldout_pairs" \
   --output-dir "$FORMAL_ROOT/pi05" \
   --openpi-root "$OPENPI_ROOT" \
   --shared-feature-root "$SHARED_ROOT" \
   --checkpoint-dir "$PI05_CKPT"
 
-"$OPENPI_PY" scripts/step1_analyze_transfer.py \
+"$JOINT_PY" scripts/step1_analyze_transfer.py \
   --pairs-dir "$FORMAL_ROOT/heldout_pairs" \
   --openvla-dir "$FORMAL_ROOT/openvla" \
   --pi05-dir "$FORMAL_ROOT/pi05" \

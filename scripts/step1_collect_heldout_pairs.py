@@ -155,7 +155,6 @@ def _capture_state(task: Any, initial_state: Any) -> _Capture:
 
 def _validate_scene_pair(clean: _Capture, adversarial: _Capture) -> None:
     checks = {
-        "wrist RGB": np.array_equal(clean.wrist_rgb, adversarial.wrist_rgb),
         "robot state": np.array_equal(clean.robot_state, adversarial.robot_state),
         "scene state": np.array_equal(clean.scene_state, adversarial.scene_state),
         "camera state": np.array_equal(clean.camera_state, adversarial.camera_state),
@@ -275,12 +274,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "openvla_attacked_camera_field": CAMERA_FIELD,
             "pi05_corresponding_image_field": PI05_CAMERA_FIELD,
             "pi05_fixed_wrist_field": WRIST_FIELD,
+            "pi05_wrist_rgb_source": "clean_capture",
+            "pi05_fixed_wrist_rgb_sha256": sha256_rgb(clean.wrist_rgb),
+            "pi05_wrist_rgb_held_fixed": True,
+            "captured_clean_wrist_rgb_sha256": sha256_rgb(clean.wrist_rgb),
+            "captured_adv_wrist_rgb_sha256": sha256_rgb(adversarial.wrist_rgb),
+            "captured_wrist_rgb_identical": bool(
+                np.array_equal(clean.wrist_rgb, adversarial.wrist_rgb)
+            ),
             "task_description": clean.task_description,
             "no_policy_action_between_observations": True,
             "scene_state_identical": True,
             "camera_state_identical": True,
             "robot_state_identical": True,
-            "wrist_rgb_identical": True,
             "clean_path": "clean.png",
             "adversarial_path": "adversarial.png",
             "fixed_inputs_path": "fixed_inputs.npz",

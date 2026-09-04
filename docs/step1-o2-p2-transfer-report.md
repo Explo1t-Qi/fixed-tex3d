@@ -6,9 +6,11 @@
 STEP 1 IMPLEMENTATION READY — SERVER VALIDATION PENDING
 ```
 
-The implementation and CPU contracts are complete and ready for user-operated
-server validation. The required source GPU smoke, one-pair witness smoke, and
-formal experiment have not run, so no scientific transfer result is claimed.
+The implementation and CPU contracts are complete. The source GPU smoke passed
+on the server. The first one-pair collection exposed and stopped on an overly
+strict wrist-image assertion; that contract has been corrected and awaits a
+server rerun. The formal experiment has not run, so no scientific transfer
+result is claimed.
 
 ## Git provenance
 
@@ -39,7 +41,10 @@ Implemented contracts:
 - deterministic nonzero O2-mode initialization, needed because squared
   displacement has an exactly zero derivative at an exactly clean start;
 - raw MuJoCo clean/adversarial pair collection with no policy action and exact
-  robot/scene/camera/wrist equality checks;
+  robot/scene/camera equality checks;
+- explicit reuse and SHA256 verification of the clean-capture wrist image for
+  both pi0.5 inputs; the separately captured adversarial wrist may legitimately
+  show the changed texture and is not treated as scene-state drift;
 - independent OpenVLA and pi0.5 consumers that recompute and verify the same
   sample IDs and raw-image SHA256 values;
 - the validated pi05 adapter mapping `agentview_image -> base_0_rgb`, with wrist,
@@ -72,18 +77,18 @@ PYTHONDONTWRITEBYTECODE=1 \
 30 passed in 7.75s
 ```
 
-Final implementation suite:
+Latest implementation suite after the wrist-input contract regression fix:
 
 ```text
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 /home/xmq/.virtualenvs/modified-tex3d/bin/python -m pytest -q tests/unit
-47 passed in 5.52s
+48 passed in 5.61s
 ```
 
 The explicit empty `CUDA_VISIBLE_DEVICES` is required for a CPU regression on
 this workstation. One intermediate invocation let TensorFlow discover the
 local GPU and failed because local CUDA lacks `libdevice.10.bc`; rerunning as an
-actual CPU test passed all 47 tests. No code was changed to conceal that
+actual CPU test passed the suite. No code was changed to conceal that
 environmental failure.
 
 The tests cover all required unit gates:
@@ -116,22 +121,21 @@ the tex3d-openvla server environment
 a PyTorch-visible CUDA device
 ```
 
-The configured validation server
-`xiaomengqi@59.78.189.196` was contacted twice with a 10/15-second connection
-timeout. Both attempts failed before authentication with:
-
-```text
-ssh: connect to host 59.78.189.196 port 22: Connection timed out
-```
-
-The user will execute the server validation using
+The user is executing server validation using
 `LIBERO_ROOT=/data/xiaomengqi/src/LIBERO-joint/` and store run artifacts under
-`/data/xiaomengqi/logs/`. Consequently, the following required gates remain
-**NOT EXECUTED** at this report revision:
+`/data/xiaomengqi/logs/`. The confirmed joint OpenVLA/OpenPI witness Python is
+`/data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python`.
+The source GPU smoke passed with a finite loss, finite/nonzero O2 displacement
+and texture gradient, a changed parameter, a respected texture budget, pi0.5
+absent from training, and successful XML/texture restoration. The first witness
+collection stopped before feature extraction because the attacked texture was
+also visible in the separately rendered wrist image. This is expected image
+content change, not a scene-state change; the witness contract requires that
+the clean wrist input be reused for both pi0.5 calls. Consequently, the
+following required gates remain **NOT EXECUTED** at this report revision:
 
 ```text
-source GPU smoke
-one held-out-pair OpenVLA/P2 witness smoke
+one held-out-pair OpenVLA/P2 witness smoke rerun
 formal train 0-9
 formal analyze 10-19
 server XML/texture restoration audit
