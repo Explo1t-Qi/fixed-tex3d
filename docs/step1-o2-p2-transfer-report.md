@@ -6,12 +6,10 @@
 STEP 1 IMPLEMENTATION READY — SERVER VALIDATION PENDING
 ```
 
-The implementation and CPU contracts are complete. The source GPU smoke,
-corrected one-pair collection, and authoritative OpenVLA O2 extraction passed
-on the server. The first PyTorch pi0.5 extraction reached the official
-preprocessing boundary and exposed a tuple-interface mismatch in the witness
-adapter; that mismatch has been corrected and awaits a server rerun. The formal
-experiment has not run, so no scientific transfer result is claimed.
+The implementation and CPU contracts are complete. The source GPU smoke and
+one-pair OpenVLA O2/PyTorch pi0.5 P2 witness smoke passed on the server. The
+formal experiment has not run, so no formal scientific transfer result is
+claimed.
 
 ## Git provenance
 
@@ -19,7 +17,7 @@ experiment has not run, so no scientific transfer result is claimed.
 repository          /home/xmq/src/tex3d
 base commit         6ee46c18c78981cfa86b45edaab20c11db030483
 branch              feat/step1-o2-p2-transfer-mvp
-implementation HEAD 4e4dbe5 (before this report commit)
+pre-formal code HEAD dc4ac355e5fc61bbb8182fc0bec5f1e06454fa45
 Step 0 code ancestor ff9fcbc8f84debb7693027a58490a0d856c8cdde
 ```
 
@@ -139,11 +137,12 @@ expected image content change, not a scene-state change; the corrected
 collection and OpenVLA O2 extraction then passed. The first PyTorch pi0.5 run
 stopped because the witness treated the official five-value preprocessing
 tuple as an object with image attributes. A regression test now reproduces the
-official tuple contract and passes with explicit unpacking. Consequently, the
-following required gates remain **NOT EXECUTED** at this report revision:
+official tuple contract and passes with explicit unpacking. The corrected
+PyTorch rerun then passed all shape, provenance, frozen-model, no-grad, and
+official-prefix-slice checks. Consequently, the following required gates remain
+**NOT EXECUTED** at this report revision:
 
 ```text
-one held-out-pair OpenVLA/P2 witness smoke rerun
 formal train 0-9
 formal analyze 10-19
 server XML/texture restoration audit
@@ -153,17 +152,35 @@ formal artifact completeness audit
 The exact fail-closed commands are recorded in
 `docs/step1-server-validation.md`.
 
+### Smoke measurements
+
+The one-pair smoke used state 10 only and the source-smoke texture
+`sha256:e77ee3d7b1f6e2351d2f517d0690521a557f00ce7014b95782c2b2477375fcde`.
+Both consumers verified the same raw pair:
+
+```text
+clean RGB sha256:d17110ecbb1c3c5d4b74a0f518137953f51b5f81b7a202f38a7a7cae23a30722
+adv RGB   sha256:1f40a02f8e9c481ea6ad02fd5d119d1b545b073cc43e1f1502009a78b1c9c025
+O2 shape  [1,256,4096]
+P2 shape  [1,256,2048]
+d_O2      0.0005087100718570168
+d_P2      0.0036383388960389983
+```
+
+These values validate the one-pair runtime path only. State-level or
+token-index correlation is undefined for one state and was not computed.
+
 ## Scientific observation
 
-No real-model measurements are available. The three Step 1 questions remain
-unanswered:
+The three formal Step 1 questions remain unanswered until the frozen 10-state
+run is complete:
 
 1. Held-out OpenVLA O2 displacement: **NOT MEASURED**.
 2. Frozen-texture pi0.5 P2 displacement: **NOT MEASURED**.
 3. State-level and token-index O2/P2 trends: **NOT MEASURED**.
 
-There are no formal `rho`, p-value, per-state token correlations, or O2/P2
-displacement values to report. No experiment directory is claimed as formal.
+There are no formal `rho`, p-value, or per-state token correlations to report.
+No smoke directory is claimed as formal.
 
 ## Interpretation boundary
 
@@ -184,8 +201,13 @@ been established here; the implemented metric is therefore labelled only as a
 
 ## Artifact state
 
-No smoke or formal runtime artifacts were generated locally. Once the server is
-reachable, the validated pipeline will write:
+The server smoke artifacts were synchronized read-only under:
+
+```text
+experiment_inbox/step1/source-smoke-20260904-173550/
+```
+
+The formal pipeline will write:
 
 ```text
 /data/xiaomengqi/logs/step1/<run-id>/
