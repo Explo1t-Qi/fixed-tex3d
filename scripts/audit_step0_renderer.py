@@ -19,7 +19,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 OPENVLA_ROOT = REPOSITORY_ROOT / "openvla"
 ROBOT_DIR = OPENVLA_ROOT / "experiments/robot"
 LIBERO_DIR = ROBOT_DIR / "libero"
-LIBERO_ROOT = LIBERO_DIR / "libero-eval"
+LIBERO_ROOT = Path(os.environ.get("LIBERO_ROOT", OPENVLA_ROOT / "libero-eval"))
 for path in (OPENVLA_ROOT, ROBOT_DIR, LIBERO_DIR, LIBERO_ROOT):
     sys.path.insert(0, str(path))
 

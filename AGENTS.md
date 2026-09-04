@@ -71,4 +71,3 @@ Every completed development task must report:
 * tests executed and results;
 * GPU smoke results when applicable;
 * remaining known issues or unexecuted validation.
-

@@ -1,4 +1,4 @@
-# Codex 前置任务书 v2  
+# Codex 前置任务书 v2
 
 # Step 0 — Tex3D/OpenVLA Baseline Correctness Repair & Smoke Validation
 
