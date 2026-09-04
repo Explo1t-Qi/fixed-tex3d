@@ -6,10 +6,11 @@ import traceback
 import time
 import json
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Union, List
 import shutil
+import hashlib
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -78,6 +79,18 @@ from openvla_renderer_contracts import (
 from openvla_runtime_assets import (
     activate_runtime_texture,
     resolve_runtime_texture_binding,
+)
+from step1_o2_p2 import (
+    LEGACY_OBJECTIVE,
+    O2_DISPLACEMENT_OBJECTIVE,
+    assert_pi05_not_loaded,
+    detached_clean_o2,
+    extract_openvla_o2,
+    freeze_openvla_for_o2,
+    initialize_o2_texture_parameter,
+    legacy_attack_objective,
+    o2_displacement_loss,
+    validate_attack_objective,
 )
 from openvla_utils import get_processor
 from robot_utils import (
@@ -585,6 +598,14 @@ def train_adversarial_texture(
     print(f"[ATTACK] Training Ep {episode_idx} | {cfg.num_frames_to_attack}-Frame Optimization...")
     os.makedirs(save_dir, exist_ok=True)
 
+    attack_objective = validate_attack_objective(cfg.attack_objective)
+    if attack_objective == O2_DISPLACEMENT_OBJECTIVE:
+        assert_pi05_not_loaded()
+        freeze_openvla_for_o2(model)
+        initialize_o2_texture_parameter(
+            renderer.get_texture_param(), scale=cfg.attack_lr, seed=cfg.seed
+        )
+
     RENDER_RES       = POLICY_SOURCE_RESOLUTION
     device           = model.device
     image_preprocessor = (
@@ -685,29 +706,47 @@ def train_adversarial_texture(
                     img_np, specification=DEFAULT_DEPLOYMENT_VIEW
                 )
             )
-            prompt       = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
-            clean_inputs = processor(prompt, images=image_pil).to(device)
             clean_pv = image_preprocessor(policy_view(bg_tensor)).to(torch.bfloat16)
-            clean_inputs["pixel_values"] = clean_pv
-            clean_inputs = ensure_trailing_empty_token(clean_inputs)
-
-            with torch.no_grad():
+            clean_o2 = None
+            clean_output_ids = None
+            clean_hidden = None
+            clean_action = None
+            if attack_objective == O2_DISPLACEMENT_OBJECTIVE:
                 with autocast(dtype=torch.bfloat16):
-                    clean_output_ids = model.generate(
-                        **clean_inputs, max_new_tokens=7,
-                        do_sample=False,
-                        pad_token_id=processor.tokenizer.pad_token_id,
-                    )
-                    clean_fwd = model(
-                        input_ids=clean_output_ids,
-                        attention_mask=torch.ones_like(clean_output_ids),
-                        pixel_values=clean_pv,
-                        output_hidden_states=True,
-                    )
-                    clean_hidden = clean_fwd.hidden_states[-1].detach()
-                    clean_action = decode_action_from_generated_ids(model, clean_output_ids, cfg.unnorm_key)
+                    clean_o2 = detached_clean_o2(model, clean_pv)
+            else:
+                prompt = (
+                    "In: What action should the robot take to "
+                    f"{task_description.lower()}?\nOut:"
+                )
+                clean_inputs = processor(prompt, images=image_pil).to(device)
+                clean_inputs["pixel_values"] = clean_pv
+                clean_inputs = ensure_trailing_empty_token(clean_inputs)
+
+                with torch.no_grad():
+                    with autocast(dtype=torch.bfloat16):
+                        clean_output_ids = model.generate(
+                            **clean_inputs, max_new_tokens=7,
+                            do_sample=False,
+                            pad_token_id=processor.tokenizer.pad_token_id,
+                        )
+                        clean_fwd = model(
+                            input_ids=clean_output_ids,
+                            attention_mask=torch.ones_like(clean_output_ids),
+                            pixel_values=clean_pv,
+                            output_hidden_states=True,
+                        )
+                        clean_hidden = clean_fwd.hidden_states[-1].detach()
+                        clean_action = decode_action_from_generated_ids(
+                            model, clean_output_ids, cfg.unnorm_key
+                        )
             executed_action = None
             if cfg.frame_collect_with_policy:
+                if clean_action is None:
+                    raise RuntimeError(
+                        "policy-driven frame collection is unavailable for the "
+                        "feature-only O2 objective"
+                    )
                 executed_action = normalize_gripper_action(clean_action.copy(), binarize=True)
                 if cfg.model_family == "openvla":
                     executed_action = invert_gripper_action(executed_action)
@@ -725,10 +764,15 @@ def train_adversarial_texture(
                     visible_pixel_counts if target_poses else ()
                 ),
                 "clean_output_ids": clean_output_ids,
-                "prompt_ids":       clean_inputs["input_ids"],
+                "prompt_ids": (
+                    clean_inputs["input_ids"]
+                    if attack_objective == LEGACY_OBJECTIVE
+                    else None
+                ),
                 "clean_action":     clean_action,
                 "executed_action":  executed_action,
                 "clean_hidden":     clean_hidden,
+                "clean_o2":         clean_o2,
             }
 
             if cfg.collect_grasp_frames:
@@ -797,7 +841,10 @@ def train_adversarial_texture(
 
     grad_log_path = os.path.join(save_dir, f"Ep{episode_idx}_gradient_log.txt")
     with open(grad_log_path, "w") as f:
-        f.write("Iter | Total Loss | Action Loss | Feature Loss | Grad Norm | LR\n")
+        f.write(
+            "Iter | Objective | Total Loss | Action Loss | Feature Loss | "
+            "O2 Displacement | Grad Norm | LR\n"
+        )
     step_metrics_path = os.path.join(
         save_dir, f"Ep{episode_idx}_step_metrics.jsonl"
     )
@@ -881,7 +928,7 @@ def train_adversarial_texture(
     for i in iterator:
         renderer.adv_noise.grad = None
         parameter_before = renderer.adv_noise.detach().clone()
-        avg_total = avg_action = avg_feat = 0.0
+        avg_total = avg_action = avg_feat = avg_o2_displacement = 0.0
         valid = 0
         image_gradient_norms = []
 
@@ -897,30 +944,63 @@ def train_adversarial_texture(
             adv_samples = _build_adv_samples(renderer, fdata, RENDER_RES)
 
             sample_action_losses = []
-            sample_feat_losses   = []
+            sample_feat_losses = []
+            sample_o2_losses = []
+            sample_o2_displacements = []
 
             for sample_idx, adv_img in enumerate(adv_samples):
                 adv_img.retain_grad()
                 pv = image_preprocessor(policy_view(adv_img))
 
-                with autocast(dtype=torch.bfloat16):
-                    outputs = model(
-                        input_ids=fdata["clean_output_ids"],
-                        attention_mask=torch.ones_like(fdata["clean_output_ids"]),
-                        pixel_values=pv.to(torch.bfloat16),
-                        output_hidden_states=True,
+                if attack_objective == LEGACY_OBJECTIVE:
+                    with autocast(dtype=torch.bfloat16):
+                        outputs = model(
+                            input_ids=fdata["clean_output_ids"],
+                            attention_mask=torch.ones_like(fdata["clean_output_ids"]),
+                            pixel_values=pv.to(torch.bfloat16),
+                            output_hidden_states=True,
+                        )
+
+                    sample_action_losses.append(
+                        get_attack_loss(
+                            outputs.logits, fdata["clean_output_ids"]
+                        )
                     )
+                    sample_feat_losses.append(
+                        -F.mse_loss(
+                            outputs.hidden_states[-1], fdata["clean_hidden"]
+                        )
+                    )
+                else:
+                    with autocast(dtype=torch.bfloat16):
+                        adv_o2 = extract_openvla_o2(
+                            model, pv.to(torch.bfloat16)
+                        )
+                    o2_loss, displacement = o2_displacement_loss(
+                        adv_o2, fdata["clean_o2"]
+                    )
+                    sample_o2_losses.append(o2_loss)
+                    sample_o2_displacements.append(displacement.detach())
 
-                sample_action_losses.append(get_attack_loss(outputs.logits, fdata["clean_output_ids"]))
-                sample_feat_losses.append(-F.mse_loss(outputs.hidden_states[-1], fdata["clean_hidden"]))
+            if attack_objective == LEGACY_OBJECTIVE:
+                loss_action = torch.stack(sample_action_losses).mean()
+                loss_feature = torch.stack(sample_feat_losses).mean()
+                o2_displacement = torch.zeros((), device=device)
+                objective_loss = legacy_attack_objective(
+                    loss_action,
+                    loss_feature,
+                    alpha_action=cfg.alpha_action,
+                    alpha_feature=cfg.alpha_feature,
+                )
+            else:
+                loss_action = torch.zeros((), device=device)
+                loss_feature = torch.zeros((), device=device)
+                o2_displacement = torch.stack(
+                    sample_o2_displacements
+                ).mean()
+                objective_loss = torch.stack(sample_o2_losses).mean()
 
-            loss_action  = torch.stack(sample_action_losses).mean()
-            loss_feature = torch.stack(sample_feat_losses).mean()
-
-            frame_loss = w_t * (
-                cfg.alpha_action  * loss_action +
-                cfg.alpha_feature * loss_feature
-            )
+            frame_loss = w_t * objective_loss
             if not bool(torch.isfinite(frame_loss)):
                 raise RuntimeError("Tex3D objective produced NaN/Inf")
             frame_loss.backward()
@@ -935,12 +1015,14 @@ def train_adversarial_texture(
             avg_total  += frame_loss.item()
             avg_action += loss_action.item()
             avg_feat   += loss_feature.item()
+            avg_o2_displacement += o2_displacement.item()
             valid += 1
 
         if valid > 0:
             avg_total  /= valid
             avg_action /= valid
             avg_feat   /= valid
+            avg_o2_displacement /= valid
         loss_history.append(avg_total)
 
         if valid == 0:
@@ -953,8 +1035,12 @@ def train_adversarial_texture(
             raise RuntimeError("Tex3D texture gradient is zero")
 
         with open(grad_log_path, "a") as f:
-            f.write(f"{i:02d} | {avg_total:.6f} | {avg_action:.6f} | "
-                    f"{avg_feat:.6f} | {g_norm:.6e} | {pgd_step:.6e}\n")
+            f.write(
+                f"{i:02d} | {attack_objective} | {avg_total:.6f} | "
+                f"{avg_action:.6f} | {avg_feat:.6f} | "
+                f"{avg_o2_displacement:.6f} | {g_norm:.6e} | "
+                f"{pgd_step:.6e}\n"
+            )
 
         with torch.no_grad():
             renderer.adv_noise.data -= pgd_step * grad.sign()
@@ -964,8 +1050,10 @@ def train_adversarial_texture(
             )
         step_metrics = {
             "iteration": i,
+            "attack_objective": attack_objective,
             "action_loss": avg_action,
             "feature_loss": avg_feat,
+            "o2_displacement": avg_o2_displacement,
             "total_loss": avg_total,
             "image_gradient_norm_max": max(image_gradient_norms),
             "texture_gradient_norm": g_norm,
@@ -978,11 +1066,16 @@ def train_adversarial_texture(
         }
         with open(step_metrics_path, "a") as f:
             f.write(json.dumps(step_metrics, sort_keys=True) + "\n")
-        iterator.set_postfix(
-            act=f"{avg_action:.4f}",
-            feat=f"{avg_feat:.4f}",
-            gnorm=f"{g_norm:.4f}",
-        )
+        if attack_objective == LEGACY_OBJECTIVE:
+            iterator.set_postfix(
+                act=f"{avg_action:.4f}",
+                feat=f"{avg_feat:.4f}",
+                gnorm=f"{g_norm:.4f}",
+            )
+        else:
+            iterator.set_postfix(
+                o2=f"{avg_o2_displacement:.4f}", gnorm=f"{g_norm:.4f}"
+            )
 
         if (cfg.live_test_enabled and cfg.live_test_every_n_iters > 0
                 and (i + 1) % cfg.live_test_every_n_iters == 0):
@@ -1000,6 +1093,27 @@ def train_adversarial_texture(
             os.path.join(save_dir, f"Ep{episode_idx}_loss_history.npy"),
             np.array(loss_history),
         )
+        if attack_objective == O2_DISPLACEMENT_OBJECTIVE:
+            assert_pi05_not_loaded()
+            summary = {
+                "attack_objective": attack_objective,
+                "train_state_ids": list(range(n_train_states)),
+                "num_training_frames": pool_size,
+                "num_iterations": num_iters,
+                "pi05_loaded_during_training": False,
+                "texture_initialization": "seeded_uniform_parameter",
+                "texture_initialization_scale": float(cfg.attack_lr),
+                "texture_initialization_seed": int(cfg.seed),
+                "final_total_loss": loss_history[-1],
+                "final_o2_displacement": avg_o2_displacement,
+                "final_texture_gradient_norm": g_norm,
+                "maximum_texture_perturbation": maximum_texture_perturbation,
+                "renderer_epsilon": float(renderer.epsilon),
+            }
+            Path(save_dir, "training_summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     return env, loss_history
 
@@ -1025,6 +1139,7 @@ class GenerateConfig:
     enable_attack:        bool           = True
     attack_iters:         int            = 10
     attack_lr:            float          = 0.05
+    attack_objective:       str            = LEGACY_OBJECTIVE
     num_frames_to_attack: int            = 20
     num_train_init_states: int           = 10
     train_frames_per_state: int          = 1
@@ -1048,6 +1163,8 @@ class GenerateConfig:
     save_attack_artifacts: bool           = True
     load_texture_path:     Optional[str]  = None
     local_log_dir:         str            = "./experiments/logs"
+    step1_output_dir:       Optional[str]  = None
+    step1_formal:           bool           = False
 
     use_wandb:     bool           = False
     wandb_project: str            = "openvla_attack"
@@ -1058,9 +1175,47 @@ class GenerateConfig:
     unnorm_key:  Optional[str]  = None
 
 
+def _validate_step1_formal_config(cfg: GenerateConfig) -> None:
+    if not cfg.step1_formal:
+        return
+    expected = {
+        "attack_objective": O2_DISPLACEMENT_OBJECTIVE,
+        "task_suite_name": "libero_spatial",
+        "task_id": 0,
+        "object_name": "akita_black_bowl",
+        "enable_attack": True,
+        "attack_iters": 10,
+        "attack_lr": 0.05,
+        "num_frames_to_attack": 20,
+        "num_train_init_states": 10,
+        "train_frames_per_state": 1,
+        "frame_collect_with_policy": False,
+        "collect_grasp_frames": False,
+        "photometric_calib_frames": 5,
+        "live_test_enabled": False,
+        "num_trials_per_task": 0,
+        "save_attack_artifacts": True,
+        "load_texture_path": None,
+        "seed": 7,
+        "center_crop": True,
+    }
+    actual = {name: getattr(cfg, name) for name in expected}
+    if actual != expected:
+        raise ValueError(
+            "Step 1 formal configuration is frozen; mismatched fields: "
+            f"{[(name, actual[name], value) for name, value in expected.items() if actual[name] != value]}"
+        )
+    if not cfg.step1_output_dir:
+        raise ValueError("Step 1 formal run requires step1_output_dir")
+
+
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
+    validate_attack_objective(cfg.attack_objective)
+    _validate_step1_formal_config(cfg)
+    if cfg.attack_objective == O2_DISPLACEMENT_OBJECTIVE:
+        assert_pi05_not_loaded()
 
 
     if cfg.object_name not in OBJECTS:
@@ -1077,11 +1232,29 @@ def eval_libero(cfg: GenerateConfig) -> None:
     run_id = f"EVAL-{task_suite_name}-{DATE_TIME}"
     if cfg.run_id_note:
         run_id = f"{cfg.run_id_note}-{run_id}"
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    artifact_dir = os.path.join(cfg.local_log_dir, "attack_artifacts", run_id)
+    step1_run_dir = (
+        Path(cfg.step1_output_dir).expanduser().resolve()
+        if cfg.step1_output_dir
+        else None
+    )
+    if step1_run_dir is not None and cfg.attack_objective != O2_DISPLACEMENT_OBJECTIVE:
+        raise ValueError("step1_output_dir is only valid for o2_displacement")
+    if step1_run_dir is not None:
+        if step1_run_dir.exists():
+            raise FileExistsError(
+                f"Step 1 output directory must be fresh: {step1_run_dir}"
+            )
+        step1_run_dir.mkdir(parents=True)
+        artifact_dir = str(step1_run_dir / "training")
+        Path(artifact_dir).mkdir()
+        log_root = step1_run_dir
+    else:
+        os.makedirs(cfg.local_log_dir, exist_ok=True)
+        artifact_dir = os.path.join(cfg.local_log_dir, "attack_artifacts", run_id)
+        log_root = Path(cfg.local_log_dir)
     if cfg.enable_attack and cfg.save_attack_artifacts:
         os.makedirs(artifact_dir, exist_ok=True)
-    log_file     = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
+    log_file = open(log_root / (run_id + ".txt"), "w")
     original_xml = Path(xml_path)
 
     if cfg.use_wandb:
@@ -1150,6 +1323,29 @@ def eval_libero(cfg: GenerateConfig) -> None:
             device=str(model.device),
             scale_xyz=scale_xyz,
         ).to(model.device)
+        if step1_run_dir is not None:
+            resolved_config = asdict(cfg)
+            resolved_config.update(
+                {
+                    "run_id": run_id,
+                    "renderer_epsilon": float(renderer.epsilon),
+                    "renderer_position_offset": renderer.pos_offset.detach()
+                    .cpu()
+                    .tolist(),
+                    "train_state_ids": list(range(cfg.num_train_init_states)),
+                    "heldout_state_ids": list(range(10, 20)),
+                    "formal_configuration_frozen": bool(cfg.step1_formal),
+                    "pi05_training_role": "forbidden/not loaded",
+                    "o2_texture_initialization": "seeded_uniform_parameter",
+                    "o2_texture_initialization_scale": float(cfg.attack_lr),
+                    "o2_texture_initialization_seed": int(cfg.seed),
+                }
+            )
+            (step1_run_dir / "config.json").write_text(
+                json.dumps(resolved_config, indent=2, sort_keys=True, default=str)
+                + "\n",
+                encoding="utf-8",
+            )
     total_episodes  = 0
     total_successes = 0
 
@@ -1222,11 +1418,44 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 with torch.no_grad():
                     baked_tex = renderer.get_baked_adv_texture()
                     trained_tex_path = os.path.join(
-                        artifact_dir, f"task_{task_id}_adv_texture_{DATE_TIME}.png"
+                        artifact_dir,
+                        (
+                            "final_attack_texture.png"
+                            if step1_run_dir is not None
+                            else f"task_{task_id}_adv_texture_{DATE_TIME}.png"
+                        ),
                     )
                     Image.fromarray(
                         (baked_tex.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
                     ).save(trained_tex_path)
+                    if step1_run_dir is not None:
+                        torch.save(
+                            renderer.get_texture_param().detach().cpu(),
+                            Path(artifact_dir) / "parameter.pt",
+                        )
+                        texture_hash = hashlib.sha256(
+                            Path(trained_tex_path).read_bytes()
+                        ).hexdigest()
+                        (Path(artifact_dir) / "texture_sha256.txt").write_text(
+                            f"sha256:{texture_hash}\n", encoding="utf-8"
+                        )
+                        summary_path = Path(artifact_dir) / "training_summary.json"
+                        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                        summary.update(
+                            {
+                                "final_attack_texture": str(
+                                    Path(trained_tex_path).resolve()
+                                ),
+                                "texture_sha256": f"sha256:{texture_hash}",
+                                "parameter_artifact": str(
+                                    (Path(artifact_dir) / "parameter.pt").resolve()
+                                ),
+                            }
+                        )
+                        summary_path.write_text(
+                            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
                 print(f"[INFO] Task {task_id} texture saved → {trained_tex_path}")
 
                 activate_runtime_texture(
