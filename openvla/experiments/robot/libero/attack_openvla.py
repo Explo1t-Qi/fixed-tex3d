@@ -47,11 +47,11 @@ import imageio
 
 
 sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent))
 from libero_utils import (
     get_libero_dummy_action, get_libero_env, get_libero_image,
     quat2axisangle, save_rollout_video,
 )
-sys.path.append(str(Path(__file__).parent.parent))
 
 OPENVLA_REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if OPENVLA_REPO_ROOT not in sys.path:
