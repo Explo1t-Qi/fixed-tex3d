@@ -93,7 +93,12 @@ def test_native_mujoco_name_api_discovers_shared_texture_instances(
         geom_matid=np.array([1, 0, 0, 1]),
         mat_texid=np.array([0, 1]),
     )
-    body_names = ("world", "akita_black_bowl_1", "akita_black_bowl_2", "plate")
+    body_names = (
+        "world",
+        "akita_black_bowl_1",
+        "akita_black_bowl_2",
+        "plate",
+    )
     object_types = SimpleNamespace(
         mjOBJ_TEXTURE=7, mjOBJ_BODY=1, mjOBJ_CAMERA=3
     )
@@ -165,6 +170,70 @@ def test_robosuite_model_wrapper_is_unwrapped_for_native_name_lookup(
     assert resolve_mujoco_object_id(
         wrapper, "shared-akita", "texture"
     ) == 4
+
+
+def test_prefixed_compiled_texture_instances_are_discovered(
+    monkeypatch,
+) -> None:
+    """robosuite prefixes copied MJCF assets with each object instance name."""
+    raw_model = SimpleNamespace(ntex=3)
+    wrapper = SimpleNamespace(
+        _model=raw_model,
+        nbody=4,
+        ngeom=4,
+        body_parentid=np.array([0, 0, 0, 0]),
+        geom_bodyid=np.array([0, 1, 2, 3]),
+        geom_matid=np.array([2, 0, 1, 2]),
+        mat_texid=np.array([1, 2, 0]),
+    )
+    body_names = ("world", "akita_black_bowl_1", "akita_black_bowl_2", "plate")
+    texture_names = (
+        "plate_tex-ceramic",
+        "akita_black_bowl_1_tex-akita_black_bowl",
+        "akita_black_bowl_2_tex-akita_black_bowl",
+    )
+    object_types = SimpleNamespace(mjOBJ_TEXTURE=7, mjOBJ_BODY=1)
+
+    def name_to_id(candidate_model, object_type, name):
+        assert candidate_model is raw_model
+        assert object_type == object_types.mjOBJ_TEXTURE
+        return -1
+
+    def id_to_name(candidate_model, object_type, object_id):
+        assert candidate_model is raw_model
+        if object_type == object_types.mjOBJ_TEXTURE:
+            return texture_names[object_id]
+        assert object_type == object_types.mjOBJ_BODY
+        return body_names[object_id]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(
+            mjtObj=object_types,
+            mj_name2id=name_to_id,
+            mj_id2name=id_to_name,
+        ),
+    )
+    data = SimpleNamespace(
+        xpos=np.zeros((4, 3), dtype=np.float32),
+        xquat=np.tile(
+            np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (4, 1)
+        ),
+    )
+    environment = SimpleNamespace(sim=SimpleNamespace(model=wrapper, data=data))
+
+    poses = find_target_body_poses(
+        environment,
+        (("akita_black_bowl",),),
+        device="cpu",
+        texture_name="tex-akita_black_bowl",
+    )
+
+    assert [pose.body_name for pose in poses] == [
+        "akita_black_bowl_1",
+        "akita_black_bowl_2",
+    ]
 
 
 def test_frontmost_segmentation_is_split_into_mutually_exclusive_masks() -> None:

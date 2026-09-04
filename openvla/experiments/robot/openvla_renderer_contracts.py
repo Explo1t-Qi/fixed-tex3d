@@ -67,6 +67,49 @@ def resolve_mujoco_object_id(model: Any, name: str, kind: str) -> int:
     return object_id
 
 
+def _resolve_compiled_texture_ids(model: Any, source_name: str) -> tuple[int, ...]:
+    """Resolve one source texture across robosuite-prefixed MJCF instances.
+
+    ``MujocoXMLObject`` prefixes copied asset names with the object instance's
+    naming prefix.  The compiled model can therefore contain multiple texture
+    IDs such as ``akita_black_bowl_1_tex-akita_black_bowl`` while the source
+    XML calls the texture ``tex-akita_black_bowl``.
+    """
+    raw_model = _raw_mujoco_model(model)
+    compiled_names: list[tuple[int, str]] = []
+    try:
+        import mujoco
+
+        texture_type = _native_mujoco_object_type("texture")
+        for texture_id in range(int(raw_model.ntex)):
+            compiled_name = mujoco.mj_id2name(
+                raw_model, texture_type, texture_id
+            )
+            if compiled_name is not None:
+                compiled_names.append((texture_id, compiled_name))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        # Legacy mujoco-py models expose tex_name2id but cannot be enumerated
+        # with native mujoco module functions.
+        compiled_names = []
+
+    suffix = f"_{source_name}"
+    matches = tuple(
+        texture_id
+        for texture_id, compiled_name in compiled_names
+        if compiled_name == source_name or compiled_name.endswith(suffix)
+    )
+    if matches:
+        return matches
+
+    try:
+        return (resolve_mujoco_object_id(model, source_name, "texture"),)
+    except KeyError as error:
+        available = tuple(name for _, name in compiled_names)
+        raise KeyError(
+            f"{source_name!r}; compiled texture names={available!r}"
+        ) from error
+
+
 def _body_name(model: Any, body_id: int) -> str | None:
     if hasattr(model, "body_id2name"):
         try:
@@ -127,18 +170,17 @@ def find_target_body_poses(
     if texture_name is not None:
         model = simulation.model
         try:
-            texture_id = resolve_mujoco_object_id(
-                model, texture_name, "texture"
-            )
+            texture_ids = _resolve_compiled_texture_ids(model, texture_name)
         except Exception as error:
             raise ValueError(
-                f"MuJoCo model does not contain texture {texture_name!r}"
+                f"MuJoCo model does not contain source texture "
+                f"{texture_name!r}: {error}"
             ) from error
         material_texture_ids = np.asarray(model.mat_texid)
         material_ids = set(
             int(index)
             for index in np.flatnonzero(
-                (material_texture_ids == int(texture_id)).reshape(
+                np.isin(material_texture_ids, texture_ids).reshape(
                     material_texture_ids.shape[0], -1
                 ).any(axis=1)
             )
