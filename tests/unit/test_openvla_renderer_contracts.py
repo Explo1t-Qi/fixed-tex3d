@@ -21,6 +21,7 @@ from openvla_renderer_contracts import (  # noqa: E402
     capture_frontmost_instance_masks,
     compose_visibility_masked_renderer_delta,
     find_target_body_poses,
+    resolve_mujoco_object_id,
 )
 from openvla_image_transform import (  # noqa: E402
     DifferentiableOpenVLAImageProcessor,
@@ -74,6 +75,68 @@ def test_all_shared_texture_instances_are_discovered() -> None:
     )
 
     assert [pose.body_id for pose in poses] == [1, 2]
+    assert [pose.body_name for pose in poses] == [
+        "akita_black_bowl_1",
+        "akita_black_bowl_2",
+    ]
+
+
+def test_native_mujoco_name_api_discovers_shared_texture_instances(
+    monkeypatch,
+) -> None:
+    """Native mujoco.MjModel exposes module functions, not name methods."""
+    model = SimpleNamespace(
+        nbody=4,
+        ngeom=4,
+        body_parentid=np.array([0, 0, 0, 0]),
+        geom_bodyid=np.array([0, 1, 2, 3]),
+        geom_matid=np.array([1, 0, 0, 1]),
+        mat_texid=np.array([0, 1]),
+    )
+    body_names = ("world", "akita_black_bowl_1", "akita_black_bowl_2", "plate")
+    object_types = SimpleNamespace(
+        mjOBJ_TEXTURE=7, mjOBJ_BODY=1, mjOBJ_CAMERA=3
+    )
+
+    def name_to_id(candidate_model, object_type, name):
+        assert candidate_model is model
+        values = {
+            (object_types.mjOBJ_TEXTURE, "shared-akita"): 0,
+            (object_types.mjOBJ_CAMERA, "agentview"): 2,
+        }
+        return values.get((object_type, name), -1)
+
+    def id_to_name(candidate_model, object_type, object_id):
+        assert candidate_model is model
+        assert object_type == object_types.mjOBJ_BODY
+        return body_names[object_id]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(
+            mjtObj=object_types,
+            mj_name2id=name_to_id,
+            mj_id2name=id_to_name,
+        ),
+    )
+    data = SimpleNamespace(
+        xpos=np.zeros((4, 3), dtype=np.float32),
+        xquat=np.tile(
+            np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (4, 1)
+        ),
+    )
+    environment = SimpleNamespace(sim=SimpleNamespace(model=model, data=data))
+
+    assert resolve_mujoco_object_id(model, "agentview", "camera") == 2
+
+    poses = find_target_body_poses(
+        environment,
+        (("akita_black_bowl",),),
+        device="cpu",
+        texture_name="shared-akita",
+    )
+
     assert [pose.body_name for pose in poses] == [
         "akita_black_bowl_1",
         "akita_black_bowl_2",

@@ -28,6 +28,36 @@ def _simulation(env: Any) -> Any:
     return env.unwrapped.sim if hasattr(env, "unwrapped") else env.sim
 
 
+def _native_mujoco_object_type(kind: str) -> Any:
+    import mujoco
+
+    return getattr(mujoco.mjtObj, f"mjOBJ_{kind.upper()}")
+
+
+def resolve_mujoco_object_id(model: Any, name: str, kind: str) -> int:
+    """Resolve names across mujoco-py wrappers and native mujoco.MjModel."""
+    for method_name in (f"{kind[:3]}_name2id", f"{kind}_name2id"):
+        if hasattr(model, method_name):
+            object_id = int(getattr(model, method_name)(name))
+            if object_id < 0:
+                raise KeyError(name)
+            return object_id
+    if hasattr(model, "name2id"):
+        object_id = int(model.name2id(name, kind))
+        if object_id < 0:
+            raise KeyError(name)
+        return object_id
+
+    import mujoco
+
+    object_id = int(
+        mujoco.mj_name2id(model, _native_mujoco_object_type(kind), name)
+    )
+    if object_id < 0:
+        raise KeyError(name)
+    return object_id
+
+
 def _body_name(model: Any, body_id: int) -> str | None:
     if hasattr(model, "body_id2name"):
         try:
@@ -39,12 +69,27 @@ def _body_name(model: Any, body_id: int) -> str | None:
             return model.id2name(body_id, "body")
         except Exception:
             pass
+    try:
+        import mujoco
+
+        return mujoco.mj_id2name(
+            model, _native_mujoco_object_type("body"), body_id
+        )
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     return None
 
 
 def _pose_from_id(simulation: Any, body_id: int, body_name: str, device: Any) -> TargetBodyPose:
-    position = np.asarray(simulation.data.body_xpos[body_id], dtype=np.float32)
-    quaternion = np.asarray(simulation.data.body_xquat[body_id], dtype=np.float32)
+    data = simulation.data
+    position_field = "body_xpos" if hasattr(data, "body_xpos") else "xpos"
+    quaternion_field = "body_xquat" if hasattr(data, "body_xquat") else "xquat"
+    position = np.asarray(
+        getattr(data, position_field)[body_id], dtype=np.float32
+    )
+    quaternion = np.asarray(
+        getattr(data, quaternion_field)[body_id], dtype=np.float32
+    )
     rotation = Rotation.from_quat(
         (quaternion[1], quaternion[2], quaternion[3], quaternion[0])
     )
@@ -71,10 +116,8 @@ def find_target_body_poses(
     if texture_name is not None:
         model = simulation.model
         try:
-            texture_id = (
-                model.tex_name2id(texture_name)
-                if hasattr(model, "tex_name2id")
-                else model.name2id(texture_name, "texture")
+            texture_id = resolve_mujoco_object_id(
+                model, texture_name, "texture"
             )
         except Exception as error:
             raise ValueError(

@@ -71,6 +71,7 @@ from openvla_renderer_contracts import (
     capture_frontmost_instance_masks,
     compose_visibility_masked_renderer_delta,
     find_target_body_poses,
+    resolve_mujoco_object_id,
 )
 from openvla_runtime_assets import (
     activate_runtime_texture,
@@ -464,7 +465,7 @@ def get_render_mvp_from_matrix(
 
     cam_id = 0
     try:
-        cam_id = sim.model.camera_name2id("agentview")
+        cam_id = resolve_mujoco_object_id(sim.model, "agentview", "camera")
     except Exception:
         print("[WARNING] Camera 'agentview' not found, using camera 0.")
 
