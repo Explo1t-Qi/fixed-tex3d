@@ -3,12 +3,12 @@
 ## Status
 
 ```text
-STEP 1 NOT COMPLETE — RUNTIME VALIDATION BLOCKED
+STEP 1 IMPLEMENTATION READY — SERVER VALIDATION PENDING
 ```
 
-The implementation and CPU contracts are complete, but the required source GPU
-smoke, one-pair witness smoke, and formal experiment have not run. Therefore no
-scientific transfer result is claimed in this report.
+The implementation and CPU contracts are complete and ready for user-operated
+server validation. The required source GPU smoke, one-pair witness smoke, and
+formal experiment have not run, so no scientific transfer result is claimed.
 
 ## Git provenance
 
@@ -105,12 +105,12 @@ All four new CLI entrypoints also load their `--help` paths successfully, and
 all edited Python files pass `py_compile`. These are CPU engineering results;
 they are not substitutes for real OpenVLA, nvdiffrast, LIBERO, or pi0.5 runs.
 
-### Runtime validation blocker
+### Runtime validation handoff
 
 This workstation has neither:
 
 ```text
-/opt/libero
+/data/xiaomengqi/src/LIBERO-joint
 /data/huangsimin/openvla-7b-finetuned-libero-spatial
 the tex3d-openvla server environment
 a PyTorch-visible CUDA device
@@ -124,7 +124,10 @@ timeout. Both attempts failed before authentication with:
 ssh: connect to host 59.78.189.196 port 22: Connection timed out
 ```
 
-Consequently, the following required gates are **NOT EXECUTED**:
+The user will execute the server validation using
+`LIBERO_ROOT=/data/xiaomengqi/src/LIBERO-joint/` and store run artifacts under
+`/data/xiaomengqi/logs/`. Consequently, the following required gates remain
+**NOT EXECUTED** at this report revision:
 
 ```text
 source GPU smoke
@@ -173,7 +176,7 @@ No smoke or formal runtime artifacts were generated locally. Once the server is
 reachable, the validated pipeline will write:
 
 ```text
-experiments/step1/<run-id>/
+/data/xiaomengqi/logs/step1/<run-id>/
   config.json
   asset_restoration.json
   training/

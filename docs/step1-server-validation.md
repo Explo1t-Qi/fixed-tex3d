@@ -8,6 +8,8 @@ held-out outputs.
 
 ```bash
 REPO=/data/xiaomengqi/src/tex3d-fixed
+LIBERO_ROOT_PATH=/data/xiaomengqi/src/LIBERO-joint
+LOG_ROOT=/data/xiaomengqi/logs/step1
 OPENVLA_PY=/home/xiaomengqi/miniconda3/envs/tex3d-openvla/bin/python
 OPENVLA_CKPT=/data/huangsimin/openvla-7b-finetuned-libero-spatial
 OPENPI_ROOT=/data/xiaomengqi/src/openpi
@@ -20,13 +22,53 @@ Before running, verify that `OPENPI_PY`, `OPENPI_ROOT`, and `SHARED_ROOT` match
 the existing validated joint environment. Do not install or upgrade packages
 inside the authoritative OpenVLA environment.
 
+Run this preflight first and return its complete output:
+
+```bash
+set -eu
+for path in \
+  "$REPO" \
+  "$LIBERO_ROOT_PATH" \
+  "$OPENVLA_PY" \
+  "$OPENVLA_CKPT" \
+  "$OPENPI_ROOT" \
+  "$OPENPI_PY" \
+  "$PI05_CKPT" \
+  "$SHARED_ROOT"
+do
+  test -e "$path"
+  printf 'FOUND %s\n' "$path"
+done
+mkdir -p "$LOG_ROOT"
+cd "$REPO"
+git status --short --branch
+git rev-parse HEAD
+"$OPENVLA_PY" - <<'PY'
+import torch, tokenizers, transformers
+print("openvla torch", torch.__version__)
+print("openvla transformers", transformers.__version__)
+print("openvla tokenizers", tokenizers.__version__)
+print("openvla cuda", torch.cuda.is_available(), torch.cuda.device_count())
+PY
+"$OPENPI_PY" - <<'PY'
+import jax, torch
+print("openpi jax", jax.__version__)
+print("openpi backend", jax.default_backend())
+print("openpi devices", jax.devices())
+print("joint torch", torch.__version__)
+PY
+git -C "$OPENPI_ROOT" rev-parse HEAD
+git -C "$SHARED_ROOT" rev-parse HEAD
+```
+
 ## 1. CPU regression
 
 ```bash
 cd "$REPO"
 git status --short
 git rev-parse HEAD
-PYTHONDONTWRITEBYTECODE=1 "$OPENVLA_PY" -m pytest -q tests/unit
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
+  "$OPENVLA_PY" -m pytest -q tests/unit
 ```
 
 The required result is an empty initial status and all tests passing.
@@ -38,10 +80,11 @@ rollout and cannot load pi0.5.
 
 ```bash
 cd "$REPO"
-SOURCE_SMOKE_PARENT=$(mktemp -d /tmp/tex3d-step1-source-smoke.XXXXXX)
-SOURCE_SMOKE="$SOURCE_SMOKE_PARENT/run"
+RUN_TAG=$(date +%Y%m%d-%H%M%S)
+SOURCE_SMOKE="$LOG_ROOT/source-smoke-$RUN_TAG"
+test ! -e "$SOURCE_SMOKE"
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-LIBERO_ROOT=/opt/libero MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 "$OPENVLA_PY" openvla/experiments/robot/libero/attack_openvla.py \
@@ -104,7 +147,7 @@ PY
 Also require an empty backup search:
 
 ```bash
-find /opt/libero/libero/libero/assets -type f \
+find "$LIBERO_ROOT_PATH/libero/libero/assets" -type f \
   \( -name '*clean_backup*' -o -name 'texture_clean_backup_*.png' \)
 ```
 
@@ -117,7 +160,7 @@ cd "$REPO"
 "$OPENVLA_PY" scripts/step1_collect_heldout_pairs.py \
   --attack-texture "$SOURCE_SMOKE/training/final_attack_texture.png" \
   --output-dir "$SOURCE_SMOKE/heldout_pairs" \
-  --libero-root /opt/libero \
+  --libero-root "$LIBERO_ROOT_PATH" \
   --state-ids 10
 ```
 
@@ -125,14 +168,14 @@ Run the OpenVLA consumer only in the authoritative OpenVLA environment:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-LIBERO_ROOT=/opt/libero MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 "$OPENVLA_PY" scripts/step1_openvla_analysis.py \
   --pairs-dir "$SOURCE_SMOKE/heldout_pairs" \
   --output-dir "$SOURCE_SMOKE/openvla" \
   --pretrained-checkpoint "$OPENVLA_CKPT" \
-  --libero-root /opt/libero
+  --libero-root "$LIBERO_ROOT_PATH"
 ```
 
 Only after that process exits, run the separate pi0.5 witness process:
@@ -162,7 +205,7 @@ Choose a fresh run ID before any held-out extraction:
 ```bash
 cd "$REPO"
 RUN_ID=step1-o2-p2-formal-v1
-FORMAL_ROOT="$REPO/experiments/step1/$RUN_ID"
+FORMAL_ROOT="$LOG_ROOT/$RUN_ID"
 test ! -e "$FORMAL_ROOT"
 ```
 
@@ -170,7 +213,7 @@ Run the single frozen configuration:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-LIBERO_ROOT=/opt/libero MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 "$OPENVLA_PY" openvla/experiments/robot/libero/attack_openvla.py \
@@ -203,18 +246,18 @@ consumer exactly as in the witness smoke:
 "$OPENVLA_PY" scripts/step1_collect_heldout_pairs.py \
   --attack-texture "$FORMAL_ROOT/training/final_attack_texture.png" \
   --output-dir "$FORMAL_ROOT/heldout_pairs" \
-  --libero-root /opt/libero \
+  --libero-root "$LIBERO_ROOT_PATH" \
   --state-ids 10-19
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-LIBERO_ROOT=/opt/libero MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false \
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 "$OPENVLA_PY" scripts/step1_openvla_analysis.py \
   --pairs-dir "$FORMAL_ROOT/heldout_pairs" \
   --output-dir "$FORMAL_ROOT/openvla" \
   --pretrained-checkpoint "$OPENVLA_CKPT" \
-  --libero-root /opt/libero
+  --libero-root "$LIBERO_ROOT_PATH"
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONNOUSERSITE=1 \
