@@ -143,6 +143,8 @@ def main() -> int:
         load_in_4bit=False,
     )
     model = get_vla(cfg)
+    model_training_before_eval = bool(model.training)
+    model.eval()
     processor = get_processor(cfg)
     differentiable = DifferentiableOpenVLAImageProcessor.from_checkpoint(
         model=model, processor=processor
@@ -161,6 +163,11 @@ def main() -> int:
         )["pixel_values"].to(model.device)
         candidate = differentiable(_tensor_rgb(image, model.device))
         delta = (candidate - official).abs()
+        official_model_input = official.to(torch.bfloat16)
+        candidate_model_input = candidate.to(torch.bfloat16)
+        model_input_delta = (
+            candidate_model_input - official_model_input
+        ).abs().float()
         branch_rows = []
         channel_offset = 0
         for branch in differentiable.branches:
@@ -179,9 +186,17 @@ def main() -> int:
         candidate_ids = _generate(
             model, processor, prompt, image, candidate, args.unnorm_key
         )
+        official_repeat_ids = (
+            _generate(
+                model, processor, prompt, image, official, args.unnorm_key
+            )
+            if name == "libero_spatial_task0_state0"
+            else official_ids
+        )
         action_dim = model.get_action_dim(args.unnorm_key)
         official_tokens = official_ids[0, -action_dim:]
         candidate_tokens = candidate_ids[0, -action_dim:]
+        official_repeat_tokens = official_repeat_ids[0, -action_dim:]
         official_action = _decode(model, official_ids, args.unnorm_key)
         candidate_action = _decode(model, candidate_ids, args.unnorm_key)
         action_delta = candidate_action - official_action
@@ -191,10 +206,21 @@ def main() -> int:
                 "shape": list(candidate.shape),
                 "global_mae": float(delta.mean().item()),
                 "global_linf": float(delta.max().item()),
+                "model_input_bfloat16_mae": float(model_input_delta.mean().item()),
+                "model_input_bfloat16_linf": float(model_input_delta.max().item()),
+                "model_input_bfloat16_unequal_count": int(
+                    torch.count_nonzero(
+                        candidate_model_input != official_model_input
+                    ).item()
+                ),
                 "branches": branch_rows,
                 "official_action_tokens": official_tokens.tolist(),
+                "official_repeat_action_tokens": official_repeat_tokens.tolist(),
                 "candidate_action_tokens": candidate_tokens.tolist(),
                 "token_hamming": int((official_tokens != candidate_tokens).sum().item()),
+                "official_repeat_token_hamming": int(
+                    (official_tokens != official_repeat_tokens).sum().item()
+                ),
                 "decoded_action_l2": float(np.linalg.norm(action_delta)),
                 "decoded_action_linf": float(np.abs(action_delta).max()),
             }
@@ -202,6 +228,8 @@ def main() -> int:
 
     evidence = {
         "checkpoint": str(Path(args.checkpoint).resolve()),
+        "model_training_before_explicit_eval": model_training_before_eval,
+        "model_training_during_audit": bool(model.training),
         "resolved_branch_order": list(differentiable.branch_model_ids),
         "resize_mode": [branch.interpolation for branch in differentiable.branches],
         "antialias": [branch.antialias for branch in differentiable.branches],
@@ -213,6 +241,8 @@ def main() -> int:
     args.output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print(json.dumps(evidence, indent=2, sort_keys=True))
     real_row = rows[-1]
+    if real_row["official_repeat_token_hamming"] != 0:
+        return 3
     return 0 if real_row["token_hamming"] == 0 else 2
 
 

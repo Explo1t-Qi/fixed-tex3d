@@ -31,8 +31,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 ```
 
 The command exits with status 2 if the real Spatial task-0/state-0 clean frame
-does not produce 7/7 identical action tokens. Do not proceed by adding BPDA;
-return the JSON for review.
+does not produce 7/7 identical action tokens. Status 3 means that repeating the
+official-processor inference was itself not token-deterministic. Do not proceed
+by adding BPDA; return the JSON for review.
 
 ## 3. Renderer, visibility, and compositor audit
 
