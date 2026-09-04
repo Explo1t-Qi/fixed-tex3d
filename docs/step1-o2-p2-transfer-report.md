@@ -3,13 +3,14 @@
 ## Status
 
 ```text
-STEP 1 IMPLEMENTATION READY — SERVER VALIDATION PENDING
+STEP 1 FORMAL TRAINING COMPLETE — HELD-OUT ANALYSIS PENDING
 ```
 
 The implementation and CPU contracts are complete. The source GPU smoke and
 one-pair OpenVLA O2/PyTorch pi0.5 P2 witness smoke passed on the server. The
-formal experiment has not run, so no formal scientific transfer result is
-claimed.
+single frozen formal training run over states 0-9 also completed and its
+artifacts passed the local read-only audit. Held-out states 10-19 have not yet
+been analyzed, so no formal scientific transfer result is claimed.
 
 ## Git provenance
 
@@ -18,6 +19,7 @@ repository          /home/xmq/src/tex3d
 base commit         6ee46c18c78981cfa86b45edaab20c11db030483
 branch              feat/step1-o2-p2-transfer-mvp
 pre-formal code HEAD dc4ac355e5fc61bbb8182fc0bec5f1e06454fa45
+formal training code HEAD 6ec34f1c20e18aa688080de24cc2df2894fee713
 Step 0 code ancestor ff9fcbc8f84debb7693027a58490a0d856c8cdde
 ```
 
@@ -77,12 +79,12 @@ PYTHONDONTWRITEBYTECODE=1 \
 30 passed in 7.75s
 ```
 
-Latest implementation suite after the wrist-input contract regression fix:
+Latest implementation suite after the zero-episode reporting regression fix:
 
 ```text
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 /home/xmq/.virtualenvs/modified-tex3d/bin/python -m pytest -q tests/unit
-50 passed in 4.56s
+52 passed in 4.89s
 ```
 
 The explicit empty `CUDA_VISIBLE_DEVICES` is required for a CPU regression on
@@ -139,13 +141,44 @@ stopped because the witness treated the official five-value preprocessing
 tuple as an object with image attributes. A regression test now reproduces the
 official tuple contract and passes with explicit unpacking. The corrected
 PyTorch rerun then passed all shape, provenance, frozen-model, no-grad, and
-official-prefix-slice checks. Consequently, the following required gates remain
-**NOT EXECUTED** at this report revision:
+official-prefix-slice checks.
+
+The formal training run wrote
+`/data/xiaomengqi/logs/step1/step1-o2-p2-formal-v1` from code HEAD
+`6ec34f1c20e18aa688080de24cc2df2894fee713`. Its frozen configuration has ten
+training states (0-9), one frame per state, ten O2-only optimization iterations,
+and `num_trials_per_task=0`. The latter deliberately disables policy rollout;
+therefore no task success or attack success rate was measured. The legacy
+entrypoint misleadingly printed `Attack success rate: 0.00%` for the zero
+episode case. This was diagnosed as a presentation bug, not a failed task, and
+the post-run code now reports `Task success rate: NOT EVALUATED (rollout
+disabled)` when the episode count is zero. The formal texture was not retrained.
+
+The synchronized formal training artifacts pass these checks:
 
 ```text
-formal train 0-9
+iterations / training frames                 10 / 10
+finite scalar metrics                        PASS
+finite, nonzero texture gradients            PASS (all 10 iterations)
+finite, nonzero image gradients              PASS (all 10 iterations)
+loss == -O2 displacement                     PASS (all 10 iterations)
+action loss / legacy feature loss            0 / 0 (all 10 iterations)
+final O2 displacement                        0.008688865043222905
+final texture gradient norm                  0.00012498378055170178
+maximum texture perturbation                 0.25123265385627747
+renderer epsilon                             0.5019607843137255
+texture budget                               PASS
+pi0.5 loaded during training                 false
+texture SHA256                               sha256:8856483b0c93789082c93b0d88a0d6cda37c3e5126d98fc1f4f192ae184aca75
+XML / clean texture restoration              PASS
+```
+
+The frame contract contains exactly ten frames, each with both shared-texture
+instances visible and the frozen 512-to-224 deployment-view path. Consequently,
+the following required gates remain **NOT EXECUTED** at this report revision:
+
+```text
 formal analyze 10-19
-server XML/texture restoration audit
 formal artifact completeness audit
 ```
 
@@ -207,13 +240,19 @@ The server smoke artifacts were synchronized read-only under:
 experiment_inbox/step1/source-smoke-20260904-173550/
 ```
 
-The formal pipeline will write:
+The formal training artifacts are synchronized read-only under:
 
 ```text
-/data/xiaomengqi/logs/step1/<run-id>/
+experiment_inbox/step1/step1-o2-p2-formal-v1/
   config.json
   asset_restoration.json
   training/
+```
+
+The remaining server analysis will add:
+
+```text
+/data/xiaomengqi/logs/step1/step1-o2-p2-formal-v1/
   heldout_pairs/
   openvla/
   pi05/

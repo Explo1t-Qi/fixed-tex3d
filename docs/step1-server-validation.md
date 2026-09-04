@@ -240,6 +240,12 @@ PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
   --run_id_note step1-formal
 ```
 
+This configuration intentionally runs zero policy-rollout episodes. Its final
+summary must therefore say `Task success rate: NOT EVALUATED (rollout
+disabled)`; neither task success nor attack success rate is a Step 1 metric.
+Ten optimization iterations are texture-training updates, not ten rollout
+episodes.
+
 Do not retrain from this point onward. Collect states 10-19, then run each
 consumer exactly as in the witness smoke:
 

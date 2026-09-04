@@ -1222,6 +1222,23 @@ def _validate_step1_formal_config(cfg: GenerateConfig) -> None:
         raise ValueError("Step 1 formal run requires step1_output_dir")
 
 
+def _format_rollout_summary(total_successes: int, total_episodes: int):
+    if total_episodes == 0:
+        return (
+            "[DONE] Episodes: 0 | Task success rate: NOT EVALUATED "
+            "(rollout disabled)",
+            "FINAL TASK SUCCESS RATE: NOT EVALUATED (0 episodes)",
+        )
+
+    task_success_rate = total_successes / total_episodes
+    return (
+        f"[DONE] Episodes: {total_episodes} | "
+        f"Task success rate: {task_success_rate:.2%}",
+        f"FINAL TASK SUCCESS RATE: {task_success_rate:.2%} "
+        f"({total_successes}/{total_episodes})",
+    )
+
+
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
@@ -1552,9 +1569,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 )
                 env.close()
 
-        avg_sr = total_successes / total_episodes if total_episodes > 0 else 0.0
-        print(f"\n[DONE] Episodes: {total_episodes} | Attack success rate: {avg_sr:.2%}")
-        log_file.write(f"\nFINAL AVG SUCCESS RATE: {avg_sr:.2%}\n")
+        console_summary, log_summary = _format_rollout_summary(
+            total_successes, total_episodes
+        )
+        print(f"\n{console_summary}")
+        log_file.write(f"\n{log_summary}\n")
 
     finally:
         _restore_clean_assets("Final cleanup", remove_backups=True)
