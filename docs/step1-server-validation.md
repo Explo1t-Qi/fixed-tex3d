@@ -14,7 +14,7 @@ OPENVLA_PY=/home/xiaomengqi/miniconda3/envs/tex3d-openvla/bin/python
 OPENVLA_CKPT=/data/huangsimin/openvla-7b-finetuned-libero-spatial
 OPENPI_ROOT=/data/xiaomengqi/src/openpi
 JOINT_PY=/data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python
-PI05_CKPT=/data/xiaomengqi/checkpoints/pi05_libero/openpi-assets/checkpoints/pi05_libero
+PI05_CKPT=/data/xiaomengqi/checkpoints/pi05_libero_pytorch
 SHARED_ROOT=/data/xiaomengqi/src/shared-feature-tex3d
 ```
 
@@ -51,11 +51,12 @@ print("openvla tokenizers", tokenizers.__version__)
 print("openvla cuda", torch.cuda.is_available(), torch.cuda.device_count())
 PY
 "$JOINT_PY" - <<'PY'
-import jax, torch
-print("openpi jax", jax.__version__)
-print("openpi backend", jax.default_backend())
-print("openpi devices", jax.devices())
+import torch, transformers
+from transformers.models.siglip import check
 print("joint torch", torch.__version__)
+print("joint transformers", transformers.__version__)
+print("joint cuda", torch.cuda.is_available(), torch.cuda.device_count())
+print("openpi transformers patch", check.check_whether_transformers_replace_is_installed_correctly())
 PY
 git -C "$OPENPI_ROOT" rev-parse HEAD
 git -C "$SHARED_ROOT" rev-parse HEAD
@@ -178,7 +179,7 @@ PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
   --libero-root "$LIBERO_ROOT_PATH"
 ```
 
-Only after that process exits, run the separate pi0.5 witness process:
+Only after that process exits, run the separate PyTorch pi0.5 witness process:
 
 ```bash
 cd "$REPO"

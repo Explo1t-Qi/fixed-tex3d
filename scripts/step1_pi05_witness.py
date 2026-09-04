@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.metadata
 import json
 import platform
@@ -25,8 +26,9 @@ if str(ROBOT_ROOT) not in sys.path:
 CONFIG_NAME = "pi05_libero"
 CHECKPOINT_IDENTITY = "gs://openpi-assets/checkpoints/pi05_libero"
 DEFAULT_CHECKPOINT = Path(
-    "/data/xiaomengqi/checkpoints/pi05_libero/openpi-assets/checkpoints/pi05_libero"
+    "/data/xiaomengqi/checkpoints/pi05_libero_pytorch"
 )
+IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -57,11 +59,29 @@ def _git_head(repository: Path) -> str:
     ).stdout.strip()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _tree_map(function: Any, tree: Any) -> Any:
+    if isinstance(tree, dict):
+        return {key: _tree_map(function, value) for key, value in tree.items()}
+    if isinstance(tree, list):
+        return [_tree_map(function, value) for value in tree]
+    if isinstance(tree, tuple):
+        return tuple(_tree_map(function, value) for value in tree)
+    return function(tree)
+
+
 def _validate_source_roots(openpi_root: Path, shared_root: Path) -> None:
     required = (
         openpi_root / "src/openpi",
         openpi_root / "packages/openpi-client/src/openpi_client",
-        shared_root / "shared_feature/pi05_intervention.py",
+        shared_root / "shared_feature/pi05_features.py",
     )
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -77,19 +97,20 @@ def _validate_source_roots(openpi_root: Path, shared_root: Path) -> None:
 
 def _load_runtime(openpi_root: Path, shared_root: Path, checkpoint: Path) -> Any:
     _validate_source_roots(openpi_root, shared_root)
-    import jax
     import torch
+    from openpi.models import model as openpi_model
     from openpi.policies import policy_config
     from openpi.training import config
     from openpi_client import image_tools
-    from shared_feature import prepare_pi05_context
 
-    if jax.default_backend() != "gpu":
-        raise RuntimeError(f"pi0.5 witness requires JAX GPU, got {jax.default_backend()}")
-    if not (checkpoint / "params").is_dir() or not (checkpoint / "assets").is_dir():
-        raise FileNotFoundError(f"frozen pi0.5 JAX checkpoint is incomplete: {checkpoint}")
-    if (checkpoint / "model.safetensors").exists():
-        raise RuntimeError("formal witness requires the validated JAX/NNX backend")
+    if not torch.cuda.is_available():
+        raise RuntimeError("pi0.5 witness requires a PyTorch CUDA device")
+    if not (checkpoint / "model.safetensors").is_file() or not (
+        checkpoint / "assets"
+    ).is_dir():
+        raise FileNotFoundError(
+            f"frozen pi0.5 PyTorch checkpoint is incomplete: {checkpoint}"
+        )
     train_config = config.get_config(CONFIG_NAME)
     model_config = train_config.model
     if (
@@ -101,15 +122,28 @@ def _load_runtime(openpi_root: Path, shared_root: Path, checkpoint: Path) -> Any
         or model_config.max_token_len != 200
     ):
         raise RuntimeError("pi05_libero TrainConfig violates frozen semantics")
-    policy = policy_config.create_trained_policy(train_config, checkpoint)
-    if getattr(policy, "_is_pytorch_model", None) is not False:
-        raise RuntimeError("formal witness did not load the validated JAX/NNX model")
+    policy = policy_config.create_trained_policy(
+        train_config,
+        checkpoint,
+        pytorch_device="cuda",
+    )
+    if getattr(policy, "_is_pytorch_model", None) is not True:
+        raise RuntimeError("formal witness did not load the PyTorch pi0.5 model")
+    model = policy._model
+    if not isinstance(model, torch.nn.Module):
+        raise RuntimeError("pi0.5 policy model is not a torch.nn.Module")
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    if model.training or any(parameter.requires_grad for parameter in model.parameters()):
+        raise RuntimeError("pi0.5 PyTorch model was not frozen in eval mode")
     return SimpleNamespace(
-        jax=jax,
         torch=torch,
         image_tools=image_tools,
+        observation_type=openpi_model.Observation,
         policy=policy,
-        prepare_pi05_context=prepare_pi05_context,
+        model=model,
+        device=torch.device(policy._pytorch_device),
     )
 
 
@@ -208,24 +242,64 @@ def _load_pairs(pairs_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return manifest, loaded
 
 
-def _extract_p2(runtime: Any, observation: dict[str, Any]) -> tuple[np.ndarray, Any]:
-    noise = np.zeros((1, 10, 32), dtype=np.float32)
-    model = runtime.policy._model
-    eval_method = getattr(model, "eval", None)
-    if callable(eval_method):
-        eval_method()
+def _extract_p2(
+    runtime: Any,
+    observation: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    model = runtime.model
+    model.eval()
     with runtime.torch.no_grad():
         if runtime.torch.is_grad_enabled():
             raise RuntimeError("torch.no_grad guard is not active in witness path")
-        prepared = runtime.prepare_pi05_context(
-            policy=runtime.policy,
-            observation=observation,
-            noise=noise,
+        inputs = _tree_map(lambda value: value, observation)
+        inputs = runtime.policy._input_transform(inputs)
+        inputs = _tree_map(
+            lambda value: runtime.torch.from_numpy(np.asarray(value).copy())
+            .to(runtime.device)[None, ...],
+            inputs,
         )
-    p2 = np.asarray(runtime.jax.device_get(prepared.base_p2[0]), dtype=np.float32)
+        model_observation = runtime.observation_type.from_dict(inputs)
+        prepared = model._preprocess_observation(model_observation, train=False)
+        if tuple(prepared.images) != IMAGE_KEYS:
+            raise RuntimeError(
+                f"pi0.5 image-key ordering mismatch: {tuple(prepared.images)}"
+            )
+        images = [prepared.images[key] for key in IMAGE_KEYS]
+        image_masks = [prepared.image_masks[key] for key in IMAGE_KEYS]
+        prefix, _, _ = model.embed_prefix(
+            images,
+            image_masks,
+            prepared.tokenized_prompt,
+            prepared.tokenized_prompt_mask,
+        )
+        direct = {
+            key: model.paligemma_with_expert.embed_image(prepared.images[key])
+            for key in IMAGE_KEYS
+        }
+        for index, key in enumerate(IMAGE_KEYS):
+            value = direct[key]
+            expected_shape = (1, 256, 2048)
+            if tuple(value.shape) != expected_shape:
+                raise RuntimeError(
+                    f"pi0.5 {key} P2 must have shape {expected_shape}, "
+                    f"got {tuple(value.shape)}"
+                )
+            prefix_slice = prefix[:, index * 256 : (index + 1) * 256]
+            if not runtime.torch.equal(value, prefix_slice):
+                raise RuntimeError(
+                    f"pi0.5 {key} P2 does not match official embed_prefix slice"
+                )
+            if value.requires_grad or not bool(runtime.torch.isfinite(value).all()):
+                raise RuntimeError(f"pi0.5 {key} P2 is not finite and detached")
+
+    arrays = {
+        key: value[0].detach().to(device="cpu", dtype=runtime.torch.float32).numpy()
+        for key, value in direct.items()
+    }
+    p2 = arrays["base_0_rgb"]
     if p2.shape != (256, 2048) or not np.all(np.isfinite(p2)):
         raise RuntimeError("pi0.5 P2 is invalid")
-    return p2, prepared
+    return p2, arrays
 
 
 def _save_npz(path: Path, *, key: str, value: np.ndarray, records: list[dict[str, Any]]) -> None:
@@ -261,17 +335,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         }
         clean_input = _policy_input(base_rgb=item["clean"], **common)
         adversarial_input = _policy_input(base_rgb=item["adversarial"], **common)
-        clean_p2, clean_context = _extract_p2(runtime, clean_input)
-        adversarial_p2, adversarial_context = _extract_p2(
+        clean_p2, clean_image_p2 = _extract_p2(runtime, clean_input)
+        adversarial_p2, adversarial_image_p2 = _extract_p2(
             runtime, adversarial_input
         )
-        for name in ("left_p2", "right_p2"):
-            clean_fixed = np.asarray(
-                runtime.jax.device_get(getattr(clean_context, name))
-            )
-            adversarial_fixed = np.asarray(
-                runtime.jax.device_get(getattr(adversarial_context, name))
-            )
+        for name in ("left_wrist_0_rgb", "right_wrist_0_rgb"):
+            clean_fixed = clean_image_p2[name]
+            adversarial_fixed = adversarial_image_p2[name]
             if not np.array_equal(clean_fixed, adversarial_fixed):
                 raise RuntimeError(
                     f"pi0.5 fixed non-primary image representation changed: {name}"
@@ -325,11 +395,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "num_pairs": len(records),
         "p2_shape": list(clean.shape),
         "node": "PaliGemma-ready projected base-camera visual representation",
-        "backend": "jax_nnx",
+        "backend": "pytorch",
+        "model_class": (
+            f"{type(runtime.model).__module__}.{type(runtime.model).__qualname__}"
+        ),
+        "model_safetensors_sha256": _sha256_file(
+            checkpoint / "model.safetensors"
+        ),
         "inference_contract": {
-            "model_eval": "JAX/NNX train=False (no eval() state API)",
+            "model_eval": runtime.model.training is False,
             "torch_no_grad_guard": True,
             "jax_gradient_transform_used": False,
+            "model_parameters_require_grad": any(
+                parameter.requires_grad for parameter in runtime.model.parameters()
+            ),
+            "p2_extractor": "PI0Pytorch.paligemma_with_expert.embed_image",
+            "official_embed_prefix_slice_equal": True,
             "only_replaced_pi05_field": "base_0_rgb",
             "fixed_fields": [
                 "left_wrist_0_rgb",
@@ -349,9 +430,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "versions": {
             "python": platform.python_version(),
-            "jax": str(runtime.jax.__version__),
-            "jaxlib": _package_version("jaxlib"),
             "torch": str(runtime.torch.__version__),
+            "transformers": _package_version("transformers"),
         },
     }
     (output_dir / "consumer_summary.json").write_text(

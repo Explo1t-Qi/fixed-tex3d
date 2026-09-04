@@ -57,6 +57,18 @@ def _identity_rows(records: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
     ]
 
 
+def _validate_pi05_contract(summary: dict[str, Any]) -> None:
+    contract = summary.get("inference_contract", {})
+    if (
+        summary.get("backend") != "pytorch"
+        or contract.get("model_eval") is not True
+        or contract.get("torch_no_grad_guard") is not True
+        or contract.get("model_parameters_require_grad") is not False
+        or contract.get("official_embed_prefix_slice_equal") is not True
+    ):
+        raise ValueError("pi0.5 witness did not satisfy the frozen PyTorch contract")
+
+
 def _correlation(left: np.ndarray, right: np.ndarray, name: str) -> tuple[float, float]:
     result = spearmanr(left, right)
     rho = float(result.statistic)
@@ -97,6 +109,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
     openvla_summary = _load_consumer(openvla_dir / "consumer_summary.json")
     pi05_summary = _load_consumer(pi05_dir / "consumer_summary.json")
+    _validate_pi05_contract(pi05_summary)
     pair_rows = _identity_rows(pair_manifest["records"])
     openvla_rows = _identity_rows(openvla_summary["consumer_records"])
     pi05_rows = _identity_rows(pi05_summary["consumer_records"])

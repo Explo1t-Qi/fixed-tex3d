@@ -60,12 +60,13 @@ parameter-space bound and seed 7. It does not change the renderer, perturbation
 budget, SignSGD update, or objective. This single configuration is recorded in
 `config.json`; it is not a sweep. Legacy mode retains zero initialization.
 
-The validated released pi0.5 checkpoint is JAX/NNX (`params/`, no
-`model.safetensors`). JAX ordinary forward execution does not record an
-autograd tape and `PaliGemma.img` is explicitly called with `train=False`. The
-witness also runs inside `torch.no_grad()` and calls `eval()` when a backend
-provides it. The formal JAX/NNX model has no PyTorch-style global `eval()` API;
-this backend fact is emitted explicitly rather than misreported.
+The formal witness uses the converted pi0.5-LIBERO PyTorch checkpoint at
+`/data/xiaomengqi/checkpoints/pi05_libero_pytorch/model.safetensors`. It runs
+the official OpenPI policy transforms and PyTorch observation preprocessing,
+then extracts P2 with `paligemma_with_expert.embed_image`. Every extracted
+image representation is required to equal its corresponding token slice from
+the official `embed_prefix()` continuation. The model is frozen, set to
+`eval()`, and executed inside `torch.no_grad()`.
 
 ### CPU regression evidence
 
@@ -82,7 +83,7 @@ Latest implementation suite after the wrist-input contract regression fix:
 ```text
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 /home/xmq/.virtualenvs/modified-tex3d/bin/python -m pytest -q tests/unit
-48 passed in 5.61s
+50 passed in 6.53s
 ```
 
 The explicit empty `CUDA_VISIBLE_DEVICES` is required for a CPU regression on
@@ -101,7 +102,7 @@ adversarial O2 -> image -> texture gradient       PASS (synthetic CPU)
 legacy objective formula/default                  PASS
 O2/P2 token RMS reduction                         PASS
 P2 [B,256,2048]                                   PASS (synthetic CPU)
-pi0.5 eval/no-grad guard                          PASS (synthetic CPU)
+pi0.5 Torch eval/no-grad and embed-prefix node    PASS (synthetic CPU)
 sample/raw-image hash identity and fail-fast      PASS
 pair scene equality and camera-field adapter      PASS
 ```
@@ -124,7 +125,10 @@ a PyTorch-visible CUDA device
 The user is executing server validation using
 `LIBERO_ROOT=/data/xiaomengqi/src/LIBERO-joint/` and store run artifacts under
 `/data/xiaomengqi/logs/`. The confirmed joint OpenVLA/OpenPI witness Python is
-`/data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python`.
+`/data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python`; this
+environment provides Torch 2.6.0+cu124, Transformers 4.53.2, and the required
+OpenPI Transformers patch. The PyTorch checkpoint root is
+`/data/xiaomengqi/checkpoints/pi05_libero_pytorch`.
 The source GPU smoke passed with a finite loss, finite/nonzero O2 displacement
 and texture gradient, a changed parameter, a respected texture budget, pi0.5
 absent from training, and successful XML/texture restoration. The first witness

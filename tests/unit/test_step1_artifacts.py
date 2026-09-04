@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from PIL import Image
+import torch
 
 from scripts import step1_analyze_transfer as analysis
 from scripts import step1_collect_heldout_pairs as collector
@@ -167,6 +168,23 @@ def test_spearman_helper_reports_rho_and_p_value() -> None:
     assert p_value == pytest.approx(0.0)
 
 
+def test_transfer_analysis_requires_frozen_pytorch_witness_contract() -> None:
+    summary = {
+        "backend": "pytorch",
+        "inference_contract": {
+            "model_eval": True,
+            "torch_no_grad_guard": True,
+            "model_parameters_require_grad": False,
+            "official_embed_prefix_slice_equal": True,
+        },
+    }
+    analysis._validate_pi05_contract(summary)
+
+    summary["backend"] = "jax_nnx"
+    with pytest.raises(ValueError, match="frozen PyTorch contract"):
+        analysis._validate_pi05_contract(summary)
+
+
 def test_pi05_policy_input_changes_only_base_camera() -> None:
     tools = _ImageTools()
     fixed = {
@@ -194,3 +212,93 @@ def test_pi05_policy_input_changes_only_base_camera() -> None:
         clean["observation/wrist_image"],
         adversarial["observation/wrist_image"],
     )
+
+
+class _FakeTorchImageEncoder:
+    def __init__(self) -> None:
+        self.grad_enabled: list[bool] = []
+
+    def embed_image(self, image: torch.Tensor) -> torch.Tensor:
+        self.grad_enabled.append(torch.is_grad_enabled())
+        scalar = image.float().mean(dim=tuple(range(1, image.ndim)), keepdim=False)
+        return scalar[:, None, None].expand(-1, 256, 2048).to(torch.bfloat16)
+
+
+class _FakeTorchPi05(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.ones(()))
+        self.paligemma_with_expert = _FakeTorchImageEncoder()
+        self.preprocess_train_values: list[bool] = []
+
+    def _preprocess_observation(self, observation, *, train):
+        self.preprocess_train_values.append(train)
+        return observation
+
+    def embed_prefix(self, images, image_masks, lang_tokens, lang_masks):
+        del image_masks, lang_masks
+        image_tokens = [
+            self.paligemma_with_expert.embed_image(image) for image in images
+        ]
+        language = torch.zeros(
+            lang_tokens.shape[0],
+            lang_tokens.shape[1],
+            2048,
+            dtype=image_tokens[0].dtype,
+        )
+        prefix = torch.cat([*image_tokens, language], dim=1)
+        return prefix, None, None
+
+
+class _FakeTorchPolicy:
+    @staticmethod
+    def _input_transform(observation):
+        base = observation["observation/image"].astype(np.float32)
+        wrist = observation["observation/wrist_image"].astype(np.float32)
+        padded = np.zeros_like(wrist)
+        images = {
+            "base_0_rgb": base,
+            "left_wrist_0_rgb": wrist,
+            "right_wrist_0_rgb": padded,
+        }
+        return {
+            "images": images,
+            "image_masks": {
+                key: np.asarray(True, dtype=np.bool_) for key in images
+            },
+            "state": observation["observation/state"].astype(np.float32),
+            "tokenized_prompt": np.zeros(4, dtype=np.int64),
+            "tokenized_prompt_mask": np.ones(4, dtype=np.bool_),
+        }
+
+
+class _FakeObservation:
+    @staticmethod
+    def from_dict(inputs):
+        return SimpleNamespace(**inputs)
+
+
+def test_torch_pi05_p2_matches_official_prefix_slice_under_no_grad() -> None:
+    model = _FakeTorchPi05()
+    runtime = SimpleNamespace(
+        torch=torch,
+        policy=_FakeTorchPolicy(),
+        observation_type=_FakeObservation,
+        model=model,
+        device=torch.device("cpu"),
+    )
+    observation = {
+        "observation/image": np.ones((2, 2, 3), dtype=np.uint8),
+        "observation/wrist_image": np.full((2, 2, 3), 2, dtype=np.uint8),
+        "observation/state": np.zeros(8, dtype=np.float32),
+        "prompt": "pick up the bowl",
+    }
+
+    p2, image_p2 = pi05_consumer._extract_p2(runtime, observation)
+
+    assert p2.shape == (256, 2048)
+    assert tuple(image_p2) == pi05_consumer.IMAGE_KEYS
+    assert model.training is False
+    assert model.preprocess_train_values == [False]
+    assert model.paligemma_with_expert.grad_enabled
+    assert not any(model.paligemma_with_expert.grad_enabled)
