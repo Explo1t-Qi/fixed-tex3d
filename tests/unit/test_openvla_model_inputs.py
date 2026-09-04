@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -46,3 +47,13 @@ def test_existing_empty_token_is_not_duplicated() -> None:
 
     assert inputs["input_ids"].tolist() == [[1, LLAMA_EMPTY_TOKEN_ID]]
     assert inputs["attention_mask"].tolist() == [[1, 1]]
+
+
+def test_existing_empty_token_still_requires_aligned_attention_mask() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[1, LLAMA_EMPTY_TOKEN_ID]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1]], dtype=torch.long),
+    }
+
+    with pytest.raises(ValueError, match="attention_mask must match input_ids"):
+        ensure_trailing_empty_token(inputs)

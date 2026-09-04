@@ -27,6 +27,11 @@ def ensure_trailing_empty_token(inputs: ModelInputsT) -> ModelInputsT:
     input_ids = inputs["input_ids"]
     if input_ids.ndim != 2 or input_ids.shape[1] == 0:
         raise ValueError("input_ids must be a non-empty rank-2 tensor")
+    if (
+        "attention_mask" in inputs
+        and inputs["attention_mask"].shape != input_ids.shape
+    ):
+        raise ValueError("attention_mask must match input_ids before token alignment")
     if bool(torch.all(input_ids[:, -1] == LLAMA_EMPTY_TOKEN_ID).item()):
         return inputs
 
@@ -41,10 +46,6 @@ def ensure_trailing_empty_token(inputs: ModelInputsT) -> ModelInputsT:
 
     if "attention_mask" in inputs:
         attention_mask = inputs["attention_mask"]
-        if attention_mask.shape != input_ids.shape:
-            raise ValueError(
-                "attention_mask must match input_ids before token alignment"
-            )
         trailing_attention = torch.ones(
             (batch_size, 1),
             dtype=attention_mask.dtype,
