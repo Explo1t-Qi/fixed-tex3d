@@ -34,6 +34,11 @@ def _native_mujoco_object_type(kind: str) -> Any:
     return getattr(mujoco.mjtObj, f"mjOBJ_{kind.upper()}")
 
 
+def _raw_mujoco_model(model: Any) -> Any:
+    """Unwrap robosuite's binding_utils.MjModel when present."""
+    return getattr(model, "_model", model)
+
+
 def resolve_mujoco_object_id(model: Any, name: str, kind: str) -> int:
     """Resolve names across mujoco-py wrappers and native mujoco.MjModel."""
     for method_name in (f"{kind[:3]}_name2id", f"{kind}_name2id"):
@@ -51,7 +56,11 @@ def resolve_mujoco_object_id(model: Any, name: str, kind: str) -> int:
     import mujoco
 
     object_id = int(
-        mujoco.mj_name2id(model, _native_mujoco_object_type(kind), name)
+        mujoco.mj_name2id(
+            _raw_mujoco_model(model),
+            _native_mujoco_object_type(kind),
+            name,
+        )
     )
     if object_id < 0:
         raise KeyError(name)
@@ -73,7 +82,9 @@ def _body_name(model: Any, body_id: int) -> str | None:
         import mujoco
 
         return mujoco.mj_id2name(
-            model, _native_mujoco_object_type("body"), body_id
+            _raw_mujoco_model(model),
+            _native_mujoco_object_type("body"),
+            body_id,
         )
     except (ImportError, AttributeError, TypeError, ValueError):
         pass

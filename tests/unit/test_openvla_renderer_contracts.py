@@ -143,6 +143,30 @@ def test_native_mujoco_name_api_discovers_shared_texture_instances(
     ]
 
 
+def test_robosuite_model_wrapper_is_unwrapped_for_native_name_lookup(
+    monkeypatch,
+) -> None:
+    raw_model = object()
+    wrapper = SimpleNamespace(_model=raw_model)
+    object_types = SimpleNamespace(mjOBJ_TEXTURE=7)
+
+    def name_to_id(candidate_model, object_type, name):
+        assert candidate_model is raw_model
+        assert object_type == object_types.mjOBJ_TEXTURE
+        assert name == "shared-akita"
+        return 4
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(mjtObj=object_types, mj_name2id=name_to_id),
+    )
+
+    assert resolve_mujoco_object_id(
+        wrapper, "shared-akita", "texture"
+    ) == 4
+
+
 def test_frontmost_segmentation_is_split_into_mutually_exclusive_masks() -> None:
     # Channel 0 is object type; channel 1 is object/geom id.
     segmentation = np.array(
