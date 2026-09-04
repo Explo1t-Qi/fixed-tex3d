@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,6 +21,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--openvla-dir", type=Path, required=True)
     parser.add_argument("--pi05-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--training-dir", type=Path)
     parser.add_argument("--formal", action="store_true")
     return parser.parse_args(argv)
 
@@ -72,6 +74,24 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(f"analysis output directory must be fresh: {output_dir}")
 
+    training_config = None
+    if args.training_dir is not None:
+        training_dir = args.training_dir.expanduser().resolve()
+        run_dir = training_dir.parent
+        training_config = json.loads(
+            (run_dir / "config.json").read_text(encoding="utf-8")
+        )
+        recorded_texture_hash = (
+            (training_dir / "texture_sha256.txt").read_text(encoding="utf-8").strip()
+        )
+        actual_texture_hash = "sha256:" + hashlib.sha256(
+            (training_dir / "final_attack_texture.png").read_bytes()
+        ).hexdigest()
+        if recorded_texture_hash != actual_texture_hash:
+            raise ValueError("training texture artifact SHA256 mismatch")
+    elif args.formal:
+        raise ValueError("formal analysis requires training_dir provenance")
+
     pair_manifest = json.loads(
         (pairs_dir / "manifest.json").read_text(encoding="utf-8")
     )
@@ -89,6 +109,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if len(texture_hashes) != 1 or None in texture_hashes:
         raise ValueError("frozen texture SHA256 mismatch across consumers")
+    if args.training_dir is not None and next(iter(texture_hashes)) != recorded_texture_hash:
+        raise ValueError("pair texture does not match frozen training texture")
 
     o2_clean, sample_ids, state_ids = _load_feature(
         openvla_dir / "o2_clean.npz", "o2_clean"
@@ -152,6 +174,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     np.testing.assert_allclose(p2_rms, expected_p2_rms, rtol=0, atol=0)
     if args.formal and (n != 10 or state_ids.tolist() != list(range(10, 20))):
         raise ValueError("formal analysis requires exactly held-out states 10-19")
+    if args.formal and (
+        training_config.get("formal_configuration_frozen") is not True
+        or training_config.get("attack_objective") != "o2_displacement"
+        or training_config.get("train_state_ids") != list(range(10))
+        or training_config.get("heldout_state_ids") != list(range(10, 20))
+    ):
+        raise ValueError("formal training configuration provenance mismatch")
 
     d_o2 = np.mean(np.square(delta_o2, dtype=np.float64), axis=(1, 2))
     d_p2 = np.mean(np.square(delta_p2, dtype=np.float64), axis=(1, 2))
@@ -214,7 +243,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "source_git_commit": openvla_summary["repository_commit"],
         "witness_adapter_commit": pi05_summary["witness_adapter_commit"],
         "texture_sha256": next(iter(texture_hashes)),
-        "train_state_ids": list(range(10)),
+        "train_state_ids": (
+            training_config["train_state_ids"]
+            if training_config is not None
+            else list(range(10))
+        ),
         "heldout_state_ids": state_ids.tolist(),
         "state_displacement_o2": d_o2.tolist(),
         "state_displacement_p2": d_p2.tolist(),

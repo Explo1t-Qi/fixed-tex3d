@@ -206,6 +206,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     binding = resolve_runtime_texture_binding(
         xml_path, clean_texture, object_name=OBJECT_NAME
     )
+    if binding.used_name_fallback:
+        raise RuntimeError(
+            "clean texture must resolve by its XML file relationship, not name fallback"
+        )
 
     from libero.libero import benchmark
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Union, List
 import shutil
 import hashlib
+import subprocess
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -1064,6 +1065,8 @@ def train_adversarial_texture(
             ),
             "maximum_texture_perturbation": maximum_texture_perturbation,
         }
+        if maximum_texture_perturbation > float(renderer.epsilon) + 1e-6:
+            raise RuntimeError("Tex3D texture perturbation exceeded its budget")
         with open(step_metrics_path, "a") as f:
             f.write(json.dumps(step_metrics, sort_keys=True) + "\n")
         if attack_objective == LEGACY_OBJECTIVE:
@@ -1094,6 +1097,8 @@ def train_adversarial_texture(
             np.array(loss_history),
         )
         if attack_objective == O2_DISPLACEMENT_OBJECTIVE:
+            if cfg.step1_output_dir:
+                np.save(Path(save_dir) / "loss_history.npy", np.array(loss_history))
             assert_pi05_not_loaded()
             summary = {
                 "attack_objective": attack_objective,
@@ -1108,6 +1113,12 @@ def train_adversarial_texture(
                 "final_o2_displacement": avg_o2_displacement,
                 "final_texture_gradient_norm": g_norm,
                 "maximum_texture_perturbation": maximum_texture_perturbation,
+                "texture_budget_respected": bool(
+                    maximum_texture_perturbation
+                    <= float(renderer.epsilon) + 1e-6
+                ),
+                "o2_clean_finite": True,
+                "o2_adversarial_finite": True,
                 "renderer_epsilon": float(renderer.epsilon),
             }
             Path(save_dir, "training_summary.json").write_text(
@@ -1262,6 +1273,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     if not original_xml.exists():
         raise FileNotFoundError(f"XML asset not found at {original_xml}")
+    initial_xml_bytes = original_xml.read_bytes()
     runtime_texture_binding = resolve_runtime_texture_binding(
         original_xml,
         texture_path,
@@ -1276,7 +1288,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if not _real_tex_path.is_absolute():
         _real_tex_path = (Path.cwd() / _real_tex_path).resolve()
     _real_tex_backup = None
+    initial_real_texture_bytes = None
     if _real_tex_path.exists():
+        initial_real_texture_bytes = _real_tex_path.read_bytes()
         _real_tex_backup = _real_tex_path.with_name(f"texture_clean_backup_{DATE_TIME}.png")
         shutil.copy(_real_tex_path, _real_tex_backup)
     else:
@@ -1335,6 +1349,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     "train_state_ids": list(range(cfg.num_train_init_states)),
                     "heldout_state_ids": list(range(10, 20)),
                     "formal_configuration_frozen": bool(cfg.step1_formal),
+                    "source_git_commit": subprocess.run(
+                        ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
                     "pi05_training_role": "forbidden/not loaded",
                     "o2_texture_initialization": "seeded_uniform_parameter",
                     "o2_texture_initialization_scale": float(cfg.attack_lr),
@@ -1536,9 +1556,39 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     finally:
         _restore_clean_assets("Final cleanup", remove_backups=True)
+        restoration_failure = None
+        if step1_run_dir is not None:
+            restoration = {
+                "xml_restored": (
+                    original_xml.is_file()
+                    and original_xml.read_bytes() == initial_xml_bytes
+                ),
+                "clean_texture_restored": (
+                    initial_real_texture_bytes is None
+                    or (
+                        _real_tex_path.is_file()
+                        and _real_tex_path.read_bytes() == initial_real_texture_bytes
+                    )
+                ),
+                "xml_backup_removed": not global_clean_backup.exists(),
+                "texture_backup_removed": (
+                    _real_tex_backup is None or not _real_tex_backup.exists()
+                ),
+            }
+            restoration["pass"] = all(restoration.values())
+            (step1_run_dir / "asset_restoration.json").write_text(
+                json.dumps(restoration, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            if not restoration["pass"]:
+                restoration_failure = RuntimeError(
+                    f"Step 1 asset restoration failed: {restoration}"
+                )
         log_file.close()
         if cfg.use_wandb:
             wandb.finish()
+        if restoration_failure is not None:
+            raise restoration_failure
 
 
 if __name__ == "__main__":
