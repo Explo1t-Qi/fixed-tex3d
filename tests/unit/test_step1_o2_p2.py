@@ -164,6 +164,7 @@ def test_legacy_remains_the_default_objective_contract() -> None:
     ).read_text(encoding="utf-8")
     assert "attack_objective:       str            = LEGACY_OBJECTIVE" in entrypoint
     assert "if attack_objective == LEGACY_OBJECTIVE:" in entrypoint
+    assert "Preserve the historical legacy logging reduction." in entrypoint
 
 
 @pytest.mark.parametrize("width", [4096, 2048])

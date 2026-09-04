@@ -1020,7 +1020,9 @@ def train_adversarial_texture(
             valid += 1
 
         if valid > 0:
-            avg_total  /= valid
+            if attack_objective == LEGACY_OBJECTIVE:
+                # Preserve the historical legacy logging reduction.
+                avg_total /= valid
             avg_action /= valid
             avg_feat   /= valid
             avg_o2_displacement /= valid
