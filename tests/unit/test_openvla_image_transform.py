@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROBOT_EXPERIMENT_DIR))
 
 from openvla_image_transform import (  # noqa: E402
     DifferentiableOpenVLAImageProcessor,
+    ExactForwardSurrogateBackwardOpenVLAImageProcessor,
 )
 
 
@@ -60,6 +62,134 @@ def _processor(
             ),
         )
     )
+
+
+class _ExactImageProcessor:
+    def __init__(self) -> None:
+        self.last_output: torch.Tensor | None = None
+        self.last_images = None
+
+    def __call__(self, images, *, return_tensors):
+        assert return_tensors == "pt"
+        self.last_images = images
+        self.last_output = torch.arange(
+            len(images) * 6 * 2 * 2, dtype=torch.float32
+        ).reshape(len(images), 6, 2, 2)
+        return {"pixel_values": self.last_output}
+
+
+class _GradientBearingExactImageProcessor:
+    def __init__(self) -> None:
+        self.parameter = torch.tensor(0.25, requires_grad=True)
+
+    def __call__(self, images, *, return_tensors):
+        assert return_tensors == "pt"
+        return {
+            "pixel_values": self.parameter
+            * torch.ones((len(images), 6, 2, 2), dtype=torch.float32)
+        }
+
+
+def test_exact_forward_surrogate_backward_is_bit_exact_to_official() -> None:
+    surrogate = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=_model("dinov2", "siglip"),
+        processor=_processor(),
+    )
+    exact = _ExactImageProcessor()
+    processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=exact,
+        surrogate=surrogate,
+    )
+    image = torch.full((1, 3, 4, 4), 0.75, dtype=torch.float32)
+
+    fused = processor(image)
+
+    assert exact.last_output is not None
+    assert torch.equal(fused.cpu(), exact.last_output)
+
+
+def test_exact_forward_surrogate_backward_has_finite_input_gradient() -> None:
+    surrogate = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=_model("dinov2", "siglip"),
+        processor=_processor(),
+    )
+    processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=_ExactImageProcessor(),
+        surrogate=surrogate,
+    )
+    image = torch.full(
+        (1, 3, 4, 4), 0.75, dtype=torch.float32, requires_grad=True
+    )
+
+    processor(image).square().mean().backward()
+
+    assert image.grad is not None
+    assert bool(torch.isfinite(image.grad).all())
+    assert float(image.grad.abs().sum()) > 0.0
+
+
+def test_exact_forward_branch_receives_no_gradient() -> None:
+    surrogate = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=_model("dinov2", "siglip"),
+        processor=_processor(),
+    )
+    exact = _GradientBearingExactImageProcessor()
+    processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=exact,
+        surrogate=surrogate,
+    )
+    image = torch.full(
+        (1, 3, 4, 4), 0.75, dtype=torch.float32, requires_grad=True
+    )
+
+    processor(image).sum().backward()
+
+    assert exact.parameter.grad is None
+    assert image.grad is not None
+
+
+def test_exact_forward_preserves_official_shape_dtype_and_branch_order() -> None:
+    surrogate = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=_model("dinov2", "siglip"),
+        processor=_processor(),
+    )
+    processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=_ExactImageProcessor(),
+        surrogate=surrogate,
+    )
+    image = torch.full((2, 3, 4, 4), 0.75, dtype=torch.float64)
+
+    fused = processor(image)
+
+    assert fused.shape == (2, 6, 2, 2)
+    assert fused.dtype == torch.float32
+    assert processor.branch_model_ids == ("dinov2", "siglip")
+    assert processor.output_size == (2, 2)
+
+
+def test_exact_forward_restores_deployment_uint8_before_official_processor() -> None:
+    surrogate = DifferentiableOpenVLAImageProcessor.from_checkpoint(
+        model=_model("dinov2", "siglip"),
+        processor=_processor(),
+    )
+    exact = _ExactImageProcessor()
+    processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=exact,
+        surrogate=surrogate,
+    )
+    deployment_uint8 = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)
+    image = (
+        torch.from_numpy(deployment_uint8.copy())
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        .div(255.0)
+    )
+
+    processor(image)
+
+    assert exact.last_images is not None
+    assert np.array_equal(np.asarray(exact.last_images[0]), deployment_uint8)
 
 
 def test_fused_pixels_follow_checkpoint_branch_order_and_normalization() -> None:

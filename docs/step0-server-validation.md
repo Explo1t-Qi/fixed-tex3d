@@ -15,6 +15,12 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 ## 2. Real checkpoint processor equivalence
 
+The initial pure differentiable processor produced a stable `3/7` action-token
+mismatch on the real clean frame. The user-authorized fallback uses the official
+checkpoint image processor for an exact detached forward and the existing
+checkpoint-derived differentiable processor only for backward. The audit keeps
+the original surrogate error fields alongside the exact-candidate fields.
+
 ```bash
 cd /home/xmq/src/tex3d
 mkdir -p /tmp/tex3d-step0-evidence
@@ -31,9 +37,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/openvla" \
 ```
 
 The command exits with status 2 if the real Spatial task-0/state-0 clean frame
-does not produce 7/7 identical action tokens. Status 3 means that repeating the
+does not produce 7/7 identical action tokens, exact zero candidate pixel error,
+and a finite nonzero preprocessing gradient. Status 3 means that repeating the
 official-processor inference was itself not token-deterministic. Do not proceed
-by adding BPDA; return the JSON for review.
+to later phases after either failure; return the JSON for review.
 
 ## 3. Renderer, visibility, and compositor audit
 

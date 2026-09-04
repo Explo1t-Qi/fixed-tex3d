@@ -27,6 +27,7 @@ from libero.libero import benchmark  # noqa: E402
 from libero_utils import get_libero_env, get_libero_image  # noqa: E402
 from openvla_image_transform import (  # noqa: E402
     DifferentiableOpenVLAImageProcessor,
+    ExactForwardSurrogateBackwardOpenVLAImageProcessor,
 )
 from openvla_model_inputs import ensure_trailing_empty_token  # noqa: E402
 from openvla_policy_view import (  # noqa: E402
@@ -149,6 +150,10 @@ def main() -> int:
     differentiable = DifferentiableOpenVLAImageProcessor.from_checkpoint(
         model=model, processor=processor
     )
+    candidate_processor = ExactForwardSurrogateBackwardOpenVLAImageProcessor(
+        official_image_processor=processor.image_processor,
+        surrogate=differentiable,
+    )
     real_image, task_description = _real_spatial_state_zero()
     cases = _synthetic_images() + [("libero_spatial_task0_state0", real_image)]
     prompt = (
@@ -161,22 +166,40 @@ def main() -> int:
         official = processor.image_processor(
             Image.fromarray(image), return_tensors="pt"
         )["pixel_values"].to(model.device)
-        candidate = differentiable(_tensor_rgb(image, model.device))
+        rgb = _tensor_rgb(image, model.device)
+        surrogate = differentiable(rgb)
+        candidate = candidate_processor(rgb)
         delta = (candidate - official).abs()
+        surrogate_delta = (surrogate - official).abs()
         official_model_input = official.to(torch.bfloat16)
         candidate_model_input = candidate.to(torch.bfloat16)
         model_input_delta = (
             candidate_model_input - official_model_input
         ).abs().float()
+        surrogate_model_input = surrogate.to(torch.bfloat16)
+        surrogate_model_input_delta = (
+            surrogate_model_input - official_model_input
+        ).abs().float()
         branch_rows = []
+        surrogate_branch_rows = []
         channel_offset = 0
         for branch in differentiable.branches:
             branch_delta = delta[:, channel_offset : channel_offset + 3]
+            surrogate_branch_delta = surrogate_delta[
+                :, channel_offset : channel_offset + 3
+            ]
             branch_rows.append(
                 {
                     "model_id": branch.model_id,
                     "mae": float(branch_delta.mean().item()),
                     "linf": float(branch_delta.max().item()),
+                }
+            )
+            surrogate_branch_rows.append(
+                {
+                    "model_id": branch.model_id,
+                    "mae": float(surrogate_branch_delta.mean().item()),
+                    "linf": float(surrogate_branch_delta.max().item()),
                 }
             )
             channel_offset += 3
@@ -200,6 +223,14 @@ def main() -> int:
         official_action = _decode(model, official_ids, args.unnorm_key)
         candidate_action = _decode(model, candidate_ids, args.unnorm_key)
         action_delta = candidate_action - official_action
+        preprocessing_gradient = None
+        if name == "libero_spatial_task0_state0":
+            gradient_input = _tensor_rgb(image, model.device).requires_grad_(True)
+            gradient_output = candidate_processor(gradient_input)
+            gradient_loss = gradient_output.float().square().mean()
+            preprocessing_gradient = torch.autograd.grad(
+                gradient_loss, gradient_input
+            )[0]
         rows.append(
             {
                 "name": name,
@@ -214,6 +245,20 @@ def main() -> int:
                     ).item()
                 ),
                 "branches": branch_rows,
+                "surrogate_global_mae": float(surrogate_delta.mean().item()),
+                "surrogate_global_linf": float(surrogate_delta.max().item()),
+                "surrogate_model_input_bfloat16_mae": float(
+                    surrogate_model_input_delta.mean().item()
+                ),
+                "surrogate_model_input_bfloat16_linf": float(
+                    surrogate_model_input_delta.max().item()
+                ),
+                "surrogate_model_input_bfloat16_unequal_count": int(
+                    torch.count_nonzero(
+                        surrogate_model_input != official_model_input
+                    ).item()
+                ),
+                "surrogate_branches": surrogate_branch_rows,
                 "official_action_tokens": official_tokens.tolist(),
                 "official_repeat_action_tokens": official_repeat_tokens.tolist(),
                 "candidate_action_tokens": candidate_tokens.tolist(),
@@ -223,6 +268,16 @@ def main() -> int:
                 ),
                 "decoded_action_l2": float(np.linalg.norm(action_delta)),
                 "decoded_action_linf": float(np.abs(action_delta).max()),
+                "preprocessing_backward_gradient_finite": (
+                    bool(torch.isfinite(preprocessing_gradient).all())
+                    if preprocessing_gradient is not None
+                    else None
+                ),
+                "preprocessing_backward_gradient_norm": (
+                    float(preprocessing_gradient.norm().item())
+                    if preprocessing_gradient is not None
+                    else None
+                ),
             }
         )
 
@@ -230,6 +285,7 @@ def main() -> int:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "model_training_before_explicit_eval": model_training_before_eval,
         "model_training_during_audit": bool(model.training),
+        "candidate_preprocessing": "exact_forward_surrogate_backward",
         "resolved_branch_order": list(differentiable.branch_model_ids),
         "resize_mode": [branch.interpolation for branch in differentiable.branches],
         "antialias": [branch.antialias for branch in differentiable.branches],
@@ -243,7 +299,17 @@ def main() -> int:
     real_row = rows[-1]
     if real_row["official_repeat_token_hamming"] != 0:
         return 3
-    return 0 if real_row["token_hamming"] == 0 else 2
+    passed = (
+        real_row["token_hamming"] == 0
+        and real_row["decoded_action_l2"] == 0.0
+        and real_row["decoded_action_linf"] == 0.0
+        and real_row["global_mae"] == 0.0
+        and real_row["global_linf"] == 0.0
+        and real_row["model_input_bfloat16_unequal_count"] == 0
+        and real_row["preprocessing_backward_gradient_finite"]
+        and real_row["preprocessing_backward_gradient_norm"] > 0.0
+    )
+    return 0 if passed else 2
 
 
 if __name__ == "__main__":

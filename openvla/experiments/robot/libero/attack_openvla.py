@@ -57,7 +57,9 @@ OPENVLA_REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if OPENVLA_REPO_ROOT not in sys.path:
     sys.path.insert(0, OPENVLA_REPO_ROOT)
 
-from openvla_image_transform import DifferentiableOpenVLAImageProcessor
+from openvla_image_transform import (
+    ExactForwardSurrogateBackwardOpenVLAImageProcessor,
+)
 from openvla_model_inputs import ensure_trailing_empty_token
 from openvla_policy_view import (
     DEFAULT_DEPLOYMENT_VIEW,
@@ -585,9 +587,11 @@ def train_adversarial_texture(
 
     RENDER_RES       = POLICY_SOURCE_RESOLUTION
     device           = model.device
-    image_preprocessor = DifferentiableOpenVLAImageProcessor.from_checkpoint(
-        model=model,
-        processor=processor,
+    image_preprocessor = (
+        ExactForwardSurrogateBackwardOpenVLAImageProcessor.from_checkpoint(
+            model=model,
+            processor=processor,
+        )
     )
     policy_view = PolicyViewTransform(DEFAULT_DEPLOYMENT_VIEW)
 

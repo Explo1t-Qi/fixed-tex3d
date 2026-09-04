@@ -12,8 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 
 ImageSize = tuple[int, int]
@@ -201,3 +203,62 @@ class DifferentiableOpenVLAImageProcessor:
             ),
             dim=1,
         )
+
+
+@dataclass(frozen=True)
+class ExactForwardSurrogateBackwardOpenVLAImageProcessor:
+    """Use the official image processor in forward and the surrogate in backward."""
+
+    official_image_processor: Any
+    surrogate: DifferentiableOpenVLAImageProcessor
+
+    @classmethod
+    def from_checkpoint(
+        cls, *, model: Any, processor: Any
+    ) -> "ExactForwardSurrogateBackwardOpenVLAImageProcessor":
+        return cls(
+            official_image_processor=processor.image_processor,
+            surrogate=DifferentiableOpenVLAImageProcessor.from_checkpoint(
+                model=model, processor=processor
+            ),
+        )
+
+    @property
+    def branches(self) -> tuple[VisionBranchPreprocessing, ...]:
+        return self.surrogate.branches
+
+    @property
+    def branch_model_ids(self) -> tuple[str, ...]:
+        return self.surrogate.branch_model_ids
+
+    @property
+    def output_size(self) -> ImageSize:
+        return self.surrogate.output_size
+
+    def __call__(self, rgb_images: torch.Tensor) -> torch.Tensor:
+        surrogate = self.surrogate(rgb_images)
+        with torch.no_grad():
+            detached_uint8 = (
+                rgb_images.detach()
+                .clamp(0.0, 1.0)
+                .mul(255.0)
+                .round()
+                .to(device="cpu", dtype=torch.uint8)
+            )
+            pil_images = [
+                Image.fromarray(
+                    np.ascontiguousarray(image.permute(1, 2, 0).numpy()),
+                    mode="RGB",
+                )
+                for image in detached_uint8
+            ]
+            exact = self.official_image_processor(
+                pil_images, return_tensors="pt"
+            )["pixel_values"]
+        if not isinstance(exact, torch.Tensor):
+            raise TypeError("official image processor must return pixel_values tensor")
+        exact = exact.detach().to(surrogate.device)
+        surrogate = surrogate.to(exact.dtype)
+        if exact.shape != surrogate.shape:
+            raise ValueError("official and surrogate pixel_values shapes must match")
+        return exact + (surrogate - surrogate.detach())
