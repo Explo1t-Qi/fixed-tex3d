@@ -259,21 +259,28 @@ def _extract_p2(
             inputs,
         )
         model_observation = runtime.observation_type.from_dict(inputs)
-        prepared = model._preprocess_observation(model_observation, train=False)
-        if tuple(prepared.images) != IMAGE_KEYS:
+        if tuple(model_observation.images) != IMAGE_KEYS:
             raise RuntimeError(
-                f"pi0.5 image-key ordering mismatch: {tuple(prepared.images)}"
+                "pi0.5 image-key ordering mismatch: "
+                f"{tuple(model_observation.images)}"
             )
-        images = [prepared.images[key] for key in IMAGE_KEYS]
-        image_masks = [prepared.image_masks[key] for key in IMAGE_KEYS]
+        prepared = model._preprocess_observation(model_observation, train=False)
+        if not isinstance(prepared, tuple) or len(prepared) != 5:
+            raise RuntimeError(
+                "PI0Pytorch._preprocess_observation must return five values"
+            )
+        images, image_masks, lang_tokens, lang_masks, _ = prepared
+        if len(images) != len(IMAGE_KEYS) or len(image_masks) != len(IMAGE_KEYS):
+            raise RuntimeError("pi0.5 preprocessing did not return three image slots")
+        image_by_key = dict(zip(IMAGE_KEYS, images, strict=True))
         prefix, _, _ = model.embed_prefix(
             images,
             image_masks,
-            prepared.tokenized_prompt,
-            prepared.tokenized_prompt_mask,
+            lang_tokens,
+            lang_masks,
         )
         direct = {
-            key: model.paligemma_with_expert.embed_image(prepared.images[key])
+            key: model.paligemma_with_expert.embed_image(image_by_key[key])
             for key in IMAGE_KEYS
         }
         for index, key in enumerate(IMAGE_KEYS):

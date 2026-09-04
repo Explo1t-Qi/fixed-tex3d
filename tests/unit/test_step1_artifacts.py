@@ -233,7 +233,13 @@ class _FakeTorchPi05(torch.nn.Module):
 
     def _preprocess_observation(self, observation, *, train):
         self.preprocess_train_values.append(train)
-        return observation
+        return (
+            list(observation.images.values()),
+            list(observation.image_masks.values()),
+            observation.tokenized_prompt,
+            observation.tokenized_prompt_mask,
+            observation.state,
+        )
 
     def embed_prefix(self, images, image_masks, lang_tokens, lang_masks):
         del image_masks, lang_masks

@@ -6,11 +6,12 @@
 STEP 1 IMPLEMENTATION READY — SERVER VALIDATION PENDING
 ```
 
-The implementation and CPU contracts are complete. The source GPU smoke passed
-on the server. The first one-pair collection exposed and stopped on an overly
-strict wrist-image assertion; that contract has been corrected and awaits a
-server rerun. The formal experiment has not run, so no scientific transfer
-result is claimed.
+The implementation and CPU contracts are complete. The source GPU smoke,
+corrected one-pair collection, and authoritative OpenVLA O2 extraction passed
+on the server. The first PyTorch pi0.5 extraction reached the official
+preprocessing boundary and exposed a tuple-interface mismatch in the witness
+adapter; that mismatch has been corrected and awaits a server rerun. The formal
+experiment has not run, so no scientific transfer result is claimed.
 
 ## Git provenance
 
@@ -83,7 +84,7 @@ Latest implementation suite after the wrist-input contract regression fix:
 ```text
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 /home/xmq/.virtualenvs/modified-tex3d/bin/python -m pytest -q tests/unit
-50 passed in 6.53s
+50 passed in 4.56s
 ```
 
 The explicit empty `CUDA_VISIBLE_DEVICES` is required for a CPU regression on
@@ -132,10 +133,13 @@ OpenPI Transformers patch. The PyTorch checkpoint root is
 The source GPU smoke passed with a finite loss, finite/nonzero O2 displacement
 and texture gradient, a changed parameter, a respected texture budget, pi0.5
 absent from training, and successful XML/texture restoration. The first witness
-collection stopped before feature extraction because the attacked texture was
-also visible in the separately rendered wrist image. This is expected image
-content change, not a scene-state change; the witness contract requires that
-the clean wrist input be reused for both pi0.5 calls. Consequently, the
+collection initially stopped before feature extraction because the attacked
+texture was also visible in the separately rendered wrist image. This is
+expected image content change, not a scene-state change; the corrected
+collection and OpenVLA O2 extraction then passed. The first PyTorch pi0.5 run
+stopped because the witness treated the official five-value preprocessing
+tuple as an object with image attributes. A regression test now reproduces the
+official tuple contract and passes with explicit unpacking. Consequently, the
 following required gates remain **NOT EXECUTED** at this report revision:
 
 ```text
