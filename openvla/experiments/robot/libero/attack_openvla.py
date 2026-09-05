@@ -1071,6 +1071,10 @@ def train_adversarial_texture(
             raise RuntimeError("Tex3D texture perturbation exceeded its budget")
         with open(step_metrics_path, "a") as f:
             f.write(json.dumps(step_metrics, sort_keys=True) + "\n")
+        if cfg.step1b_mature_trajectory:
+            from step1b_trajectory import save_checkpoint
+
+            save_checkpoint(renderer, Path(save_dir), i, step_metrics)
         if attack_objective == LEGACY_OBJECTIVE:
             iterator.set_postfix(
                 act=f"{avg_action:.4f}",
@@ -1178,6 +1182,7 @@ class GenerateConfig:
     local_log_dir:         str            = "./experiments/logs"
     step1_output_dir:       Optional[str]  = None
     step1_formal:           bool           = False
+    step1b_mature_trajectory: bool         = False
 
     use_wandb:     bool           = False
     wandb_project: str            = "openvla_attack"
@@ -1243,6 +1248,10 @@ def _format_rollout_summary(total_successes: int, total_episodes: int):
 def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
     validate_attack_objective(cfg.attack_objective)
+    if cfg.step1b_mature_trajectory:
+        from step1b_trajectory import validate_step1b_config
+
+        validate_step1b_config(asdict(cfg))
     _validate_step1_formal_config(cfg)
     if cfg.attack_objective == O2_DISPLACEMENT_OBJECTIVE:
         assert_pi05_not_loaded()
@@ -1385,6 +1394,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 + "\n",
                 encoding="utf-8",
             )
+            if cfg.step1b_mature_trajectory:
+                from step1b_trajectory import initialize_manifest
+
+                initialize_manifest(Path(artifact_dir), resolved_config)
     total_episodes  = 0
     total_successes = 0
 
@@ -1610,6 +1623,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
             wandb.finish()
         if restoration_failure is not None:
             raise restoration_failure
+
+    if cfg.step1b_mature_trajectory:
+        from step1b_trajectory import finalize_trajectory
+
+        finalize_trajectory(step1_run_dir)
 
 
 if __name__ == "__main__":
