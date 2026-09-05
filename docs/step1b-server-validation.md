@@ -10,43 +10,58 @@ user-provided task. The user's latest instruction limits this delivery to
 implementation, CPU tests, and commands; the runtime items in specification
 section 21 are acceptance checks for the subsequent server run.
 
-## One copyable block: local sync and full server run
+## Run directly in the logged-in server shell
 
-Execute this block in Bash on the local workstation. It pushes the new branch
-directly to the existing `server` remote, checks out that exact commit on the
-server, and runs the complete script below. It does not depend on GitHub
-`origin`. Keep the connection open for the full run.
+The user selected physical GPU **1** for this run, superseding the original
+GPU 7 execution setting. The script explicitly sets `CUDA_VISIBLE_DEVICES=1`.
+
+After syncing this revision with the existing local `git push server` workflow,
+run the following directly on the server. The final handoff supplies the exact
+commit to use for `EXPECTED_HEAD`; the commands below use the checked-out HEAD.
 
 ```bash
-bash <<'STEP1B'
-set -euo pipefail
-cd /home/xmq/src/tex3d
-test "$(git branch --show-current)" = feat/step1b-mature-o2-trajectory
-test -z "$(git status --porcelain)"
+cd /data/xiaomengqi/src/tex3d-fixed
+git switch feat/step1b-mature-o2-trajectory
 EXPECTED_HEAD=$(git rev-parse HEAD)
-git push server HEAD:refs/heads/feat/step1b-mature-o2-trajectory
-ssh xiaomengqi@59.78.189.196 bash -s -- "$EXPECTED_HEAD" < scripts/step1b_server_run.sh
-STEP1B
+bash scripts/step1b_server_run.sh "$EXPECTED_HEAD" --preflight-only
 ```
 
-Alternatively, after the push, the server can run
-`bash scripts/step1b_server_run.sh "$(git rev-parse HEAD)"` from the new branch.
-The script fails if the output run or console log already exists. An interrupted
-run must be retained for inspection; this workflow supplies no resume, automatic
-restart, checkpoint selection, or early stopping.
+The preflight checks paths, assets, backup files, Git HEAD and worktree, and
+whether the run directory already exists. It does not run Python, create the
+run directory, create a console log, or start training. Failure output names the
+predicate and, for a dirty worktree, prints the affected files.
+
+After `PREFLIGHT PASSED`, start the full pipeline in that server shell:
+
+```bash
+bash scripts/step1b_server_run.sh "$EXPECTED_HEAD"
+```
+
+Existing run directories remain fail-closed. Each full attempt receives a fresh
+`mktemp` console log, so a log from a failed preflight can be preserved without
+blocking the next attempt. There is no automatic restart or resume of training.
+
+Local synchronization, when needed, is a separate local-workstation command:
+
+```bash
+cd /home/xmq/src/tex3d
+git push server HEAD:refs/heads/feat/step1b-mature-o2-trajectory
+```
 
 ## Full server Bash implementation
 
 The source of this block is `scripts/step1b_server_run.sh`; it defines all
-environment variables and uses physical GPU 7. The argument is the exact local
-commit supplied automatically by the sync block.
+environment variables and uses physical GPU 1. The argument is the expected
+committed HEAD.
 
 ```bash
 #!/usr/bin/env bash
-# Run on the server after pushing the branch. Argument: expected full Git HEAD.
+# Server usage: bash scripts/step1b_server_run.sh HEAD [--preflight-only]
 set -euo pipefail
 trap 'printf "FAILED at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 EXPECTED_HEAD="${1:?Pass the local committed HEAD as the first argument}"
+MODE="${2:-run}"
+case "$MODE" in run|--preflight-only) ;; *) printf 'Invalid mode: %s\n' "$MODE" >&2; exit 2 ;; esac
 export REPO=/data/xiaomengqi/src/tex3d-fixed
 export LOG_ROOT=/data/xiaomengqi/logs/step1b
 export OPENVLA_PY=/home/xiaomengqi/miniconda3/envs/tex3d-openvla/bin/python
@@ -58,7 +73,7 @@ export SHARED_ROOT=/data/xiaomengqi/src/shared-feature-tex3d
 export PI05_CKPT=/data/xiaomengqi/checkpoints/pi05_libero_pytorch
 export RUN_ID=step1b-mature-o2-5000-v1
 export RUN_ROOT="$LOG_ROOT/$RUN_ID"
-export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=7
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1
 export LIBERO_ROOT="$LIBERO_ROOT_PATH" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export TF_CPP_MIN_LOG_LEVEL=2 TOKENIZERS_PARALLELISM=false
@@ -66,32 +81,51 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 unset PYTHONPATH
 
 cd "$REPO"
-test -z "$(git status --porcelain)"
-test "$(git rev-parse refs/heads/feat/step1b-mature-o2-trajectory)" = "$EXPECTED_HEAD"
+changes=$(git status --porcelain)
+if [[ -n "$changes" ]]; then
+    printf 'AUDIT FAILED: dirty worktree before branch switch:\n%s\n' "$changes" >&2
+    exit 1
+fi
+branch_head=$(git rev-parse refs/heads/feat/step1b-mature-o2-trajectory)
+if [[ "$branch_head" != "$EXPECTED_HEAD" ]]; then
+    printf 'AUDIT FAILED: branch HEAD mismatch: expected=%s actual=%s\n' "$EXPECTED_HEAD" "$branch_head" >&2
+    exit 1
+fi
 git switch feat/step1b-mature-o2-trajectory
-test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-git status --short --branch
 for item in "$OPENVLA_PY" "$OPENVLA_CKPT" "$LIBERO_ROOT_PATH" "$JOINT_PY" \
             "$OPENPI_ROOT" "$SHARED_ROOT" "$PI05_CKPT/model.safetensors"; do
-    test -e "$item"
+    if [[ ! -e "$item" ]]; then printf 'MISSING PATH: %s\n' "$item" >&2; exit 1; fi
 done
-test ! -e "$RUN_ROOT"
-test ! -e "$LOG_ROOT/$RUN_ID.console.log"
-mkdir -p "$LOG_ROOT"
-exec > >(tee "$LOG_ROOT/$RUN_ID.console.log") 2>&1
 
 ASSET_DIR="$LIBERO_ROOT_PATH/libero/libero/assets/stable_scanned_objects/akita_black_bowl"
+git_audit() {
+    local actual_head changes
+    actual_head=$(git rev-parse HEAD) || return 1
+    if [[ "$actual_head" != "$EXPECTED_HEAD" ]]; then
+        printf 'AUDIT FAILED: HEAD mismatch: expected=%s actual=%s\n' "$EXPECTED_HEAD" "$actual_head" >&2
+        return 1
+    fi
+    changes=$(git status --porcelain) || return 1
+    if [[ -n "$changes" ]]; then
+        printf 'AUDIT FAILED: dirty worktree:\n%s\n' "$changes" >&2
+        return 1
+    fi
+    git status --short --branch
+}
 asset_and_git_audit() {
     printf '%s  %s\n' \
       18c1074cfa09baea739bb75928f9bd2bd80e22ac18655f6a27f005dbf77ccfda "$ASSET_DIR/akita_black_bowl.xml" \
       8a646d98b084b7400dd91beed9c83e10b4a4dca572896b3974356b7937a4bd85 "$ASSET_DIR/texture.png" | sha256sum -c - || return 1
     local backups
     backups=$(find "$LIBERO_ROOT_PATH/libero/libero/assets" -type f \
-      \( -name '*clean_backup*' -o -name 'texture_clean_backup_*.png' \)) || return 1
-    if [[ -n "$backups" ]]; then printf '%s\n' "$backups"; return 1; fi
-    test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD" || return 1
-    test -z "$(git status --porcelain)" || return 1
-    git status --short --branch
+      \( -name '*clean_backup*' -o -name 'texture_clean_backup_*.png' \)) || {
+        printf 'AUDIT FAILED: backup search failed\n' >&2; return 1;
+    }
+    if [[ -n "$backups" ]]; then
+        printf 'AUDIT FAILED: backup files remain:\n%s\n' "$backups" >&2
+        return 1
+    fi
+    git_audit
 }
 on_exit() {
     local status=$?
@@ -104,6 +138,21 @@ on_exit() {
 }
 trap on_exit EXIT
 asset_and_git_audit
+printf 'PRECHECK: GPU=%s expected_HEAD=%s run_root=%s\n' "$CUDA_VISIBLE_DEVICES" "$EXPECTED_HEAD" "$RUN_ROOT"
+if [[ -e "$RUN_ROOT" ]]; then
+    printf 'STOP: run directory already exists: %s (no restart)\n' "$RUN_ROOT" >&2
+    exit 1
+fi
+if [[ "$MODE" == --preflight-only ]]; then
+    printf 'PREFLIGHT PASSED: training not started; no console log created.\n'
+    exit 0
+fi
+mkdir -p "$LOG_ROOT"
+# Fresh log per attempt; retain earlier failed-preflight logs without blocking.
+CONSOLE_LOG=$(mktemp "$LOG_ROOT/$RUN_ID.console.XXXXXX.log")
+exec > >(tee "$CONSOLE_LOG") 2>&1
+printf 'CONSOLE_LOG=%s\n' "$CONSOLE_LOG"
+git_audit
 
 CUDA_VISIBLE_DEVICES='' "$OPENVLA_PY" -m pytest -q tests/unit
 "$OPENVLA_PY" -c 'import torch, transformers, tokenizers; assert torch.__version__ == "2.2.0+cu121"; assert transformers.__version__ == "4.40.1"; assert tokenizers.__version__ == "0.19.1"; assert torch.cuda.is_available(); print("source", torch.__version__, transformers.__version__, tokenizers.__version__, torch.cuda.get_device_name(0))'
@@ -158,7 +207,8 @@ printf 'STEP 1B SERVER RUN FINISHED: %s\n' "$RUN_ROOT"
 ## Artifact and checkpoint contract
 
 A single run writes `/data/xiaomengqi/logs/step1b/step1b-mature-o2-5000-v1/`.
-The console log is its sibling `step1b-mature-o2-5000-v1.console.log`.
+Console logs are fresh sibling files named
+`step1b-mature-o2-5000-v1.console.XXXXXX.log` (the suffix is generated by mktemp).
 
 - `training/checkpoints/checkpoint_manifest.json` declares the fixed
   `[10,100,500,1000,2000,5000]` schedule and its completed prefix.
@@ -210,7 +260,7 @@ CPU validation at implementation handoff:
 ```text
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 /home/xmq/.virtualenvs/modified-tex3d/bin/python -m pytest -q tests/unit
-66 passed in 9.34s (52 existing + 14 Step 1B cases)
+73 passed in 11.54s (52 existing + 14 trajectory + 7 server-script cases)
 bash -n scripts/step1b_server_run.sh                         PASS
 scripts/step1b_analyze_trajectory.py --help                  PASS
 git diff --check                                           PASS
@@ -218,8 +268,16 @@ protected Step 1 pipeline files vs e8d7d5e                  unchanged
 historical formal validator and renderer AST regression    PASS
 ```
 
-GPU 7
-training, checkpoint baking under nvdiffrast, all post-hoc model runs, and
+The first server attempt stopped at the initial audit (old script line 62),
+before CPU tests or training. Both asset hashes passed. The old audit did not
+print which subsequent predicate failed, so the actual server failure remains
+unresolved until diagnostic preflight output is available. Tests reproduce the
+missing diagnostics for HEAD and worktree mismatches; the updated audit prints
+both commit IDs or the dirty file list and retains the same failure gates.
+Additional shell tests verify GPU 1, preflight without model/training calls,
+preservation of old logs, and refusal to restart an existing run directory.
+
+GPU 1 training, checkpoint baking under nvdiffrast, all post-hoc model runs, and
 server restoration are **not executed by Codex** for this delivery. The
 synthetic CPU snapshot tests verify unchanged RNG, parameters, gradients,
 optimizer state, calibration and training mode; real GPU execution remains a
