@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
+from scripts import phase2_shared_optimization as training_entrypoint
 from scripts import phase2_source_eval
 
 
@@ -58,10 +60,84 @@ def _result(loss: torch.Tensor) -> SimpleNamespace:
     )
 
 
-def test_frozen_protocol_rejects_changes() -> None:
-    SharedOptimizationProtocol().validate_frozen_pilot()
-    with pytest.raises(Phase2SharedOptimizationError, match="frozen"):
-        SharedOptimizationProtocol(attack_iterations=501).validate_frozen_pilot()
+def test_controlled_diagnostics_allow_exactly_one_protocol_change() -> None:
+    baseline = SharedOptimizationProtocol()
+    baseline.validate_frozen_pilot()
+    assert (
+        baseline.validate_controlled_diagnostic("baseline")["controlled_variable"]
+        is None
+    )
+
+    step_size = SharedOptimizationProtocol(pgd_step=0.01)
+    step_control = step_size.validate_controlled_diagnostic("step-size")
+    assert step_control["controlled_variable"] == "pgd_step"
+    assert step_control["baseline_value"] == 0.05
+    assert step_control["actual_value"] == 0.01
+
+    iterations = SharedOptimizationProtocol(attack_iterations=5000)
+    iteration_control = iterations.validate_controlled_diagnostic("iterations")
+    assert iteration_control["controlled_variable"] == "attack_iterations"
+    assert iteration_control["baseline_value"] == 500
+    assert iteration_control["actual_value"] == 5000
+
+
+def test_controlled_diagnostics_reject_confounds_and_noop_diagnostics() -> None:
+    with pytest.raises(Phase2SharedOptimizationError, match="unauthorized"):
+        SharedOptimizationProtocol(
+            attack_iterations=5000, pgd_step=0.01
+        ).validate_controlled_diagnostic("iterations")
+    with pytest.raises(Phase2SharedOptimizationError, match="must change exactly"):
+        SharedOptimizationProtocol().validate_controlled_diagnostic("step-size")
+    with pytest.raises(Phase2SharedOptimizationError, match="must exceed"):
+        SharedOptimizationProtocol(
+            attack_iterations=400
+        ).validate_controlled_diagnostic("iterations")
+
+
+def test_checkpoint_step_parser_is_explicit_and_bounded() -> None:
+    assert training_entrypoint._parse_checkpoint_steps("", iterations=500) == ()
+    assert training_entrypoint._parse_checkpoint_steps(
+        "500,100,500", iterations=500
+    ) == (100, 500)
+    with pytest.raises(ValueError, match="within"):
+        training_entrypoint._parse_checkpoint_steps("501", iterations=500)
+    with pytest.raises(ValueError, match="integers"):
+        training_entrypoint._parse_checkpoint_steps("100,bad", iterations=500)
+
+
+def test_checkpoint_artifact_is_reloadable_and_self_describing(tmp_path: Path) -> None:
+    class CheckpointRenderer:
+        def __init__(self) -> None:
+            self.parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+
+        def get_texture_param(self) -> torch.Tensor:
+            return self.parameter
+
+        @staticmethod
+        def get_baked_adv_texture() -> torch.Tensor:
+            return torch.full((1, 4, 5, 3), 0.5)
+
+    row = {"iteration": 99, "shared_mse": 0.25}
+    metadata = training_entrypoint._save_texture_checkpoint(
+        renderer=CheckpointRenderer(),
+        output=tmp_path,
+        step=100,
+        diagnostic_kind="iterations",
+        row=row,
+    )
+
+    checkpoint = tmp_path / "checkpoints/step_000100"
+    parameter = torch.load(
+        checkpoint / "vertex_noise.pt", map_location="cpu", weights_only=True
+    )
+    image = Image.open(checkpoint / "attack_texture.png")
+    on_disk = json.loads((checkpoint / "metadata.json").read_text())
+    assert torch.equal(parameter, torch.tensor([1.0, -1.0]))
+    assert image.size == (5, 4)
+    assert metadata == on_disk
+    assert on_disk["completed_step"] == 100
+    assert on_disk["diagnostic_kind"] == "iterations"
+    assert on_disk["diagnostics"] == row
 
 
 def test_clean_reference_is_detached_and_frame_templates_are_unique() -> None:
@@ -191,6 +267,9 @@ def test_server_training_entrypoint_freezes_protocol_and_artifacts() -> None:
         '"step_metrics.jsonl"',
         '"loss_history.npy"',
         '"training_summary.json"',
+        '"--diagnostic-kind"',
+        '"--checkpoint-steps"',
+        '"checkpoints"',
     ):
         assert required in source
     assert "torch.optim" not in source

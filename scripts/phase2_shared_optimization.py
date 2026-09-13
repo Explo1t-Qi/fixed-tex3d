@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the frozen Phase 2.4 500-step shared-feature Tex3D pilot."""
+"""Run the Phase 2.4 baseline or one controlled optimization diagnostic."""
 
 from __future__ import annotations
 
@@ -39,8 +39,18 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--libero-root", type=Path, required=True)
     parser.add_argument("--openvla-device", default="cuda:0")
     parser.add_argument("--pi05-device", default="cuda:1")
+    parser.add_argument(
+        "--diagnostic-kind",
+        choices=("baseline", "step-size", "iterations"),
+        default="baseline",
+    )
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--pgd-step", type=float, default=0.05)
+    parser.add_argument(
+        "--checkpoint-steps",
+        default="",
+        help="Comma-separated completed steps to save, e.g. 500,1000,2000,5000",
+    )
     parser.add_argument("--num-train-init-states", type=int, default=10)
     parser.add_argument("--train-frames-per-state", type=int, default=1)
     parser.add_argument("--num-frames-to-attack", type=int, default=20)
@@ -54,6 +64,51 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _parse_checkpoint_steps(value: str, *, iterations: int) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    try:
+        steps = tuple(sorted({int(item.strip()) for item in value.split(",")}))
+    except ValueError as error:
+        raise ValueError("checkpoint steps must be comma-separated integers") from error
+    if not steps or any(step < 1 or step > iterations for step in steps):
+        raise ValueError(f"checkpoint steps must be within [1,{iterations}]")
+    return steps
+
+
+def _save_texture_checkpoint(
+    *,
+    renderer: Any,
+    output: Path,
+    step: int,
+    diagnostic_kind: str,
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    checkpoint_dir = output / "checkpoints" / f"step_{step:06d}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    parameter_checkpoint = checkpoint_dir / "vertex_noise.pt"
+    texture_checkpoint = checkpoint_dir / "attack_texture.png"
+    torch.save(renderer.get_texture_param().detach().cpu(), parameter_checkpoint)
+    with torch.no_grad():
+        baked_checkpoint = renderer.get_baked_adv_texture()[0].cpu().numpy()
+    Image.fromarray(
+        (baked_checkpoint * 255.0).round().clip(0, 255).astype(np.uint8)
+    ).save(texture_checkpoint)
+    metadata = {
+        "completed_step": step,
+        "diagnostic_kind": diagnostic_kind,
+        "diagnostics": row,
+        "vertex_noise": str(parameter_checkpoint.resolve()),
+        "vertex_noise_sha256": _sha256(parameter_checkpoint),
+        "baked_uv_texture": str(texture_checkpoint.resolve()),
+        "baked_uv_texture_sha256": _sha256(texture_checkpoint),
+    }
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    )
+    return metadata
 
 
 def _validate_paths(args: argparse.Namespace) -> dict[str, Path]:
@@ -132,7 +187,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         pgd_step=args.pgd_step,
         seed=args.seed,
     )
-    protocol.validate_frozen_pilot()
+    diagnostic = protocol.validate_controlled_diagnostic(args.diagnostic_kind)
+    checkpoint_steps = _parse_checkpoint_steps(
+        args.checkpoint_steps, iterations=protocol.attack_iterations
+    )
     if _git_head(paths["shared"]) != EXPECTED_SHARED_COMMIT:
         raise RuntimeError("shared-feature authority is not at the frozen commit")
     mapping_file = paths["mapping"] / "mapping.npz"
@@ -159,6 +217,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     config_path = output / "training_config.json"
     config = {
         **vars(protocol),
+        "diagnostic": diagnostic,
+        "checkpoint_steps": list(checkpoint_steps),
         "effective_frame_pool": 10,
         "frame_weight": 0.1,
         "optimizer": "sign_pgd",
@@ -366,7 +426,20 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(f"{frame.frame_id}: rendered image is non-finite")
         return frame.payload["pipeline"].loss(image, frame.clean)[0], image
 
+    checkpoint_artifacts: list[dict[str, Any]] = []
+
     def progress(row: dict[str, Any]) -> None:
+        completed_step = int(row["iteration"]) + 1
+        if completed_step in checkpoint_steps:
+            checkpoint_artifacts.append(
+                _save_texture_checkpoint(
+                    renderer=renderer,
+                    output=output,
+                    step=completed_step,
+                    diagnostic_kind=args.diagnostic_kind,
+                    row=row,
+                )
+            )
         print(json.dumps(row, sort_keys=True), flush=True)
 
     history = train_shared_texture(
@@ -395,6 +468,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "status": "Phase 2.4 Shared-Feature Optimization — COMPLETE",
         "phase2_4_training_result": "PASS",
+        "diagnostic": diagnostic,
         "iterations_completed": len(history),
         "texture_updates": len(history),
         "frame_pool_size": len(frames),
@@ -405,6 +479,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "maximum_texture_perturbation": maximum,
         "renderer_epsilon": float(renderer.epsilon),
         "texture_budget_respected": maximum <= float(renderer.epsilon) + 1e-6,
+        "checkpoints": checkpoint_artifacts,
         "artifacts": {
             "vertex_noise": str(parameter_path.resolve()),
             "vertex_noise_sha256": _sha256(parameter_path),

@@ -34,16 +34,67 @@ class SharedOptimizationProtocol:
     seed: int = 7
 
     def validate_frozen_pilot(self) -> None:
+        self.validate_controlled_diagnostic("baseline")
+
+    def validate_controlled_diagnostic(self, kind: str) -> dict[str, Any]:
+        """Allow exactly one named diagnostic variable to differ from baseline."""
+
         expected = SharedOptimizationProtocol()
-        if self != expected:
-            mismatches = {
-                name: {"actual": getattr(self, name), "expected": value}
-                for name, value in asdict(expected).items()
-                if getattr(self, name) != value
-            }
+        allowed_changes = {
+            "baseline": frozenset(),
+            "step-size": frozenset({"pgd_step"}),
+            "iterations": frozenset({"attack_iterations"}),
+        }
+        if kind not in allowed_changes:
             raise Phase2SharedOptimizationError(
-                f"Phase 2.4 pilot protocol is frozen: {mismatches}"
+                f"unknown Phase 2.4 diagnostic kind: {kind!r}"
             )
+        actual_values = asdict(self)
+        expected_values = asdict(expected)
+        changes = {
+            name: {"baseline": expected_values[name], "actual": value}
+            for name, value in actual_values.items()
+            if value != expected_values[name]
+        }
+        unauthorized = set(changes) - allowed_changes[kind]
+        if unauthorized:
+            raise Phase2SharedOptimizationError(
+                "Phase 2.4 controlled diagnostic changed unauthorized fields: "
+                f"{sorted(unauthorized)}"
+            )
+        if kind != "baseline" and set(changes) != allowed_changes[kind]:
+            required = sorted(allowed_changes[kind])
+            raise Phase2SharedOptimizationError(
+                f"{kind} diagnostic must change exactly {required}"
+            )
+        if not np.isfinite(self.pgd_step) or self.pgd_step <= 0:
+            raise Phase2SharedOptimizationError("PGD step must be finite and positive")
+        if self.attack_iterations < 1:
+            raise Phase2SharedOptimizationError("attack iterations must be positive")
+        if (
+            kind == "iterations"
+            and self.attack_iterations <= expected.attack_iterations
+        ):
+            raise Phase2SharedOptimizationError(
+                "iterations diagnostic must exceed the 500-step baseline"
+            )
+        controlled_variable = {
+            "baseline": None,
+            "step-size": "pgd_step",
+            "iterations": "attack_iterations",
+        }[kind]
+        return {
+            "kind": kind,
+            "controlled_variable": controlled_variable,
+            "baseline_value": (
+                expected_values[controlled_variable] if controlled_variable else None
+            ),
+            "actual_value": (
+                actual_values[controlled_variable] if controlled_variable else None
+            ),
+            "all_other_protocol_fields_equal": True,
+            "changes_from_baseline": changes,
+        }
 
 
 @dataclass(frozen=True)
