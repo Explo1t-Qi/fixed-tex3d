@@ -29,6 +29,19 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _openvla_eval_config(checkpoint: Path) -> SimpleNamespace:
+    """Adapt the CLI Path to the legacy OpenVLA string checkpoint contract."""
+
+    return SimpleNamespace(
+        model_family="openvla",
+        pretrained_checkpoint=str(checkpoint),
+        load_in_8bit=False,
+        load_in_4bit=False,
+        unnorm_key=None,
+        center_crop=True,
+    )
+
+
 def _git_head() -> str:
     return subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
@@ -148,14 +161,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
         if device != torch.device("cuda:0"):
             raise ValueError("the existing OpenVLA loader is fixed to cuda:0")
-        cfg = SimpleNamespace(
-            model_family="openvla",
-            pretrained_checkpoint=paths["checkpoint"],
-            load_in_8bit=False,
-            load_in_4bit=False,
-            unnorm_key=None,
-            center_crop=True,
-        )
+        cfg = _openvla_eval_config(paths["checkpoint"])
         policy = get_vla(cfg)
         processor = get_processor(cfg)
         max_steps = args.max_steps or 300

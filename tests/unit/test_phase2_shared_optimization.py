@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts import phase2_source_eval
+
 
 ROBOT_ROOT = Path(__file__).resolve().parents[2] / "openvla/experiments/robot"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -203,3 +205,10 @@ def test_source_evaluator_is_paired_and_restores_runtime_texture() -> None:
     assert "temporary_runtime_texture(" in source
     assert "asset XML was not restored" in source
     assert "default=50" in source
+
+
+def test_openvla_evaluator_converts_checkpoint_path_for_legacy_helper() -> None:
+    config = phase2_source_eval._openvla_eval_config(Path("/tmp/openvla-checkpoint"))
+
+    assert isinstance(config.pretrained_checkpoint, str)
+    assert config.pretrained_checkpoint == "/tmp/openvla-checkpoint"
