@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,6 +286,44 @@ def test_authoritative_entrypoint_has_one_update_and_no_witness_bridge() -> None
     assert "extract_pi05_p2_no_grad" not in entrypoint
     assert "extract_pi05_p2_autograd" in entrypoint
     assert "shared_feature_loss" in entrypoint
+
+
+def test_server_source_paths_make_nested_attack_entrypoint_importable(
+    tmp_path, monkeypatch
+) -> None:
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/phase2_shared_gradient_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("phase2_smoke_paths", script_path)
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+
+    robot_root = tmp_path / "openvla/experiments/robot"
+    nested_libero = robot_root / "libero"
+    openvla_root = tmp_path / "openvla"
+    shared_root = tmp_path / "shared"
+    openpi_root = tmp_path / "openpi"
+    for directory in (
+        nested_libero,
+        openvla_root,
+        shared_root,
+        openpi_root / "packages/openpi-client/src",
+        openpi_root / "src",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    (nested_libero / "attack_openvla.py").write_text("MARKER = True\n")
+    monkeypatch.setattr(smoke, "ROBOT_ROOT", robot_root)
+    monkeypatch.setattr(smoke, "OPENVLA_ROOT", openvla_root)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    smoke._add_source_paths(openpi_root, shared_root)
+
+    assert str(nested_libero) in sys.path
+    attack_spec = importlib.util.find_spec("attack_openvla")
+    assert attack_spec is not None
+    assert Path(attack_spec.origin) == nested_libero / "attack_openvla.py"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")

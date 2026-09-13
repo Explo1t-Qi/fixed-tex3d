@@ -67,6 +67,7 @@ def _sha256_rgb(image: np.ndarray) -> str:
 
 def _add_source_paths(openpi_root: Path, shared_root: Path) -> None:
     paths = (
+        ROBOT_ROOT / "libero",
         ROBOT_ROOT,
         OPENVLA_ROOT,
         shared_root,
