@@ -33,8 +33,15 @@ from phase2_shared_gradient import (  # noqa: E402
 class _Observation:
     @classmethod
     def from_dict(cls, values):
+        images = dict(values["image"])
+        for key, image in images.items():
+            if image.dtype == torch.uint8:
+                images[key] = (
+                    image.to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0
+                    - 1.0
+                )
         return SimpleNamespace(
-            images=values["image"],
+            images=images,
             image_masks=values["image_mask"],
             state=values["state"],
             tokenized_prompt=values["tokenized_prompt"],
@@ -50,15 +57,12 @@ class _Policy:
         base = np.asarray(values["observation/image"])
         wrist = np.asarray(values["observation/wrist_image"])
 
-        def normalized_chw(image):
-            return np.transpose(image.astype(np.float32) / 127.5 - 1.0, (2, 0, 1))
-
         return {
             "state": np.pad(np.asarray(values["observation/state"]), (0, 24)),
             "image": {
-                "base_0_rgb": normalized_chw(base),
-                "left_wrist_0_rgb": normalized_chw(wrist),
-                "right_wrist_0_rgb": np.zeros((3, 224, 224), dtype=np.float32),
+                "base_0_rgb": base.copy(),
+                "left_wrist_0_rgb": wrist.copy(),
+                "right_wrist_0_rgb": np.zeros_like(base),
             },
             "image_mask": {
                 "base_0_rgb": np.True_,

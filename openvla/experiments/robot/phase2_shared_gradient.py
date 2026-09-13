@@ -93,7 +93,7 @@ class Pi05BaseImageAdapter:
             )
         try:
             transformed = transform(dict(policy_input))
-            self._template = _tree_to_batched_torch(
+            batched = _tree_to_batched_torch(
                 transformed, device=self.device
             )
         except Phase2GradientClosureError:
@@ -103,7 +103,28 @@ class Pi05BaseImageAdapter:
                 "PI0Pytorch fixed-input preprocessing failed"
             ) from error
         self._observation_type = observation_type
+        template_observation = self._from_dict(batched)
+        self._template = self._observation_values(template_observation)
         self._validate_template()
+
+    @staticmethod
+    def _observation_values(observation: Any) -> dict[str, Any]:
+        values = {
+            "image": dict(observation.images),
+            "image_mask": dict(observation.image_masks),
+            "state": observation.state,
+        }
+        optional = (
+            "tokenized_prompt",
+            "tokenized_prompt_mask",
+            "token_ar_mask",
+            "token_loss_mask",
+        )
+        for name in optional:
+            value = getattr(observation, name, None)
+            if value is not None:
+                values[name] = value
+        return values
 
     def _validate_template(self) -> None:
         images = self._template.get("image")
@@ -129,6 +150,10 @@ class Pi05BaseImageAdapter:
                 raise Phase2GradientClosureError(
                     f"PI0Pytorch {key} template must be [1,3,224,224]"
                 )
+            if image.dtype != torch.float32 or not bool(torch.isfinite(image).all()):
+                raise Phase2GradientClosureError(
+                    f"PI0Pytorch {key} template must be finite float32"
+                )
             if tuple(mask.shape) != (1,) or mask.dtype != torch.bool:
                 raise Phase2GradientClosureError(
                     f"PI0Pytorch {key} mask must be bool [1]"
@@ -137,17 +162,29 @@ class Pi05BaseImageAdapter:
                 raise Phase2GradientClosureError(
                     f"PI0Pytorch {key} mask violates pi05_libero semantics"
                 )
-        base = images["base_0_rgb"]
-        if not base.is_floating_point() or not bool(torch.isfinite(base).all()):
+        state = self._template.get("state")
+        tokens = self._template.get("tokenized_prompt")
+        token_masks = self._template.get("tokenized_prompt_mask")
+        if not isinstance(state, torch.Tensor) or tuple(state.shape) != (1, 32):
             raise Phase2GradientClosureError(
-                "PI0Pytorch base template must be finite floating point"
+                "PI0Pytorch state template must be [1,32]"
+            )
+        if not isinstance(tokens, torch.Tensor) or tuple(tokens.shape) != (1, 200):
+            raise Phase2GradientClosureError(
+                "PI0Pytorch token template must be [1,200]"
+            )
+        if not isinstance(token_masks, torch.Tensor) or tuple(
+            token_masks.shape
+        ) != (1, 200):
+            raise Phase2GradientClosureError(
+                "PI0Pytorch token-mask template must be [1,200]"
             )
 
     @property
     def clean_observation(self) -> Any:
         """Return a fresh model observation containing the frozen clean inputs."""
 
-        return self._from_dict(self._template)
+        return self._from_dict(self._copy_template())
 
     def observation_for_base_image(self, source_rgb: torch.Tensor) -> Any:
         """Replace only ``base_0_rgb`` while preserving source-image autograd."""
@@ -183,11 +220,17 @@ class Pi05BaseImageAdapter:
             live = live * 2.0 - 1.0
         live = live.to(dtype=template_base.dtype)
 
-        inputs = dict(self._template)
+        inputs = self._copy_template()
         images = dict(self._template["image"])
         images["base_0_rgb"] = live
         inputs["image"] = images
         return self._from_dict(inputs)
+
+    def _copy_template(self) -> dict[str, Any]:
+        values = dict(self._template)
+        values["image"] = dict(self._template["image"])
+        values["image_mask"] = dict(self._template["image_mask"])
+        return values
 
     def _from_dict(self, values: Mapping[str, Any]) -> Any:
         try:
