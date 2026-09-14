@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Phase 2.4 baseline or one controlled optimization diagnostic."""
+"""Run parameterized Phase 2.4 shared-feature texture optimization."""
 
 from __future__ import annotations
 
@@ -39,11 +39,6 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--libero-root", type=Path, required=True)
     parser.add_argument("--openvla-device", default="cuda:0")
     parser.add_argument("--pi05-device", default="cuda:1")
-    parser.add_argument(
-        "--diagnostic-kind",
-        choices=("baseline", "step-size", "iterations"),
-        default="baseline",
-    )
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--pgd-step", type=float, default=0.05)
     parser.add_argument(
@@ -83,7 +78,7 @@ def _save_texture_checkpoint(
     renderer: Any,
     output: Path,
     step: int,
-    diagnostic_kind: str,
+    optimization_parameters: dict[str, int | float],
     row: dict[str, Any],
 ) -> dict[str, Any]:
     checkpoint_dir = output / "checkpoints" / f"step_{step:06d}"
@@ -98,7 +93,7 @@ def _save_texture_checkpoint(
     ).save(texture_checkpoint)
     metadata = {
         "completed_step": step,
-        "diagnostic_kind": diagnostic_kind,
+        "optimization_parameters": optimization_parameters,
         "diagnostics": row,
         "vertex_noise": str(parameter_checkpoint.resolve()),
         "vertex_noise_sha256": _sha256(parameter_checkpoint),
@@ -187,7 +182,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         pgd_step=args.pgd_step,
         seed=args.seed,
     )
-    diagnostic = protocol.validate_controlled_diagnostic(args.diagnostic_kind)
+    run_configuration = protocol.validate_training_configuration()
     checkpoint_steps = _parse_checkpoint_steps(
         args.checkpoint_steps, iterations=protocol.attack_iterations
     )
@@ -217,7 +212,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     config_path = output / "training_config.json"
     config = {
         **vars(protocol),
-        "diagnostic": diagnostic,
+        "run_configuration": run_configuration,
         "checkpoint_steps": list(checkpoint_steps),
         "effective_frame_pool": 10,
         "frame_weight": 0.1,
@@ -436,7 +431,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     renderer=renderer,
                     output=output,
                     step=completed_step,
-                    diagnostic_kind=args.diagnostic_kind,
+                    optimization_parameters={
+                        "iterations": protocol.attack_iterations,
+                        "pgd_step": protocol.pgd_step,
+                    },
                     row=row,
                 )
             )
@@ -468,7 +466,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "status": "Phase 2.4 Shared-Feature Optimization — COMPLETE",
         "phase2_4_training_result": "PASS",
-        "diagnostic": diagnostic,
+        "run_configuration": run_configuration,
         "iterations_completed": len(history),
         "texture_updates": len(history),
         "frame_pool_size": len(frames),

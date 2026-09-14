@@ -2,7 +2,8 @@
 
 The real model and renderer entry points inject their frame-specific forward
 functions here.  Keeping the optimizer mechanics independent of those heavy
-dependencies makes the frozen 500-step protocol testable on CPU.
+dependencies makes the frozen scientific substrate and parameterized optimizer
+testable on CPU.
 """
 
 from __future__ import annotations
@@ -34,21 +35,17 @@ class SharedOptimizationProtocol:
     seed: int = 7
 
     def validate_frozen_pilot(self) -> None:
-        self.validate_controlled_diagnostic("baseline")
+        configuration = self.validate_training_configuration()
+        if configuration["changes_from_baseline"]:
+            raise Phase2SharedOptimizationError(
+                "frozen Phase 2.4 pilot must use baseline optimization parameters"
+            )
 
-    def validate_controlled_diagnostic(self, kind: str) -> dict[str, Any]:
-        """Allow exactly one named diagnostic variable to differ from baseline."""
+    def validate_training_configuration(self) -> dict[str, Any]:
+        """Validate the frozen substrate while allowing optimization parameters."""
 
         expected = SharedOptimizationProtocol()
-        allowed_changes = {
-            "baseline": frozenset(),
-            "step-size": frozenset({"pgd_step"}),
-            "iterations": frozenset({"attack_iterations"}),
-        }
-        if kind not in allowed_changes:
-            raise Phase2SharedOptimizationError(
-                f"unknown Phase 2.4 diagnostic kind: {kind!r}"
-            )
+        adjustable = frozenset({"attack_iterations", "pgd_step"})
         actual_values = asdict(self)
         expected_values = asdict(expected)
         changes = {
@@ -56,43 +53,26 @@ class SharedOptimizationProtocol:
             for name, value in actual_values.items()
             if value != expected_values[name]
         }
-        unauthorized = set(changes) - allowed_changes[kind]
-        if unauthorized:
+        frozen_changes = set(changes) - adjustable
+        if frozen_changes:
             raise Phase2SharedOptimizationError(
-                "Phase 2.4 controlled diagnostic changed unauthorized fields: "
-                f"{sorted(unauthorized)}"
-            )
-        if kind != "baseline" and set(changes) != allowed_changes[kind]:
-            required = sorted(allowed_changes[kind])
-            raise Phase2SharedOptimizationError(
-                f"{kind} diagnostic must change exactly {required}"
+                "Phase 2.4 run changed frozen protocol fields: "
+                f"{sorted(frozen_changes)}"
             )
         if not np.isfinite(self.pgd_step) or self.pgd_step <= 0:
             raise Phase2SharedOptimizationError("PGD step must be finite and positive")
         if self.attack_iterations < 1:
             raise Phase2SharedOptimizationError("attack iterations must be positive")
-        if (
-            kind == "iterations"
-            and self.attack_iterations <= expected.attack_iterations
-        ):
-            raise Phase2SharedOptimizationError(
-                "iterations diagnostic must exceed the 500-step baseline"
-            )
-        controlled_variable = {
-            "baseline": None,
-            "step-size": "pgd_step",
-            "iterations": "attack_iterations",
-        }[kind]
         return {
-            "kind": kind,
-            "controlled_variable": controlled_variable,
-            "baseline_value": (
-                expected_values[controlled_variable] if controlled_variable else None
-            ),
-            "actual_value": (
-                actual_values[controlled_variable] if controlled_variable else None
-            ),
-            "all_other_protocol_fields_equal": True,
+            "adjustable_parameters": {
+                name: {
+                    "baseline": expected_values[name],
+                    "actual": actual_values[name],
+                    "changed": name in changes,
+                }
+                for name in sorted(adjustable)
+            },
+            "frozen_protocol_fields_equal": True,
             "changes_from_baseline": changes,
         }
 

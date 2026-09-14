@@ -60,38 +60,82 @@ def _result(loss: torch.Tensor) -> SimpleNamespace:
     )
 
 
-def test_controlled_diagnostics_allow_exactly_one_protocol_change() -> None:
+def test_optimization_parameters_can_change_independently_or_together() -> None:
     baseline = SharedOptimizationProtocol()
     baseline.validate_frozen_pilot()
-    assert (
-        baseline.validate_controlled_diagnostic("baseline")["controlled_variable"]
-        is None
-    )
+    baseline_config = baseline.validate_training_configuration()
+    assert baseline_config["changes_from_baseline"] == {}
 
     step_size = SharedOptimizationProtocol(pgd_step=0.01)
-    step_control = step_size.validate_controlled_diagnostic("step-size")
-    assert step_control["controlled_variable"] == "pgd_step"
-    assert step_control["baseline_value"] == 0.05
-    assert step_control["actual_value"] == 0.01
+    step_config = step_size.validate_training_configuration()
+    assert step_config["changes_from_baseline"] == {
+        "pgd_step": {"baseline": 0.05, "actual": 0.01}
+    }
 
     iterations = SharedOptimizationProtocol(attack_iterations=5000)
-    iteration_control = iterations.validate_controlled_diagnostic("iterations")
-    assert iteration_control["controlled_variable"] == "attack_iterations"
-    assert iteration_control["baseline_value"] == 500
-    assert iteration_control["actual_value"] == 5000
+    iteration_config = iterations.validate_training_configuration()
+    assert iteration_config["changes_from_baseline"] == {
+        "attack_iterations": {"baseline": 500, "actual": 5000}
+    }
+
+    combined = SharedOptimizationProtocol(attack_iterations=5000, pgd_step=0.01)
+    combined_config = combined.validate_training_configuration()
+    assert set(combined_config["changes_from_baseline"]) == {
+        "attack_iterations",
+        "pgd_step",
+    }
+    assert combined_config["adjustable_parameters"]["attack_iterations"] == {
+        "baseline": 500,
+        "actual": 5000,
+        "changed": True,
+    }
+    assert combined_config["adjustable_parameters"]["pgd_step"] == {
+        "baseline": 0.05,
+        "actual": 0.01,
+        "changed": True,
+    }
 
 
-def test_controlled_diagnostics_reject_confounds_and_noop_diagnostics() -> None:
-    with pytest.raises(Phase2SharedOptimizationError, match="unauthorized"):
+def test_optimization_parameter_validation_keeps_other_protocol_fields_frozen() -> None:
+    with pytest.raises(Phase2SharedOptimizationError, match="frozen protocol"):
+        SharedOptimizationProtocol(seed=8).validate_training_configuration()
+    with pytest.raises(Phase2SharedOptimizationError, match="positive"):
         SharedOptimizationProtocol(
-            attack_iterations=5000, pgd_step=0.01
-        ).validate_controlled_diagnostic("iterations")
-    with pytest.raises(Phase2SharedOptimizationError, match="must change exactly"):
-        SharedOptimizationProtocol().validate_controlled_diagnostic("step-size")
-    with pytest.raises(Phase2SharedOptimizationError, match="must exceed"):
+            attack_iterations=0
+        ).validate_training_configuration()
+    with pytest.raises(Phase2SharedOptimizationError, match="finite and positive"):
         SharedOptimizationProtocol(
-            attack_iterations=400
-        ).validate_controlled_diagnostic("iterations")
+            pgd_step=float("nan")
+        ).validate_training_configuration()
+
+
+def test_training_cli_accepts_combined_iterations_and_step_size() -> None:
+    args = training_entrypoint._args(
+        [
+            "--output-dir",
+            "/tmp/output",
+            "--shared-feature-root",
+            "/tmp/shared",
+            "--mapping-dir",
+            "/tmp/mapping",
+            "--openpi-root",
+            "/tmp/openpi",
+            "--openvla-checkpoint",
+            "/tmp/openvla-checkpoint",
+            "--pi05-checkpoint",
+            "/tmp/pi05-checkpoint",
+            "--libero-root",
+            "/tmp/libero",
+            "--iterations",
+            "5000",
+            "--pgd-step",
+            "0.01",
+        ]
+    )
+
+    assert args.iterations == 5000
+    assert args.pgd_step == 0.01
+    assert not hasattr(args, "diagnostic_kind")
 
 
 def test_checkpoint_step_parser_is_explicit_and_bounded() -> None:
@@ -122,7 +166,7 @@ def test_checkpoint_artifact_is_reloadable_and_self_describing(tmp_path: Path) -
         renderer=CheckpointRenderer(),
         output=tmp_path,
         step=100,
-        diagnostic_kind="iterations",
+        optimization_parameters={"iterations": 5000, "pgd_step": 0.01},
         row=row,
     )
 
@@ -136,7 +180,10 @@ def test_checkpoint_artifact_is_reloadable_and_self_describing(tmp_path: Path) -
     assert image.size == (5, 4)
     assert metadata == on_disk
     assert on_disk["completed_step"] == 100
-    assert on_disk["diagnostic_kind"] == "iterations"
+    assert on_disk["optimization_parameters"] == {
+        "iterations": 5000,
+        "pgd_step": 0.01,
+    }
     assert on_disk["diagnostics"] == row
 
 
@@ -254,7 +301,9 @@ def test_training_localizes_zero_gradient() -> None:
         )
 
 
-def test_server_training_entrypoint_freezes_protocol_and_artifacts() -> None:
+def test_server_training_entrypoint_parameterizes_optimizer_and_freezes_artifacts() -> (
+    None
+):
     source = (PROJECT_ROOT / "scripts/phase2_shared_optimization.py").read_text()
     for required in (
         "default=500",
@@ -267,11 +316,14 @@ def test_server_training_entrypoint_freezes_protocol_and_artifacts() -> None:
         '"step_metrics.jsonl"',
         '"loss_history.npy"',
         '"training_summary.json"',
-        '"--diagnostic-kind"',
+        '"--iterations"',
+        '"--pgd-step"',
         '"--checkpoint-steps"',
         '"checkpoints"',
+        '"run_configuration"',
     ):
         assert required in source
+    assert '"--diagnostic-kind"' not in source
     assert "torch.optim" not in source
     assert "autograd.grad" not in source
 
