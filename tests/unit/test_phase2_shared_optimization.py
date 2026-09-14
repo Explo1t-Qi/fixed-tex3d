@@ -138,6 +138,97 @@ def test_training_cli_accepts_combined_iterations_and_step_size() -> None:
     assert not hasattr(args, "diagnostic_kind")
 
 
+def test_native_mode_does_not_require_or_resolve_shared_artifacts(
+    tmp_path: Path,
+) -> None:
+    existing = {}
+    for name in (
+        "openpi",
+        "openvla-checkpoint",
+        "pi05-checkpoint",
+        "libero",
+    ):
+        existing[name] = tmp_path / name
+        existing[name].mkdir()
+    args = training_entrypoint._args(
+        [
+            "--objective",
+            "native_gradient_ensemble",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--shared-feature-root",
+            str(tmp_path / "missing-shared"),
+            "--mapping-dir",
+            str(tmp_path / "missing-mapping"),
+            "--openpi-root",
+            str(existing["openpi"]),
+            "--openvla-checkpoint",
+            str(existing["openvla-checkpoint"]),
+            "--pi05-checkpoint",
+            str(existing["pi05-checkpoint"]),
+            "--libero-root",
+            str(existing["libero"]),
+        ]
+    )
+
+    paths = training_entrypoint._validate_paths(args)
+
+    assert "shared" not in paths
+    assert "mapping" not in paths
+
+
+def test_native_source_paths_exclude_shared_feature_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    robot_root = tmp_path / "openvla/experiments/robot"
+    openvla_root = tmp_path / "openvla"
+    openpi_root = tmp_path / "openpi"
+    for directory in (
+        robot_root / "libero",
+        openvla_root,
+        openpi_root / "packages/openpi-client/src",
+        openpi_root / "src",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(training_entrypoint, "ROBOT_ROOT", robot_root)
+    monkeypatch.setattr(training_entrypoint, "OPENVLA_ROOT", openvla_root)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    training_entrypoint._add_native_source_paths(openpi_root)
+
+    assert str(openpi_root / "src") in sys.path
+    assert not any("shared-feature" in path for path in sys.path[:5])
+
+
+def test_shared_cca_mode_still_requires_shared_artifacts(tmp_path: Path) -> None:
+    existing = {}
+    for name in (
+        "openpi",
+        "openvla-checkpoint",
+        "pi05-checkpoint",
+        "libero",
+    ):
+        existing[name] = tmp_path / name
+        existing[name].mkdir()
+    args = training_entrypoint._args(
+        [
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--openpi-root",
+            str(existing["openpi"]),
+            "--openvla-checkpoint",
+            str(existing["openvla-checkpoint"]),
+            "--pi05-checkpoint",
+            str(existing["pi05-checkpoint"]),
+            "--libero-root",
+            str(existing["libero"]),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="shared_cca requires"):
+        training_entrypoint._validate_paths(args)
+
+
 def test_checkpoint_step_parser_is_explicit_and_bounded() -> None:
     assert training_entrypoint._parse_checkpoint_steps("", iterations=500) == ()
     assert training_entrypoint._parse_checkpoint_steps(
@@ -321,6 +412,7 @@ def test_server_training_entrypoint_parameterizes_optimizer_and_freezes_artifact
         '"--checkpoint-steps"',
         '"checkpoints"',
         '"run_configuration"',
+        '"native_gradient_ensemble"',
     ):
         assert required in source
     assert '"--diagnostic-kind"' not in source

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run parameterized Phase 2.4 shared-feature texture optimization."""
+"""Run parameterized Phase 2 source-feature texture optimization."""
 
 from __future__ import annotations
 
@@ -26,13 +26,17 @@ EXPECTED_MAPPING_SHA256 = (
     "572d4772432025f130ecf0403562bab20a20d4bec008c778985b2b9aee28caec"
 )
 MAPPING_ID = "phase1_o2_p2_pi05_torch_v1"
+SHARED_CCA_OBJECTIVE = "shared_cca"
+NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE = "native_gradient_ensemble"
+OBJECTIVES = (SHARED_CCA_OBJECTIVE, NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE)
 
 
 def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--objective", choices=OBJECTIVES, default=SHARED_CCA_OBJECTIVE)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--shared-feature-root", type=Path, required=True)
-    parser.add_argument("--mapping-dir", type=Path, required=True)
+    parser.add_argument("--shared-feature-root", type=Path)
+    parser.add_argument("--mapping-dir", type=Path)
     parser.add_argument("--openpi-root", type=Path, required=True)
     parser.add_argument("--openvla-checkpoint", type=Path, required=True)
     parser.add_argument("--pi05-checkpoint", type=Path, required=True)
@@ -59,6 +63,24 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _add_native_source_paths(openpi_root: Path) -> None:
+    """Add fixed-tex3d and OpenPI sources without a shared-feature root."""
+
+    paths = (
+        ROBOT_ROOT / "libero",
+        ROBOT_ROOT,
+        OPENVLA_ROOT,
+        openpi_root / "packages/openpi-client/src",
+        openpi_root / "src",
+    )
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"required native source paths are missing: {missing}")
+    for path in reversed(paths):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
 
 
 def _parse_checkpoint_steps(value: str, *, iterations: int) -> tuple[int, ...]:
@@ -108,13 +130,18 @@ def _save_texture_checkpoint(
 
 def _validate_paths(args: argparse.Namespace) -> dict[str, Path]:
     paths = {
-        "shared": args.shared_feature_root.expanduser().resolve(strict=True),
-        "mapping": args.mapping_dir.expanduser().resolve(strict=True),
         "openpi": args.openpi_root.expanduser().resolve(strict=True),
         "openvla_checkpoint": args.openvla_checkpoint.expanduser().resolve(strict=True),
         "pi05_checkpoint": args.pi05_checkpoint.expanduser().resolve(strict=True),
         "libero": args.libero_root.expanduser().resolve(strict=True),
     }
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        if args.shared_feature_root is None or args.mapping_dir is None:
+            raise ValueError(
+                "shared_cca requires --shared-feature-root and --mapping-dir"
+            )
+        paths["shared"] = args.shared_feature_root.expanduser().resolve(strict=True)
+        paths["mapping"] = args.mapping_dir.expanduser().resolve(strict=True)
     output = args.output_dir.expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"output directory must be fresh: {output}")
@@ -137,11 +164,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         _robot_state,
     )
 
-    _add_source_paths(paths["openpi"], paths["shared"])
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        _add_source_paths(paths["openpi"], paths["shared"])
+    else:
+        _add_native_source_paths(paths["openpi"])
     from phase2_shared_gradient import (
         DualVLAFeatureAdapter,
         Pi05BaseImageAdapter,
         extract_pi05_p2_autograd,
+    )
+    from phase2_native_gradient_ensemble import (
+        DualVLANativeFeatureAdapter,
+        NativeTrainingFrame,
+        train_native_gradient_ensemble,
     )
     from phase2_shared_optimization import (
         FrozenCleanReference,
@@ -150,8 +185,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         train_shared_texture,
         validate_texture_budget,
     )
-    from shared_feature.shared_feature_loss import shared_feature_loss
-    from shared_feature.torch_cca_mapping import FrozenSharedCCAMapping
     from attack_openvla import (
         DEFAULT_DEPLOYMENT_VIEW,
         DifferentiableRenderer,
@@ -174,6 +207,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     from libero.libero import benchmark
     from openpi_client import image_tools
 
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        from shared_feature.shared_feature_loss import shared_feature_loss
+        from shared_feature.torch_cca_mapping import FrozenSharedCCAMapping
+
     protocol = SharedOptimizationProtocol(
         num_train_init_states=args.num_train_init_states,
         train_frames_per_state=args.train_frames_per_state,
@@ -186,11 +223,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_steps = _parse_checkpoint_steps(
         args.checkpoint_steps, iterations=protocol.attack_iterations
     )
-    if _git_head(paths["shared"]) != EXPECTED_SHARED_COMMIT:
-        raise RuntimeError("shared-feature authority is not at the frozen commit")
-    mapping_file = paths["mapping"] / "mapping.npz"
-    if _sha256(mapping_file) != EXPECTED_MAPPING_SHA256:
-        raise RuntimeError("mapping.npz SHA-256 does not match Phase 1 authority")
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        if _git_head(paths["shared"]) != EXPECTED_SHARED_COMMIT:
+            raise RuntimeError("shared-feature authority is not at the frozen commit")
+        mapping_file = paths["mapping"] / "mapping.npz"
+        if _sha256(mapping_file) != EXPECTED_MAPPING_SHA256:
+            raise RuntimeError("mapping.npz SHA-256 does not match Phase 1 authority")
 
     openvla_device = torch.device(args.openvla_device)
     pi05_device = torch.device(args.pi05_device)
@@ -212,6 +250,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     config_path = output / "training_config.json"
     config = {
         **vars(protocol),
+        "objective": args.objective,
         "run_configuration": run_configuration,
         "checkpoint_steps": list(checkpoint_steps),
         "effective_frame_pool": 10,
@@ -219,15 +258,29 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer": "sign_pgd",
         "renderer_epsilon": 128.0 / 255.0,
         "texture_parameterization": "tanh(adv_noise) * epsilon",
-        "mapping_materialization_id": MAPPING_ID,
-        "mapping_sha256": EXPECTED_MAPPING_SHA256,
         "tex3d_commit": _git_head(PROJECT_ROOT),
-        "shared_feature_commit": EXPECTED_SHARED_COMMIT,
         "openvla_checkpoint": str(paths["openvla_checkpoint"]),
         "pi05_checkpoint": str(paths["pi05_checkpoint"]),
         "openvla_device": str(openvla_device),
         "pi05_device": str(pi05_device),
+        "uses_shared_feature_artifact": args.objective == SHARED_CCA_OBJECTIVE,
     }
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        config.update(
+            {
+                "mapping_materialization_id": MAPPING_ID,
+                "mapping_sha256": EXPECTED_MAPPING_SHA256,
+                "shared_feature_commit": EXPECTED_SHARED_COMMIT,
+            }
+        )
+    else:
+        config["native_gradient_ensemble"] = {
+            "openvla_loss": "-mean((O2_adv - O2_clean)^2)",
+            "pi05_loss": "-mean((P2_adv - P2_clean)^2)",
+            "frame_aggregation": "mean within each model before normalization",
+            "model_normalization": "g / (mean(abs(g)) + 1e-12)",
+            "model_aggregation": "(g_o_normalized + g_p_normalized) / 2",
+        }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     openvla_cfg = SimpleNamespace(
@@ -247,18 +300,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
     policy_view = PolicyViewTransform(DEFAULT_DEPLOYMENT_VIEW)
     pi05 = _load_pi05(paths["openpi"], paths["pi05_checkpoint"], pi05_device)
-    mapping_o = FrozenSharedCCAMapping.from_artifact(
-        paths["mapping"],
-        dtype=torch.float32,
-        device=openvla_device,
-        expected_mapping_sha256=EXPECTED_MAPPING_SHA256,
-    )
-    mapping_p = FrozenSharedCCAMapping.from_artifact(
-        paths["mapping"],
-        dtype=torch.float32,
-        device=pi05_device,
-        expected_mapping_sha256=EXPECTED_MAPPING_SHA256,
-    )
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        mapping_o = FrozenSharedCCAMapping.from_artifact(
+            paths["mapping"],
+            dtype=torch.float32,
+            device=openvla_device,
+            expected_mapping_sha256=EXPECTED_MAPPING_SHA256,
+        )
+        mapping_p = FrozenSharedCCAMapping.from_artifact(
+            paths["mapping"],
+            dtype=torch.float32,
+            device=pi05_device,
+            expected_mapping_sha256=EXPECTED_MAPPING_SHA256,
+        )
     # The inherited MVP helper uses ``.cuda()`` without a device argument.
     # Restore the renderer/OpenVLA device after constructing the cuda:1 policy.
     torch.cuda.set_device(openvla_device)
@@ -293,7 +347,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             return extract_openvla_o2(openvla_model, pixels)
 
-    frames: list[SharedTrainingFrame] = []
+    frames: list[SharedTrainingFrame | NativeTrainingFrame] = []
     frame_contract = []
     calibration_count = 0
     for state_id in range(protocol.num_train_init_states):
@@ -330,18 +384,33 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     return extract_pi05_p2_autograd(pi05.model, model_observation)
 
-            pipeline = DualVLAFeatureAdapter(
-                openvla_path=openvla_path,
-                pi05_path=pi05_path,
-                openvla_mapping=mapping_o,
-                pi05_mapping=mapping_p,
-                shared_loss=shared_feature_loss,
-                openvla_device=openvla_device,
-                pi05_device=pi05_device,
-                loss_device=openvla_device,
-            )
-            clean_live = pipeline.clean_reference(clean_image)
-            clean = FrozenCleanReference.from_tensors(clean_live.h_o, clean_live.h_p)
+            if args.objective == SHARED_CCA_OBJECTIVE:
+                pipeline = DualVLAFeatureAdapter(
+                    openvla_path=openvla_path,
+                    pi05_path=pi05_path,
+                    openvla_mapping=mapping_o,
+                    pi05_mapping=mapping_p,
+                    shared_loss=shared_feature_loss,
+                    openvla_device=openvla_device,
+                    pi05_device=pi05_device,
+                    loss_device=openvla_device,
+                )
+                clean_live = pipeline.clean_reference(clean_image)
+                clean = FrozenCleanReference.from_tensors(
+                    clean_live.h_o, clean_live.h_p
+                )
+                frame_type = SharedTrainingFrame
+                clean_reference_space = "pca_cca_canonical"
+            else:
+                pipeline = DualVLANativeFeatureAdapter(
+                    openvla_path=openvla_path,
+                    pi05_path=pi05_path,
+                    openvla_device=openvla_device,
+                    pi05_device=pi05_device,
+                )
+                clean = pipeline.clean_reference(clean_image)
+                frame_type = NativeTrainingFrame
+                clean_reference_space = "native_o2_p2"
             poses = find_target_body_poses(
                 env,
                 object_config["search"],
@@ -380,7 +449,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             }
             frame_id = f"task00-state{state_id:02d}-frame00"
             frames.append(
-                SharedTrainingFrame(
+                frame_type(
                     frame_id=frame_id,
                     state_id=state_id,
                     pi05_template_id=f"pi05-state-{state_id:02d}",
@@ -396,6 +465,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "instance_names": [pose.body_name for pose in poses],
                     "visible_pixel_counts": visible_pixels,
                     "clean_reference_detached": True,
+                    "clean_reference_space": clean_reference_space,
                     "base_image_sha256": hashlib.sha256(
                         np.ascontiguousarray(clean_rgb).tobytes()
                     ).hexdigest(),
@@ -412,14 +482,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(frame_contract, indent=2, sort_keys=True) + "\n"
     )
 
-    def forward_frame(frame: SharedTrainingFrame):
+    def render_frame(frame: SharedTrainingFrame | NativeTrainingFrame):
         images = _build_adv_samples(renderer, frame.payload["renderer_frame"], 512)
         if len(images) != 1:
             raise RuntimeError(f"{frame.frame_id}: renderer must return one base image")
         image = images[0]
         if not bool(torch.isfinite(image).all()):
             raise RuntimeError(f"{frame.frame_id}: rendered image is non-finite")
+        return image
+
+    def forward_shared_frame(frame: SharedTrainingFrame):
+        image = render_frame(frame)
         return frame.payload["pipeline"].loss(image, frame.clean)[0], image
+
+    def forward_native_frame(frame: NativeTrainingFrame):
+        image = render_frame(frame)
+        return frame.payload["pipeline"].losses(image, frame.clean)[0], image
 
     checkpoint_artifacts: list[dict[str, Any]] = []
 
@@ -440,17 +518,30 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             )
         print(json.dumps(row, sort_keys=True), flush=True)
 
-    history = train_shared_texture(
-        renderer=renderer,
-        frames=frames,
-        forward_frame=forward_frame,
-        iterations=protocol.attack_iterations,
-        requested_batch_size=protocol.num_frames_to_attack,
-        pgd_step=protocol.pgd_step,
-        seed=protocol.seed,
-        metrics_path=output / "step_metrics.jsonl",
-        progress=progress,
-    )
+    training_arguments = {
+        "renderer": renderer,
+        "frames": frames,
+        "iterations": protocol.attack_iterations,
+        "requested_batch_size": protocol.num_frames_to_attack,
+        "pgd_step": protocol.pgd_step,
+        "seed": protocol.seed,
+        "metrics_path": output / "step_metrics.jsonl",
+        "progress": progress,
+    }
+    if args.objective == SHARED_CCA_OBJECTIVE:
+        history = train_shared_texture(
+            forward_frame=forward_shared_frame,
+            **training_arguments,
+        )
+        loss_history = np.asarray([row["loss_shared"] for row in history])
+        loss_history_fields = ["loss_shared"]
+    else:
+        history = train_native_gradient_ensemble(
+            forward_frame=forward_native_frame,
+            **training_arguments,
+        )
+        loss_history = np.asarray([[row["loss_o"], row["loss_p"]] for row in history])
+        loss_history_fields = ["loss_o", "loss_p"]
     maximum = validate_texture_budget(renderer)
     parameter_path = output / "final_vertex_noise.pt"
     texture_path = output / "final_attack_texture.png"
@@ -460,12 +551,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     Image.fromarray((baked * 255.0).round().clip(0, 255).astype(np.uint8)).save(
         texture_path
     )
-    np.save(
-        output / "loss_history.npy", np.asarray([row["loss_shared"] for row in history])
-    )
+    np.save(output / "loss_history.npy", loss_history)
     summary = {
-        "status": "Phase 2.4 Shared-Feature Optimization — COMPLETE",
+        "status": (
+            "Phase 2.4 Shared-Feature Optimization — COMPLETE"
+            if args.objective == SHARED_CCA_OBJECTIVE
+            else "Phase 2 Native Gradient Ensemble Optimization — COMPLETE"
+        ),
         "phase2_4_training_result": "PASS",
+        "objective": args.objective,
+        "uses_shared_feature_artifact": args.objective == SHARED_CCA_OBJECTIVE,
         "run_configuration": run_configuration,
         "iterations_completed": len(history),
         "texture_updates": len(history),
@@ -473,6 +568,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "effective_batch_size": len(frames),
         "training_state_ids": list(range(protocol.num_train_init_states)),
         "clean_reference_forward_count": len(frames),
+        "loss_history_fields": loss_history_fields,
         "final_diagnostics": history[-1],
         "maximum_texture_perturbation": maximum,
         "renderer_epsilon": float(renderer.epsilon),
@@ -488,7 +584,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "frame_contract": str((output / "frame_contract.json").resolve()),
             "training_config": str(config_path.resolve()),
         },
-        "scope": "source-model shared-feature texture training; no rollout claim",
+        "scope": (
+            "source-model shared-feature texture training; no rollout claim"
+            if args.objective == SHARED_CCA_OBJECTIVE
+            else "source-model native-gradient-ensemble texture training; no rollout claim"
+        ),
     }
     (output / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
@@ -506,7 +606,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         (output / "failure.json").write_text(
             json.dumps(
                 {
-                    "status": "Phase 2.4 Shared-Feature Optimization — BLOCKED",
+                    "status": "Phase 2 Source-Feature Optimization — BLOCKED",
+                    "objective": args.objective,
                     "phase2_4_training_result": "BLOCKED",
                     "error_type": type(error).__name__,
                     "error": str(error),
