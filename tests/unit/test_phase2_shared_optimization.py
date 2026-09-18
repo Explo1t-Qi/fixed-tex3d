@@ -177,6 +177,42 @@ def test_native_mode_does_not_require_or_resolve_shared_artifacts(
     assert "mapping" not in paths
 
 
+def test_multilevel_native_mode_does_not_require_shared_artifacts(
+    tmp_path: Path,
+) -> None:
+    existing = {}
+    for name in (
+        "openpi",
+        "openvla-checkpoint",
+        "pi05-checkpoint",
+        "libero",
+    ):
+        existing[name] = tmp_path / name
+        existing[name].mkdir()
+    args = training_entrypoint._args(
+        [
+            "--objective",
+            "multilevel_native_gradient_ensemble",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--openpi-root",
+            str(existing["openpi"]),
+            "--openvla-checkpoint",
+            str(existing["openvla-checkpoint"]),
+            "--pi05-checkpoint",
+            str(existing["pi05-checkpoint"]),
+            "--libero-root",
+            str(existing["libero"]),
+        ]
+    )
+
+    paths = training_entrypoint._validate_paths(args)
+
+    assert args.objective == "multilevel_native_gradient_ensemble"
+    assert "shared" not in paths
+    assert "mapping" not in paths
+
+
 def test_native_source_paths_exclude_shared_feature_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
