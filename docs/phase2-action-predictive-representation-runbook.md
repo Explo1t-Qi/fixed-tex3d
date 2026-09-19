@@ -53,8 +53,23 @@ The synchronized evidence is stored under:
 - `experiment_inbox/shared-feature-phase2/phase2-action-probe-smoke-20260919-201027/openvla/`
 - `experiment_inbox/shared-feature-phase2/phase2-action-probe-pi05-smoke-fix-20260919-202246/`
 
-This evidence closes the real-checkpoint hook, tensor-shape, action-target, repeatability, and serialization smoke gates. It does not evaluate action coverage or linear predictability. Phase 2A still requires complete 200-observation extraction for both models, followed by the frozen group-aware probe materialization and held-out evaluation.
+This evidence closes the real-checkpoint hook, tensor-shape, action-target, repeatability, and serialization smoke gates.
+
+## Phase 2A result
+
+Both models subsequently completed extraction on all 200 paired observations at code commit `dabe0d4da006a2d9074d4db7d933f4f0d8fc31fa`. All 400 feature archives passed SHA-256, identity, shape, ordering, and finite-value validation. Repeat-forward maximum absolute differences remained `0.0` for both representations and actions.
+
+The group-aware Phase 2A materialization completed with 160 TRAIN and 40 HELD-OUT observations. All four candidate probes beat their model-specific mean-action baseline on aggregate held-out normalized MSE:
+
+| Model | Node | Held-out MSE | Mean baseline MSE | Reduction |
+|---|---|---:|---:|---:|
+| OpenVLA | O2 | 0.619732 | 1.109212 | 44.13% |
+| OpenVLA | O-deep | 0.525864 | 1.109212 | 52.59% |
+| PI0.5 | P2 | 0.666358 | 1.069136 | 37.67% |
+| PI0.5 | P-deep | 0.506923 | 1.069136 | 52.59% |
+
+No action dimension is near-constant overall or within a task. Probe optimization, serialization, projection construction, and artifact inventory checks passed. Phase 2A therefore selects Case A: retain the existing 200-observation dataset and proceed to Phase 2B without densification. Detailed action coverage, per-dimension metrics, limitations, and candidate artifact validation are recorded in `docs/phase2-action-predictive-representation-report.md`.
 
 ## Server-only validation boundary
 
-Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, and projection construction. The generated scientific report is authoritative only after both 200-observation extraction manifests and formal materialization complete on the server.
+Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. That extraction and Phase 2A candidate materialization have completed. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, and projection construction. Phase 2B formal materialization remains required before the probe and action-subspace artifacts become authoritative Phase 3 inputs.
