@@ -204,7 +204,13 @@ def extract_pi05_action_representation(
     p2 = _validate_feature(
         projected[0] / math.sqrt(hidden_size), name="PI0.5 P2", width=2048
     )
-    p_deep = _validate_feature(prefix_hidden[0], name="PI0.5 P-deep", width=2048)
+    # PI0Pytorch inference is torch.compile'd with CUDA Graphs. Decoder-layer
+    # outputs can therefore alias a static output buffer that the next infer()
+    # call overwrites. Take ownership after infer() returns (outside the
+    # compiled region) so repeated extraction and serialization remain valid.
+    p_deep = _validate_feature(
+        prefix_hidden[0].clone(), name="PI0.5 P-deep", width=2048
+    )
     actions = output["actions"] if isinstance(output, dict) else output
     actions = np.asarray(actions, dtype=np.float32)
     if actions.ndim == 3 and actions.shape[0] == 1:

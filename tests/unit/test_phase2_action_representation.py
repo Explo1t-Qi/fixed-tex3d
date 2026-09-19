@@ -26,6 +26,21 @@ class _PassLayer(torch.nn.Module):
         return value + 1
 
 
+class _ReusableOutputLayer(torch.nn.Module):
+    """Model a CUDA Graph output buffer overwritten by the next invocation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_buffer: torch.Tensor | None = None
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        result = value + 1
+        if self.output_buffer is None:
+            self.output_buffer = torch.empty_like(result)
+        self.output_buffer.copy_(result)
+        return self.output_buffer
+
+
 class _OpenModel:
     def __init__(self) -> None:
         self.projector = torch.nn.Identity()
@@ -103,6 +118,28 @@ class _PiPolicy:
         return {"actions": np.arange(70, dtype=np.float32).reshape(10, 7)}
 
 
+class _OverwritingPiPolicy(_PiPolicy):
+    def __init__(self, model: _PiModel) -> None:
+        super().__init__(model)
+        layers = self.model.paligemma_with_expert.paligemma.language_model.layers
+        layers[8] = _ReusableOutputLayer()
+        self.calls = 0
+
+    def infer(self, _observation, *, noise):
+        assert noise.shape == (10, 32)
+        self.calls += 1
+        projector = (
+            self.model.paligemma_with_expert.paligemma.model.multi_modal_projector
+        )
+        for _ in range(3):
+            projector(torch.ones(1, 256, 1152))
+        hidden = torch.full((1, 800, 2048), float(self.calls))
+        layers = self.model.paligemma_with_expert.paligemma.language_model.layers
+        for layer in layers:
+            hidden = layer(hidden)
+        return {"actions": np.arange(70, dtype=np.float32).reshape(10, 7)}
+
+
 def test_pi05_capture_uses_first_projector_slot_and_midpoint_prefix() -> None:
     model = _PiModel()
     result = extract_pi05_action_representation(
@@ -118,6 +155,29 @@ def test_pi05_capture_uses_first_projector_slot_and_midpoint_prefix() -> None:
     assert result.deep_identity.total_layers == 18
     assert result.deep_identity.zero_based_layer_index == 8
     assert np.array_equal(result.deployed_action, np.arange(7, dtype=np.float32))
+
+
+def test_pi05_deep_capture_owns_storage_across_repeated_inference() -> None:
+    model = _PiModel()
+    policy = _OverwritingPiPolicy(model)
+    noise = np.zeros((10, 32), dtype=np.float32)
+
+    first = extract_pi05_action_representation(
+        policy=policy,
+        model=model,
+        raw_observation={},
+        noise=noise,
+    )
+    first_snapshot = first.deep.clone()
+    repeated = extract_pi05_action_representation(
+        policy=policy,
+        model=model,
+        raw_observation={},
+        noise=noise,
+    )
+
+    assert torch.equal(first.deep, first_snapshot)
+    assert not torch.equal(first.deep, repeated.deep)
 
 
 def test_hooks_are_removed_after_failure() -> None:
