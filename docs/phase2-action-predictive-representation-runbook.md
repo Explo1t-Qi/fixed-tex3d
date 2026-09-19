@@ -35,6 +35,26 @@ P_{action}=W^T(WW^T+\eta I)^{-1}W.
 
 The materializer records symmetry and ridge-idempotence residuals and verifies probe, weight, and projection serialization.
 
+## Real-checkpoint extraction smoke status
+
+Both model-specific extraction paths have passed a one-observation server smoke on the same frozen Pilot v0.2 sample, `libero_spatial__task00__state00__step0008`.
+
+| Model | Code commit | Projected node | Deep node | Action | Repeat-forward maximum absolute differences | Result |
+|---|---|---|---|---|---|---|
+| OpenVLA | `3d362a8f24033b3dbec150b23660d2b0315ba95f` | O2 `[256,4096]` | O-deep `[256,4096]` | `[7]` | O2 `0.0`; O-deep `0.0`; action `0.0` | `SMOKE_COMPLETE` |
+| PI0.5 | `9b174369eee36a4715dd9b716d5213bebec27bae` | P2 `[256,2048]` | P-deep `[256,2048]` | `[7]` | P2 `0.0`; P-deep `0.0`; action `0.0` | `SMOKE_COMPLETE` |
+
+Both archives are float32, finite, and match the SHA-256 recorded in their manifests. Extraction ran under `torch.inference_mode()`, and neither smoke populated gradients on VLA parameters.
+
+The PI0Pytorch path required an extraction ownership fix. Its compiled CUDA Graph runtime may reuse decoder-layer output storage on the next `infer()` call. P-deep is therefore cloned after `policy.infer()` returns and before another model invocation. This preserves the same layer-8 tensor values and base-camera token slice while preventing a later inference from overwriting the captured representation. A regression test models this reusable-buffer behavior and verifies that the first extraction remains unchanged after a repeated inference.
+
+The synchronized evidence is stored under:
+
+- `experiment_inbox/shared-feature-phase2/phase2-action-probe-smoke-20260919-201027/openvla/`
+- `experiment_inbox/shared-feature-phase2/phase2-action-probe-pi05-smoke-fix-20260919-202246/`
+
+This evidence closes the real-checkpoint hook, tensor-shape, action-target, repeatability, and serialization smoke gates. It does not evaluate action coverage or linear predictability. Phase 2A still requires complete 200-observation extraction for both models, followed by the frozen group-aware probe materialization and held-out evaluation.
+
 ## Server-only validation boundary
 
-Real extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, and projection construction. The generated scientific report is authoritative only after both 200-observation extraction manifests and formal materialization complete on the server.
+Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, and projection construction. The generated scientific report is authoritative only after both 200-observation extraction manifests and formal materialization complete on the server.
