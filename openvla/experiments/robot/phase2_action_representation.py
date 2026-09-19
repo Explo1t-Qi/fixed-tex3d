@@ -1,0 +1,229 @@
+"""Frozen extraction contracts for action-predictive representation probes."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import numpy as np
+import torch
+
+
+ACTION_DIM = 7
+NUM_VISUAL_TOKENS = 256
+
+
+class ActionRepresentationError(RuntimeError):
+    """Raised when a representation/action extraction contract is violated."""
+
+
+@dataclass(frozen=True)
+class DeepNodeIdentity:
+    module_path: str
+    total_layers: int
+    zero_based_layer_index: int
+    one_based_layer_index: int
+    capture_point: str
+    visual_token_slice: str
+
+
+@dataclass(frozen=True)
+class ModelActionRepresentation:
+    projected: torch.Tensor
+    deep: torch.Tensor
+    deployed_action: np.ndarray
+    deep_identity: DeepNodeIdentity
+
+
+def midpoint_layer_index(total_layers: int) -> int:
+    """Select the last decoder block in the first half of a tower."""
+
+    if type(total_layers) is not int or total_layers < 2:
+        raise ActionRepresentationError(
+            "decoder tower must contain at least two layers"
+        )
+    return total_layers // 2 - 1
+
+
+def _tensor_output(output: Any, *, name: str) -> torch.Tensor:
+    value = output[0] if isinstance(output, (tuple, list)) else output
+    if not isinstance(value, torch.Tensor):
+        raise ActionRepresentationError(f"{name} hook did not capture a tensor")
+    return value
+
+
+def _validate_feature(value: torch.Tensor, *, name: str, width: int) -> torch.Tensor:
+    if tuple(value.shape) != (1, NUM_VISUAL_TOKENS, width):
+        raise ActionRepresentationError(
+            f"{name} must have shape [1,{NUM_VISUAL_TOKENS},{width}], "
+            f"got {tuple(value.shape)}"
+        )
+    if not bool(torch.isfinite(value).all()):
+        raise ActionRepresentationError(f"{name} contains non-finite values")
+    return value
+
+
+def _validate_action(action: Any, *, name: str) -> np.ndarray:
+    value = np.asarray(action, dtype=np.float32)
+    if value.shape != (ACTION_DIM,) or not np.all(np.isfinite(value)):
+        raise ActionRepresentationError(f"{name} must be finite shape [7]")
+    return value
+
+
+def extract_openvla_action_representation(
+    *,
+    model: Any,
+    model_inputs: dict[str, torch.Tensor],
+    unnorm_key: str,
+    deploy_action: Callable[[np.ndarray], np.ndarray],
+) -> ModelActionRepresentation:
+    """Decode one action while capturing O2 and a midpoint visual-token state."""
+
+    try:
+        layers = model.language_model.model.layers
+        projector = model.projector
+    except AttributeError as error:
+        raise ActionRepresentationError(
+            "OpenVLA does not expose projector and Llama decoder layers"
+        ) from error
+    total_layers = len(layers)
+    layer_index = midpoint_layer_index(total_layers)
+    projected: list[torch.Tensor] = []
+    deep: list[torch.Tensor] = []
+
+    def capture_projected(_module: Any, _inputs: Any, output: Any) -> None:
+        projected.append(_tensor_output(output, name="OpenVLA O2"))
+
+    def capture_deep(_module: Any, _inputs: Any, output: Any) -> None:
+        hidden = _tensor_output(output, name="OpenVLA O-deep")
+        # Generation revisits the layer with one cached token. Only the initial
+        # multimodal call contains the 256 visual-token span after BOS.
+        if hidden.ndim == 3 and hidden.shape[1] >= NUM_VISUAL_TOKENS + 1:
+            deep.append(hidden[:, 1 : NUM_VISUAL_TOKENS + 1, :])
+
+    handles = (
+        projector.register_forward_hook(capture_projected),
+        layers[layer_index].register_forward_hook(capture_deep),
+    )
+    try:
+        with torch.inference_mode():
+            raw_action = model.predict_action(
+                **model_inputs, unnorm_key=unnorm_key, do_sample=False
+            )
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
+
+    if len(projected) != 1:
+        raise ActionRepresentationError(
+            f"OpenVLA O2 capture count must be 1, got {len(projected)}"
+        )
+    if len(deep) != 1:
+        raise ActionRepresentationError(
+            f"OpenVLA O-deep full-sequence capture count must be 1, got {len(deep)}"
+        )
+    o2 = _validate_feature(projected[0], name="OpenVLA O2", width=4096)
+    o_deep = _validate_feature(deep[0], name="OpenVLA O-deep", width=4096)
+    deployed = _validate_action(
+        deploy_action(np.asarray(raw_action).copy()), name="OpenVLA deployed action"
+    )
+    return ModelActionRepresentation(
+        projected=o2,
+        deep=o_deep,
+        deployed_action=deployed,
+        deep_identity=DeepNodeIdentity(
+            module_path=f"language_model.model.layers[{layer_index}]",
+            total_layers=total_layers,
+            zero_based_layer_index=layer_index,
+            one_based_layer_index=layer_index + 1,
+            capture_point="decoder block output",
+            visual_token_slice="multimodal hidden_state[:, 1:257, :]",
+        ),
+    )
+
+
+def extract_pi05_action_representation(
+    *,
+    policy: Any,
+    model: Any,
+    raw_observation: dict[str, Any],
+    noise: np.ndarray,
+) -> ModelActionRepresentation:
+    """Infer one PI0.5 action chunk while capturing base-camera P2/P-deep."""
+
+    try:
+        paligemma = model.paligemma_with_expert.paligemma
+        projector = paligemma.model.multi_modal_projector
+        layers = paligemma.language_model.layers
+    except AttributeError as error:
+        raise ActionRepresentationError(
+            "PI0Pytorch does not expose PaliGemma projector and prefix layers"
+        ) from error
+    total_layers = len(layers)
+    layer_index = midpoint_layer_index(total_layers)
+    projected: list[torch.Tensor] = []
+    prefix_hidden: list[torch.Tensor] = []
+
+    def capture_projected(_module: Any, _inputs: Any, output: Any) -> None:
+        projected.append(_tensor_output(output, name="PI0.5 P2"))
+
+    def capture_deep(_module: Any, _inputs: Any, output: Any) -> None:
+        hidden = _tensor_output(output, name="PI0.5 P-deep")
+        if hidden.ndim == 3 and hidden.shape[1] >= 3 * NUM_VISUAL_TOKENS:
+            prefix_hidden.append(hidden[:, :NUM_VISUAL_TOKENS, :])
+
+    handles = (
+        projector.register_forward_hook(capture_projected),
+        layers[layer_index].register_forward_hook(capture_deep),
+    )
+    try:
+        with torch.inference_mode():
+            output = policy.infer(raw_observation, noise=noise)
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
+
+    # Official prefix order is base, left wrist, right wrist. The projector is
+    # called once per image slot and the primary camera is therefore capture 0.
+    if len(projected) != 3:
+        raise ActionRepresentationError(
+            f"PI0.5 image-projector capture count must be 3, got {len(projected)}"
+        )
+    if len(prefix_hidden) != 1:
+        raise ActionRepresentationError(
+            f"PI0.5 P-deep prefix capture count must be 1, got {len(prefix_hidden)}"
+        )
+    hidden_size = int(paligemma.config.text_config.hidden_size)
+    if hidden_size != 2048:
+        raise ActionRepresentationError(
+            f"PI0.5 PaliGemma hidden size must be 2048, got {hidden_size}"
+        )
+    # PaliGemmaModel.get_image_features applies this after its projector.
+    # Reproduce it so P2 equals embed_image(), rather than the raw hook output.
+    p2 = _validate_feature(
+        projected[0] / math.sqrt(hidden_size), name="PI0.5 P2", width=2048
+    )
+    p_deep = _validate_feature(prefix_hidden[0], name="PI0.5 P-deep", width=2048)
+    actions = output["actions"] if isinstance(output, dict) else output
+    actions = np.asarray(actions, dtype=np.float32)
+    if actions.ndim == 3 and actions.shape[0] == 1:
+        actions = actions[0]
+    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM or not len(actions):
+        raise ActionRepresentationError("PI0.5 deployed action chunk must be [H,7]")
+    deployed = _validate_action(actions[0], name="PI0.5 first deployed action")
+    return ModelActionRepresentation(
+        projected=p2,
+        deep=p_deep,
+        deployed_action=deployed,
+        deep_identity=DeepNodeIdentity(
+            module_path=(
+                f"paligemma_with_expert.paligemma.language_model.layers[{layer_index}]"
+            ),
+            total_layers=total_layers,
+            zero_based_layer_index=layer_index,
+            one_based_layer_index=layer_index + 1,
+            capture_point="PaliGemma prefix decoder block output",
+            visual_token_slice="prefix hidden_state[:, 0:256, :] (base_0_rgb)",
+        ),
+    )

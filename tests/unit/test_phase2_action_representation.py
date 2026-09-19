@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from scripts import phase2_action_representation_extract as entrypoint
+
+
+ROBOT_ROOT = Path(__file__).resolve().parents[2] / "openvla/experiments/robot"
+sys.path.insert(0, str(ROBOT_ROOT))
+
+from phase2_action_representation import (  # noqa: E402
+    ActionRepresentationError,
+    extract_openvla_action_representation,
+    extract_pi05_action_representation,
+    midpoint_layer_index,
+)
+
+
+class _PassLayer(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + 1
+
+
+class _OpenModel:
+    def __init__(self) -> None:
+        self.projector = torch.nn.Identity()
+        layers = torch.nn.ModuleList([_PassLayer() for _ in range(32)])
+        self.language_model = type(
+            "LM", (), {"model": type("Core", (), {"layers": layers})()}
+        )()
+
+    def predict_action(self, **_kwargs):
+        value = self.projector(torch.ones(1, 256, 4096))
+        hidden = torch.zeros(1, 260, 4096)
+        for layer in self.language_model.model.layers:
+            hidden = layer(hidden)
+        # Cached generation calls must not create another full-sequence capture.
+        self.language_model.model.layers[15](torch.zeros(1, 1, 4096))
+        assert value.shape[-1] == 4096
+        return np.arange(7, dtype=np.float32)
+
+
+def test_openvla_capture_uses_derived_midpoint_and_visual_slice() -> None:
+    model = _OpenModel()
+    result = extract_openvla_action_representation(
+        model=model,
+        model_inputs={"input_ids": torch.ones(1, 2, dtype=torch.long)},
+        unnorm_key="fixture",
+        deploy_action=lambda action: action,
+    )
+    assert result.projected.shape == (1, 256, 4096)
+    assert result.deep.shape == (1, 256, 4096)
+    assert torch.all(result.deep == 16)
+    assert result.deep_identity.total_layers == 32
+    assert result.deep_identity.zero_based_layer_index == 15
+    assert result.deep_identity.one_based_layer_index == 16
+
+
+class _Projector(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.pad(value, (0, 896))
+
+
+class _PiModel:
+    def __init__(self) -> None:
+        projector = _Projector()
+        layers = torch.nn.ModuleList([_PassLayer() for _ in range(18)])
+        language_model = type("LM", (), {"layers": layers})()
+        model = type("Vision", (), {"multi_modal_projector": projector})()
+        config = type(
+            "Config",
+            (),
+            {"text_config": type("TextConfig", (), {"hidden_size": 2048})()},
+        )()
+        paligemma = type(
+            "Pali",
+            (),
+            {"model": model, "language_model": language_model, "config": config},
+        )()
+        self.paligemma_with_expert = type("Wrapper", (), {"paligemma": paligemma})()
+
+
+class _PiPolicy:
+    def __init__(self, model: _PiModel) -> None:
+        self.model = model
+
+    def infer(self, _observation, *, noise):
+        assert noise.shape == (10, 32)
+        projector = (
+            self.model.paligemma_with_expert.paligemma.model.multi_modal_projector
+        )
+        for _ in range(3):
+            projector(torch.ones(1, 256, 1152))
+        hidden = torch.zeros(1, 800, 2048)
+        layers = self.model.paligemma_with_expert.paligemma.language_model.layers
+        for layer in layers:
+            hidden = layer(hidden)
+        return {"actions": np.arange(70, dtype=np.float32).reshape(10, 7)}
+
+
+def test_pi05_capture_uses_first_projector_slot_and_midpoint_prefix() -> None:
+    model = _PiModel()
+    result = extract_pi05_action_representation(
+        policy=_PiPolicy(model),
+        model=model,
+        raw_observation={},
+        noise=np.zeros((10, 32), dtype=np.float32),
+    )
+    assert result.projected.shape == (1, 256, 2048)
+    assert result.projected[0, 0, 0].item() == pytest.approx(1 / np.sqrt(2048))
+    assert result.deep.shape == (1, 256, 2048)
+    assert torch.all(result.deep == 9)
+    assert result.deep_identity.total_layers == 18
+    assert result.deep_identity.zero_based_layer_index == 8
+    assert np.array_equal(result.deployed_action, np.arange(7, dtype=np.float32))
+
+
+def test_hooks_are_removed_after_failure() -> None:
+    model = _OpenModel()
+    model.predict_action = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+    layer = model.language_model.model.layers[15]
+    with pytest.raises(RuntimeError, match="boom"):
+        extract_openvla_action_representation(
+            model=model,
+            model_inputs={},
+            unnorm_key="fixture",
+            deploy_action=lambda action: action,
+        )
+    assert not model.projector._forward_hooks
+    assert not layer._forward_hooks
+
+
+def test_midpoint_requires_a_real_tower() -> None:
+    assert midpoint_layer_index(32) == 15
+    assert midpoint_layer_index(18) == 8
+    with pytest.raises(ActionRepresentationError):
+        midpoint_layer_index(1)
+
+
+def test_extraction_cli_separates_one_observation_smoke_from_formal() -> None:
+    common = [
+        "--model",
+        "openvla",
+        "--output-dir",
+        "/tmp/out",
+        "--collection-manifest",
+        "/tmp/collection.json",
+        "--shared-feature-root",
+        "/tmp/shared",
+        "--checkpoint",
+        "/tmp/model",
+    ]
+    assert entrypoint._args(common).max_observations == 200
+    assert entrypoint._args([*common, "--max-observations", "1"]).max_observations == 1
+    with pytest.raises(SystemExit):
+        entrypoint._args([*common, "--max-observations", "2"])
