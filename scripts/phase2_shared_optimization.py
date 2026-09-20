@@ -384,6 +384,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
     policy_view = PolicyViewTransform(DEFAULT_DEPLOYMENT_VIEW)
     pi05 = _load_pi05(paths["openpi"], paths["pi05_checkpoint"], pi05_device)
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        if any(parameter.requires_grad for parameter in openvla_model.parameters()):
+            raise RuntimeError("OpenVLA parameters are not frozen")
+        if any(parameter.requires_grad for parameter in pi05.model.parameters()):
+            raise RuntimeError("PI0Pytorch parameters are not frozen")
+        config["action_predictive_gradient_ensemble"]["vla_parameters_frozen"] = {
+            "openvla": True,
+            "pi05": True,
+        }
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
     if args.objective == SHARED_CCA_OBJECTIVE:
         mapping_o = FrozenSharedCCAMapping.from_artifact(
             paths["mapping"],
@@ -823,6 +833,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "clean_reference_forward_count": len(frames),
         "lambda_dir": (
             phase3_lambda_dir
+            if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
+            else None
+        ),
+        "probe_weights_unchanged": (
+            True
             if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
             else None
         ),
