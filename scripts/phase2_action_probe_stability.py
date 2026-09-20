@@ -62,6 +62,7 @@ NODE_KEYS = (
     ("pi05", "projected", "p2", "PI0.5 P2"),
     ("pi05", "deep", "deep", "PI0.5 P-deep"),
 )
+NODE_CHOICES = tuple(f"{model}/{node}" for model, _, node, _ in NODE_KEYS)
 
 
 def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -72,6 +73,13 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--report-path", type=Path)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
+    parser.add_argument(
+        "--nodes",
+        nargs="+",
+        choices=NODE_CHOICES,
+        default=list(NODE_CHOICES),
+        help="Diagnose only selected nodes; defaults to all historical nodes.",
+    )
     return parser.parse_args(argv)
 
 
@@ -128,6 +136,9 @@ def _validate_phase2a(
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     seeds = validate_seeds(args.seeds)
+    selected_nodes = tuple(getattr(args, "nodes", NODE_CHOICES))
+    if len(set(selected_nodes)) != len(selected_nodes):
+        raise ActionProbeError("selected stability nodes must be unique")
     phase2a = args.phase2a_dir.expanduser().resolve(strict=True)
     openvla_manifest_path = args.openvla_manifest.expanduser().resolve(strict=True)
     pi05_manifest_path = args.pi05_manifest.expanduser().resolve(strict=True)
@@ -157,6 +168,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         openvla_manifest=openvla_manifest_path,
         pi05_manifest=pi05_manifest_path,
     )
+    if selected_nodes != NODE_CHOICES and metadata.get("selected_nodes") != list(
+        selected_nodes
+    ):
+        raise ActionProbeError(
+            "selected stability nodes differ from Phase 2A materialization"
+        )
     source_roots = {
         "phase2a": phase2a,
         "openvla_representations": openvla_manifest_path.parent,
@@ -191,6 +208,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     similarity_nodes: dict[str, Any] = {}
 
     for model, feature_key, artifact_node, display_name in NODE_KEYS:
+        if f"{model}/{artifact_node}" not in selected_nodes:
+            continue
         _, features, actions = loaded[model]
         node_features = features[feature_key]
         weights: dict[int, torch.Tensor] = {}
@@ -288,6 +307,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     classification = classify_stability(similarity_nodes)
+    corrected_p2_only = selected_nodes == ("pi05/p2",)
+    status = classification["status"]
+    if corrected_p2_only:
+        status = (
+            "CORRECTED_P2_STABLE" if status == "STABLE" else "CORRECTED_P2_NEEDS_REVIEW"
+        )
     for name, path in source_roots.items():
         assert_tree_unchanged(path, source_snapshots[name])
 
@@ -297,7 +322,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     }
     summary = {
         "schema_version": STABILITY_SCHEMA_VERSION,
-        "status": classification["status"],
+        "status": status,
+        "selected_nodes": list(selected_nodes),
         "scope": "prediction and candidate action-predictive subspace initialization stability only",
         "code_commit": _head(),
         "phase2a_source": str(phase2a),

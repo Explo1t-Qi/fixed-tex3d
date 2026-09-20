@@ -17,6 +17,9 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ROBOT_ROOT = PROJECT_ROOT / "openvla/experiments/robot"
+ALL_NODE_KEYS = ("openvla/o2", "openvla/deep", "pi05/p2", "pi05/deep")
+CORRECTED_PI05_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v2"
+CORRECTED_PI05_DEFINITION_ID = "pi05_p2_embed_image_no_manual_scaling_v2"
 if str(ROBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ROBOT_ROOT))
 
@@ -61,6 +64,13 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--probe-steps", type=int, default=2000)
     parser.add_argument("--action-std-epsilon", type=float, default=1e-6)
     parser.add_argument("--probe-reg", type=float, default=1e-4)
+    parser.add_argument(
+        "--nodes",
+        nargs="+",
+        choices=ALL_NODE_KEYS,
+        default=list(ALL_NODE_KEYS),
+        help="Fit only the listed nodes; defaults to the historical four-node run.",
+    )
     return parser.parse_args(argv)
 
 
@@ -77,13 +87,28 @@ def _manifest(path: Path, model: str) -> dict[str, Any]:
     resolved = path.expanduser().resolve(strict=True)
     value = json.loads(resolved.read_text(encoding="utf-8"))
     if (
-        value.get("schema_version") != "phase2_action_representation_manifest_v1"
+        value.get("schema_version")
+        not in {
+            "phase2_action_representation_manifest_v1",
+            CORRECTED_PI05_MANIFEST_SCHEMA,
+        }
         or value.get("status") != "COMPLETE"
         or value.get("model") != model
         or value.get("count") != 200
         or len(value.get("records", [])) != 200
     ):
         raise ActionProbeError(f"invalid {model} representation manifest")
+    if value.get("schema_version") == CORRECTED_PI05_MANIFEST_SCHEMA:
+        projected = value.get("representation_nodes", {}).get("projected", {})
+        if (
+            model != "pi05"
+            or projected.get("definition_id") != CORRECTED_PI05_DEFINITION_ID
+            or projected.get("capture_semantics")
+            != "current PI0Pytorch base-camera embed_image() output; no additional manual scaling"
+            or value.get("pi05_p2_identity", {}).get("identity_pass") is not True
+            or value.get("action_identity", {}).get("pass") is not True
+        ):
+            raise ActionProbeError("invalid corrected PI0.5 P2 representation identity")
     value["_path"] = resolved
     return value
 
@@ -112,6 +137,15 @@ def _load_model_data(
                 or metadata["model"] != model
             ):
                 raise ActionProbeError(f"archive identity mismatch: {path}")
+            if manifest.get("schema_version") == CORRECTED_PI05_MANIFEST_SCHEMA and (
+                metadata.get("schema_version")
+                != "phase2_action_representation_archive_v2"
+                or metadata.get("representation_definition_id")
+                != CORRECTED_PI05_DEFINITION_ID
+            ):
+                raise ActionProbeError(
+                    f"corrected PI0.5 archive schema mismatch: {path}"
+                )
             samples.append(
                 SampleIdentity(
                     sample_id=metadata["sample_id"],
@@ -164,6 +198,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         probe_reg=args.probe_reg,
     )
     config.validate()
+    selected_nodes = tuple(getattr(args, "nodes", ALL_NODE_KEYS))
+    if len(set(selected_nodes)) != len(selected_nodes):
+        raise ActionProbeError("selected probe nodes must be unique")
     device = torch.device(args.probe_device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ActionProbeError("requested probe CUDA device is unavailable")
@@ -208,6 +245,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         atomic_json(audit_dir / f"{model}.json", audit)
         for key in ("projected", "deep"):
             node = _node_name(model, key)
+            if f"{model}/{node}" not in selected_nodes:
+                continue
             node_dir = output / model / node
             node_dir.mkdir(parents=True)
             probe, stats, history = fit_linear_probe(
@@ -321,6 +360,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             else "frozen_phase2_action_predictive_representation"
         ),
         "scope": "action predictability only; no causal action relevance, texture effectiveness, or transferability claim",
+        "selected_nodes": list(selected_nodes),
         "code_commit": _head(),
         "dataset": {
             "materialization": "Pilot v0.2 frozen 200-observation collection",
@@ -387,10 +427,26 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def _write_report(path: Path, metadata: dict[str, Any]) -> None:
     rows = metadata["results"]
+    selected_nodes = set(metadata["selected_nodes"])
     table = "\n".join(
         f"| {r['model']} | {r['node']} | {r['dimension']} | {r['train_mse_normalized']:.6g} | {r['heldout_mse_normalized']:.6g} | {r['heldout_mean_baseline_mse_normalized']:.6g} |"
         for r in rows
     )
+    node_lines = []
+    if "openvla/o2" in selected_nodes:
+        node_lines.append("- OpenVLA O2: multimodal-projector output, `[256,4096]`.")
+    if "openvla/deep" in selected_nodes:
+        node_lines.append(
+            f"- OpenVLA O-deep: `{metadata['models']['openvla']['deep_node']['module_path']}` output, visual slice `{metadata['models']['openvla']['deep_node']['visual_token_slice']}`."
+        )
+    if "pi05/p2" in selected_nodes:
+        node_lines.append(
+            "- PI0.5 P2: current base-camera `embed_image()` output, `[256,2048]`, with no additional manual scaling."
+        )
+    if "pi05/deep" in selected_nodes:
+        node_lines.append(
+            f"- PI0.5 P-deep: `{metadata['models']['pi05']['deep_node']['module_path']}` output, visual slice `{metadata['models']['pi05']['deep_node']['visual_token_slice']}`."
+        )
     text = f"""# Phase 2 — Action-Predictive Representation Report
 
 ## 1. Scope
@@ -403,10 +459,7 @@ The experiment uses 200 frozen Pilot v0.2 observations from 50 successful OpenVL
 
 ## 3. Representation Nodes
 
-- OpenVLA O2: multimodal-projector output, `[256,4096]`.
-- OpenVLA O-deep: `{metadata["models"]["openvla"]["deep_node"]["module_path"]}` output, visual slice `{metadata["models"]["openvla"]["deep_node"]["visual_token_slice"]}`.
-- PI0.5 P2: base-camera PaliGemma-ready projected tokens, `[256,2048]`.
-- PI0.5 P-deep: `{metadata["models"]["pi05"]["deep_node"]["module_path"]}` output, visual slice `{metadata["models"]["pi05"]["deep_node"]["visual_token_slice"]}`.
+{chr(10).join(node_lines)}
 
 ## 4. Probe
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -12,6 +11,8 @@ import torch
 
 ACTION_DIM = 7
 NUM_VISUAL_TOKENS = 256
+PI05_P2_WIDTH = 2048
+PI05_P2_DEFINITION_ID = "pi05_p2_embed_image_no_manual_scaling_v2"
 
 
 class ActionRepresentationError(RuntimeError):
@@ -34,6 +35,62 @@ class ModelActionRepresentation:
     deep: torch.Tensor
     deployed_action: np.ndarray
     deep_identity: DeepNodeIdentity
+
+
+def pi05_p2_identity_metrics(
+    *,
+    extractor: torch.Tensor,
+    embed_image: torch.Tensor,
+    prefix: torch.Tensor,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> dict[str, Any]:
+    """Validate the three authoritative PI0.5 P2 paths without rescaling."""
+
+    values = {
+        "phase2_extractor": extractor,
+        "direct_embed_image": embed_image,
+        "official_prefix_base_slice": prefix,
+    }
+    for name, value in values.items():
+        _validate_feature(value, name=name, width=PI05_P2_WIDTH)
+    reference = values["direct_embed_image"].float()
+    reference_norm = torch.linalg.vector_norm(reference)
+    if not bool(torch.isfinite(reference_norm)) or float(reference_norm) == 0.0:
+        raise ActionRepresentationError("direct embed_image P2 norm must be positive")
+    comparisons: dict[str, Any] = {}
+    for name in ("phase2_extractor", "official_prefix_base_slice"):
+        candidate = values[name].float()
+        difference = candidate - reference
+        metrics = {
+            "max_abs_difference": float(difference.abs().max()),
+            "mean_abs_difference": float(difference.abs().mean()),
+            "relative_l2_error": float(
+                torch.linalg.vector_norm(difference) / reference_norm
+            ),
+        }
+        metrics["within_tolerance"] = bool(
+            torch.allclose(candidate, reference, atol=atol, rtol=rtol)
+        )
+        comparisons[name] = metrics
+    result = {
+        "definition_id": PI05_P2_DEFINITION_ID,
+        "shape": list(extractor.shape),
+        "dtype": {name: str(value.dtype) for name, value in values.items()},
+        "l2_norm": {
+            name: float(torch.linalg.vector_norm(value.float()))
+            for name, value in values.items()
+        },
+        "tolerance": {"atol": atol, "rtol": rtol},
+        "comparisons_to_embed_image": comparisons,
+        "identity_pass": all(
+            value["within_tolerance"] for value in comparisons.values()
+        ),
+        "manual_scaling": "none",
+    }
+    if not result["identity_pass"]:
+        raise ActionRepresentationError(f"PI0.5 P2 identity mismatch: {result}")
+    return result
 
 
 def midpoint_layer_index(total_layers: int) -> int:
@@ -195,15 +252,14 @@ def extract_pi05_action_representation(
             f"PI0.5 P-deep prefix capture count must be 1, got {len(prefix_hidden)}"
         )
     hidden_size = int(paligemma.config.text_config.hidden_size)
-    if hidden_size != 2048:
+    if hidden_size != PI05_P2_WIDTH:
         raise ActionRepresentationError(
             f"PI0.5 PaliGemma hidden size must be 2048, got {hidden_size}"
         )
-    # PaliGemmaModel.get_image_features applies this after its projector.
-    # Reproduce it so P2 equals embed_image(), rather than the raw hook output.
-    p2 = _validate_feature(
-        projected[0] / math.sqrt(hidden_size), name="PI0.5 P2", width=2048
-    )
+    # Current PI0Pytorch embed_image() returns get_image_features() directly.
+    # Own the hook output because compiled inference may reuse static buffers;
+    # no manual scaling is part of the authoritative P2 definition.
+    p2 = _validate_feature(projected[0].clone(), name="PI0.5 P2", width=2048)
     # PI0Pytorch inference is torch.compile'd with CUDA Graphs. Decoder-layer
     # outputs can therefore alias a static output buffer that the next infer()
     # call overwrites. Take ownership after infer() returns (outside the

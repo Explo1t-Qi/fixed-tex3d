@@ -87,6 +87,8 @@ def consistency_metrics(inputs: ConsistencyInputs) -> dict[str, Any]:
     delta_z = z_adv - z_clean
     delta_action = normalized_adv - normalized_clean
     raw_delta_action = action_adv - action_clean
+    continuous_delta_z = delta_z[:, :6]
+    continuous_delta_action = delta_action[:, :6]
     clean_sample_mse = np.mean(np.square(error_clean), axis=1)
     adv_sample_mse = np.mean(np.square(error_adv), axis=1)
     delta_z_l2 = np.linalg.norm(delta_z, axis=1)
@@ -139,6 +141,38 @@ def consistency_metrics(inputs: ConsistencyInputs) -> dict[str, Any]:
             "per_sample_cosine_mean": (
                 float(defined_cosines.mean()) if defined_cosines.size else None
             ),
+            "continuous_6d": {
+                "delta_z_mse": float(np.mean(np.square(continuous_delta_z))),
+                "normalized_action_delta_mse": float(
+                    np.mean(np.square(continuous_delta_action))
+                ),
+                "flattened_cosine": _cosine(
+                    continuous_delta_z.reshape(-1),
+                    continuous_delta_action.reshape(-1),
+                ),
+                "flattened_pearson": _pearson(
+                    continuous_delta_z.reshape(-1),
+                    continuous_delta_action.reshape(-1),
+                ),
+                "delta_z_l2": _summary(np.linalg.norm(continuous_delta_z, axis=1)),
+                "normalized_action_delta_l2": _summary(
+                    np.linalg.norm(continuous_delta_action, axis=1)
+                ),
+                "raw_action_delta_l2": _summary(
+                    np.linalg.norm(raw_delta_action[:, :6], axis=1)
+                ),
+            },
+            "gripper": {
+                "state_threshold": 0.0,
+                "clean": action_clean[:, 6].tolist(),
+                "adv": action_adv[:, 6].tolist(),
+                "clean_state": (action_clean[:, 6] >= 0).astype(int).tolist(),
+                "adv_state": (action_adv[:, 6] >= 0).astype(int).tolist(),
+                "flip": ((action_clean[:, 6] >= 0) != (action_adv[:, 6] >= 0)).tolist(),
+                "flip_count": int(
+                    np.sum((action_clean[:, 6] >= 0) != (action_adv[:, 6] >= 0))
+                ),
+            },
         },
         "per_dimension": per_dimension,
         "arrays": {

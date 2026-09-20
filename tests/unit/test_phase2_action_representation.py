@@ -18,6 +18,7 @@ from phase2_action_representation import (  # noqa: E402
     extract_openvla_action_representation,
     extract_pi05_action_representation,
     midpoint_layer_index,
+    pi05_p2_identity_metrics,
 )
 
 
@@ -149,12 +150,34 @@ def test_pi05_capture_uses_first_projector_slot_and_midpoint_prefix() -> None:
         noise=np.zeros((10, 32), dtype=np.float32),
     )
     assert result.projected.shape == (1, 256, 2048)
-    assert result.projected[0, 0, 0].item() == pytest.approx(1 / np.sqrt(2048))
+    assert result.projected[0, 0, 0].item() == pytest.approx(1.0)
     assert result.deep.shape == (1, 256, 2048)
     assert torch.all(result.deep == 9)
     assert result.deep_identity.total_layers == 18
     assert result.deep_identity.zero_based_layer_index == 8
     assert np.array_equal(result.deployed_action, np.arange(7, dtype=np.float32))
+
+
+def test_pi05_p2_identity_has_no_manual_sqrt_scaling() -> None:
+    authoritative = torch.randn(1, 256, 2048, dtype=torch.bfloat16)
+    result = pi05_p2_identity_metrics(
+        extractor=authoritative.clone(),
+        embed_image=authoritative.clone(),
+        prefix=authoritative.clone(),
+    )
+
+    assert result["identity_pass"] is True
+    assert result["manual_scaling"] == "none"
+    assert result["l2_norm"]["phase2_extractor"] == pytest.approx(
+        result["l2_norm"]["direct_embed_image"]
+    )
+
+    with pytest.raises(ActionRepresentationError, match="identity mismatch"):
+        pi05_p2_identity_metrics(
+            extractor=authoritative / np.sqrt(2048),
+            embed_image=authoritative,
+            prefix=authoritative,
+        )
 
 
 def test_pi05_deep_capture_owns_storage_across_repeated_inference() -> None:

@@ -24,17 +24,35 @@ from phase2_native_gradient_ensemble import (
 )
 from phase2_shared_gradient import O2_SHAPE, P2_SHAPE, _validate_finite_feature
 from phase2_shared_optimization import sign_pgd_update, validate_texture_budget
+from phase2_action_representation import pi05_p2_identity_metrics
 
 
 ACTION_NAMES = ("x", "y", "z", "rot_x", "rot_y", "rot_z", "gripper")
 ACTION_DIMENSION = 7
 DIRECTION_EPS = 1e-8
 CALIBRATION_EPS = 1e-12
-PHASE2B_SCHEMA = "phase2b_primary_action_probes_v1"
+PHASE2B_SCHEMA = "phase2b_primary_action_probes_v2"
 
 
 class ActionPredictiveObjectiveError(RuntimeError):
     """Raised at the first invalid Phase 3 objective stage."""
+
+
+def validate_pi05_probe_runtime_identity(
+    authoritative_p2: torch.Tensor, runtime_p2: torch.Tensor
+) -> dict[str, Any]:
+    """Gate Phase 3 on corrected probe/runtime PI0.5 P2 identity."""
+
+    try:
+        return pi05_p2_identity_metrics(
+            extractor=authoritative_p2,
+            embed_image=runtime_p2,
+            prefix=authoritative_p2,
+        )
+    except Exception as error:
+        raise ActionPredictiveObjectiveError(
+            "Phase 3 PI0.5 probe/runtime P2 identity mismatch"
+        ) from error
 
 
 def _sha256(path: Path) -> str:
@@ -183,6 +201,20 @@ def load_frozen_primary_probes(
         or metadata.get("split_rule") != "pilot-v0.2-c5-split-v1"
     ):
         raise ActionPredictiveObjectiveError("invalid Phase 2B primary metadata")
+    pi05_projected = (
+        metadata.get("models", {})
+        .get("pi05", {})
+        .get("representation_nodes", {})
+        .get("projected", {})
+    )
+    if (
+        pi05_projected.get("definition_id")
+        != "pi05_p2_embed_image_no_manual_scaling_v2"
+        or metadata.get("provenance", {}).get("openvla_W_unchanged") is not True
+    ):
+        raise ActionPredictiveObjectiveError(
+            "Phase 2B PI0.5 P2 is not runtime-identity-corrected"
+        )
     expected_probe = {
         "architecture": "Linear(D,7,bias=False)",
         "learning_rate": 1e-3,

@@ -25,6 +25,7 @@ from phase3_action_predictive_objective import (  # noqa: E402
     action_predictive_losses,
     calibrate_lambda_dir,
     load_frozen_primary_probes,
+    validate_pi05_probe_runtime_identity,
     train_action_predictive_gradient_ensemble,
 )
 
@@ -61,6 +62,16 @@ def _probe_artifact(tmp_path: Path) -> Path:
             "action_std_epsilon": 1e-6,
             "probe_reg": 1e-4,
         },
+        "models": {
+            "pi05": {
+                "representation_nodes": {
+                    "projected": {
+                        "definition_id": "pi05_p2_embed_image_no_manual_scaling_v2"
+                    }
+                }
+            }
+        },
+        "provenance": {"openvla_W_unchanged": True},
     }
     (root / "metadata.json").write_text(json.dumps(metadata))
     inventory = {
@@ -83,6 +94,19 @@ def test_primary_probe_artifact_loads_with_hash_validation(tmp_path: Path) -> No
     (root / "openvla/o2/metrics.json").write_text('{"changed": true}\n')
     with pytest.raises(phase3.ActionPredictiveObjectiveError, match="hash mismatch"):
         load_frozen_primary_probes(root, openvla_device="cpu", pi05_device="cpu")
+
+
+def test_pi05_probe_runtime_identity_rejects_fixed_scaling() -> None:
+    authoritative = torch.randn(1, 256, 2048, dtype=torch.bfloat16)
+    result = validate_pi05_probe_runtime_identity(authoritative, authoritative.clone())
+    assert result["identity_pass"] is True
+
+    with pytest.raises(
+        phase3.ActionPredictiveObjectiveError, match="probe/runtime P2 identity"
+    ):
+        validate_pi05_probe_runtime_identity(
+            authoritative, authoritative * np.sqrt(2048)
+        )
 
 
 def test_phase3_wrapper_fixes_objective(monkeypatch: pytest.MonkeyPatch) -> None:

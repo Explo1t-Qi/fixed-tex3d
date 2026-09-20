@@ -256,3 +256,29 @@ def test_runner_writes_fresh_outputs_without_modifying_sources(
     assert tree_hashes(phase2a) == sources_before["phase2a"]
     assert tree_hashes(openvla_root) == sources_before["openvla"]
     assert tree_hashes(pi05_root) == sources_before["pi05"]
+
+    metadata["selected_nodes"] = ["pi05/p2"]
+    (phase2a / "metadata.json").write_text(
+        __import__("json").dumps(metadata), encoding="utf-8"
+    )
+    corrected_output = tmp_path / "corrected-p2-stability"
+    corrected = runner._run(
+        SimpleNamespace(
+            phase2a_dir=phase2a,
+            openvla_manifest=openvla_manifest,
+            pi05_manifest=pi05_manifest,
+            output_dir=corrected_output,
+            report_path=None,
+            seeds=[1, 2, 3, 4, 5, 7],
+            nodes=["pi05/p2"],
+        )
+    )
+    assert corrected["status"] in {
+        "CORRECTED_P2_STABLE",
+        "CORRECTED_P2_NEEDS_REVIEW",
+    }
+    corrected_summary = __import__("json").loads(
+        (corrected_output / "summary.json").read_text(encoding="utf-8")
+    )
+    assert corrected_summary["selected_nodes"] == ["pi05/p2"]
+    assert set(corrected_summary["nodes"]) == {"pi05/p2"}

@@ -54,6 +54,18 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _paired_pi05_noise(noise: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+    value = np.asarray(noise, dtype=np.float32)
+    if value.shape != (10, 32) or not np.all(np.isfinite(value)):
+        raise ValueError("PI0.5 diagnostic noise must be finite [10,32]")
+    clean = np.array(value, copy=True)
+    adversarial = np.array(value, copy=True)
+    if not np.array_equal(clean, adversarial):
+        raise RuntimeError("PI0.5 clean/adversarial noise pairing failed")
+    digest = hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+    return clean, adversarial, digest
+
+
 def _validate_paths(args: argparse.Namespace) -> dict[str, Path]:
     paths = {
         "texture": args.texture_param.expanduser().resolve(strict=True),
@@ -322,6 +334,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
             frame_id = f"task00-state{state_id:02d}-frame00"
             noise, noise_seed = _noise(protocol.seed, frame_id)
+            clean_noise, adv_noise, noise_hash = _paired_pi05_noise(noise)
 
             def pi_raw(base_rgb: np.ndarray) -> dict[str, Any]:
                 return {
@@ -335,7 +348,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 policy=pi05.policy,
                 model=pi05.model,
                 raw_observation=pi_raw(clean_rgb),
-                noise=noise.copy(),
+                noise=clean_noise,
             )
             with torch.no_grad():
                 z_p_clean = (
@@ -345,8 +358,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 policy=pi05.policy,
                 model=pi05.model,
                 raw_observation=pi_raw(adv_rgb),
-                noise=noise.copy(),
+                noise=adv_noise,
             )
+            if (
+                hashlib.sha256(np.ascontiguousarray(clean_noise).tobytes()).hexdigest()
+                != noise_hash
+                or hashlib.sha256(np.ascontiguousarray(adv_noise).tobytes()).hexdigest()
+                != noise_hash
+            ):
+                raise RuntimeError(
+                    "PI0.5 inference mutated the paired clean/adversarial noise"
+                )
             with torch.no_grad():
                 z_p_adv = (
                     probes.pi05(adv_pi.projected).detach().float().cpu().numpy()[0]
@@ -369,6 +391,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "frame_id": frame_id,
                     "state_id": state_id,
                     "pi05_noise_seed": noise_seed,
+                    "pi05_noise_sha256": noise_hash,
+                    "paired_pi05_noise": True,
                     "visible_pixel_counts": [
                         int(visibility[index].sum()) for index in range(len(poses))
                     ],
@@ -412,6 +436,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "pi05_noise_contract": (
             "same deterministic sha256-derived [10,32] noise for clean/adv per frame"
         ),
+        "paired_pi05_noise": all(frame["paired_pi05_noise"] for frame in records),
         "texture_parameter_unchanged": True,
         "model_parameters_with_grad": {"openvla": 0, "pi05": 0},
         "frames": records,

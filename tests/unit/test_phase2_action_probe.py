@@ -123,6 +123,41 @@ def test_mean_predictor_is_zero_in_train_normalized_space() -> None:
     assert metrics["normalized"]["mse"] == pytest.approx(1.0, rel=1e-5)
 
 
+def test_corrected_pi05_manifest_requires_runtime_identity_contract(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "representation_manifest.json"
+    manifest = {
+        "schema_version": "phase2_action_representation_manifest_v2",
+        "status": "COMPLETE",
+        "model": "pi05",
+        "count": 200,
+        "records": [
+            {"sample_id": f"sample-{index}", "archive": "unused", "sha256": "x"}
+            for index in range(200)
+        ],
+        "representation_nodes": {
+            "projected": {
+                "definition_id": "pi05_p2_embed_image_no_manual_scaling_v2",
+                "capture_semantics": "current PI0Pytorch base-camera embed_image() output; no additional manual scaling",
+            }
+        },
+        "pi05_p2_identity": {"identity_pass": True},
+        "action_identity": {"pass": True},
+    }
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+
+    loaded = materializer._manifest(manifest_path, "pi05")
+    assert loaded["representation_nodes"]["projected"]["definition_id"].endswith(
+        "no_manual_scaling_v2"
+    )
+
+    manifest["pi05_p2_identity"]["identity_pass"] = False
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+    with pytest.raises(Exception, match="representation identity"):
+        materializer._manifest(manifest_path, "pi05")
+
+
 def test_materializer_writes_complete_reloadable_artifact_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

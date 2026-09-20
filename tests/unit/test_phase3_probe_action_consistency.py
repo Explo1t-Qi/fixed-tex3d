@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from scripts import phase3_probe_action_consistency as entrypoint
+
 
 ROBOT_ROOT = Path(__file__).resolve().parents[2] / "openvla/experiments/robot"
 sys.path.insert(0, str(ROBOT_ROOT))
@@ -58,6 +60,8 @@ def test_perfect_probe_predictions_and_aligned_displacements() -> None:
     assert displacement["delta_z_mse"] == pytest.approx(2.5)
     assert displacement["normalized_action_delta_mse"] == pytest.approx(2.5)
     assert displacement["raw_action_delta_l2"]["mean"] > 0
+    assert displacement["continuous_6d"]["flattened_cosine"] == pytest.approx(1.0)
+    assert displacement["gripper"]["flip_count"] == 0
 
 
 def test_train_statistics_normalize_actual_actions() -> None:
@@ -99,6 +103,17 @@ def test_zero_displacements_have_explicit_undefined_alignment() -> None:
     assert result["displacement"]["flattened_pearson"] is None
     assert result["displacement"]["per_sample_cosine"] == [None, None]
     assert result["displacement"]["per_sample_cosine_defined_count"] == 0
+
+
+def test_pi05_noise_pair_is_exact_and_independently_owned() -> None:
+    noise = np.arange(320, dtype=np.float32).reshape(10, 32)
+    clean, adversarial, digest = entrypoint._paired_pi05_noise(noise)
+
+    assert np.array_equal(clean, adversarial)
+    assert clean is not adversarial
+    assert len(digest) == 64
+    clean[0, 0] = -1
+    assert adversarial[0, 0] == 0
 
 
 @pytest.mark.parametrize(

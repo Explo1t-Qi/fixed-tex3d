@@ -202,6 +202,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         Pi05BaseImageAdapter,
         extract_pi05_p2_autograd,
     )
+    from phase2_action_representation import (
+        extract_pi05_action_representation,
+    )
     from phase2_native_gradient_ensemble import (
         DualVLANativeFeatureAdapter,
         NativeTrainingFrame,
@@ -220,6 +223,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         calibrate_lambda_dir,
         load_frozen_primary_probes,
         train_action_predictive_gradient_ensemble,
+        validate_pi05_probe_runtime_identity,
     )
     from phase2_shared_optimization import (
         FrozenCleanReference,
@@ -456,6 +460,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     ] = []
     frame_contract = []
     calibration_count = 0
+    phase3_pi05_p2_identity = None
     for state_id in range(protocol.num_train_init_states):
         env, task_description = get_libero_env(task, "openvla", resolution=512)
         try:
@@ -473,15 +478,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             wrist_rgb = np.ascontiguousarray(
                 observation["robot0_eye_in_hand_image"][::-1, ::-1]
             )
+            pi05_policy_input = {
+                "observation/image": _client_image(clean_rgb, image_tools),
+                "observation/wrist_image": _client_image(wrist_rgb, image_tools),
+                "observation/state": _robot_state(observation),
+                "prompt": str(task_description),
+            }
             pi_inputs = Pi05BaseImageAdapter(
                 policy=pi05.policy,
                 observation_type=pi05.observation_type,
-                policy_input={
-                    "observation/image": _client_image(clean_rgb, image_tools),
-                    "observation/wrist_image": _client_image(wrist_rgb, image_tools),
-                    "observation/state": _robot_state(observation),
-                    "prompt": str(task_description),
-                },
+                policy_input=pi05_policy_input,
                 device=pi05_device,
             )
 
@@ -547,6 +553,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     probes=frozen_probes,
                 )
                 clean = pipeline.clean_reference(clean_image)
+                if state_id == 0:
+                    authoritative = extract_pi05_action_representation(
+                        policy=pi05.policy,
+                        model=pi05.model,
+                        raw_observation=pi05_policy_input,
+                        noise=np.zeros((10, 32), dtype=np.float32),
+                    )
+                    phase3_pi05_p2_identity = validate_pi05_probe_runtime_identity(
+                        authoritative.projected,
+                        clean.p2,
+                    )
                 frame_type = ActionPredictiveTrainingFrame
                 clean_reference_space = "native_o2_p2_action_predictive_coordinates"
             poses = find_target_body_poses(
@@ -616,6 +633,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             "frozen frame-pool/calibration contract was not materialized"
         )
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        if phase3_pi05_p2_identity is None:
+            raise RuntimeError("Phase 3 PI0.5 P2 runtime identity was not checked")
+        config["action_predictive_gradient_ensemble"]["pi05_p2_runtime_identity"] = (
+            phase3_pi05_p2_identity
+        )
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
     (output / "frame_contract.json").write_text(
         json.dumps(frame_contract, indent=2, sort_keys=True) + "\n"
     )

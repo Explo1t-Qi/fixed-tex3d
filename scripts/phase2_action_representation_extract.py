@@ -23,6 +23,8 @@ ROBOT_ROOT = PROJECT_ROOT / "openvla/experiments/robot"
 OPENVLA_ROOT = PROJECT_ROOT / "openvla"
 UNNORM_KEY = "libero_spatial_no_noops"
 PI05_CONFIG = "pi05_libero"
+CORRECTED_PI05_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v2"
+CORRECTED_PI05_MATERIALIZATION_ID = "pi05_p2_runtime_identity_v2"
 
 
 def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -35,6 +37,14 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--openpi-root", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--reference-action-manifest",
+        type=Path,
+        help=(
+            "Historical PI0.5 representation manifest used only to verify that "
+            "the corrected extraction preserves all deployed action targets."
+        ),
+    )
     parser.add_argument(
         "--max-observations",
         type=int,
@@ -118,6 +128,31 @@ def _save_archive(
         )
 
 
+def _reference_actions(path: Path) -> tuple[list[str], dict[str, np.ndarray]]:
+    manifest_path = path.expanduser().resolve(strict=True)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = manifest.get("records", [])
+    if manifest.get("model") != "pi05" or len(records) != 200:
+        raise RuntimeError("reference action manifest must contain 200 PI0.5 records")
+    order: list[str] = []
+    actions: dict[str, np.ndarray] = {}
+    for record in records:
+        archive_path = (manifest_path.parent / record["archive"]).resolve(strict=True)
+        if _sha(archive_path) != record["sha256"]:
+            raise RuntimeError(f"reference archive hash mismatch: {archive_path}")
+        with np.load(archive_path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata_json"].item()))
+            sample_id = str(metadata["sample_id"])
+            action = np.asarray(archive["action"], dtype=np.float32)
+        if sample_id != record["sample_id"] or action.shape != (7,):
+            raise RuntimeError(f"reference action identity mismatch: {archive_path}")
+        if sample_id in actions or not np.all(np.isfinite(action)):
+            raise RuntimeError("reference actions must be unique and finite")
+        order.append(sample_id)
+        actions[sample_id] = action
+    return order, actions
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.seed < 0:
         raise ValueError("seed must be non-negative")
@@ -129,6 +164,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise FileExistsError(f"output directory must be fresh: {output}")
     if args.model == "pi05" and args.openpi_root is None:
         raise ValueError("--openpi-root is required for PI0.5 extraction")
+    if (
+        args.model == "pi05"
+        and args.max_observations == 200
+        and args.reference_action_manifest is None
+    ):
+        raise ValueError(
+            "formal corrected PI0.5 extraction requires --reference-action-manifest"
+        )
     if args.openpi_root is not None:
         args.openpi_root = args.openpi_root.expanduser().resolve(strict=True)
     _source_paths(args)
@@ -144,8 +187,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     spec.loader.exec_module(common)
     from shared_feature import PilotObservation
     from phase2_action_representation import (
+        PI05_P2_DEFINITION_ID,
         extract_openvla_action_representation,
         extract_pi05_action_representation,
+        pi05_p2_identity_metrics,
     )
 
     source = common.load_source_collection(manifest_path)
@@ -206,14 +251,15 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         model_identity = "openvla/openvla-7b-finetuned-libero-spatial"
         noise_contract = None
     else:
+        from phase2_shared_gradient import Pi05BaseImageAdapter
         from phase2_shared_gradient_smoke import _load_pi05
         import shared_feature.pi05_features as pi_features
 
         pi05 = _load_pi05(args.openpi_root, checkpoint, device)
         runtime = pi_features._load_openpi_runtime()
 
-        def extract(observation: Any, sample_id: str) -> Any:
-            raw = {
+        def pi05_raw(observation: Any) -> dict[str, Any]:
+            return {
                 "observation/image": pi_features._preprocess_client_image(
                     observation.base_rgb_raw, runtime
                 ),
@@ -223,6 +269,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "observation/state": observation.state.copy(),
                 "prompt": observation.prompt,
             }
+
+        def extract(observation: Any, sample_id: str) -> Any:
+            raw = pi05_raw(observation)
             noise, _ = _noise(args.seed, sample_id)
             return extract_pi05_action_representation(
                 policy=pi05.policy,
@@ -242,6 +291,33 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
     first = extract(first_observation, first_observation.sample_id)
     repeated = extract(first_observation, first_observation.sample_id)
+    p2_identity = None
+    if args.model == "pi05":
+        adapter = Pi05BaseImageAdapter(
+            policy=pi05.policy,
+            observation_type=pi05.observation_type,
+            policy_input=pi05_raw(first_observation),
+            device=device,
+        )
+        with torch.inference_mode():
+            prepared = pi05.model._preprocess_observation(
+                adapter.clean_observation, train=False
+            )
+            if not isinstance(prepared, tuple) or len(prepared) != 5:
+                raise RuntimeError("PI0Pytorch preprocessing contract changed")
+            images, image_masks, language, language_masks, _ = prepared
+            # torch.compile/CUDA Graph paths may reuse static output buffers.
+            # Own each witness before the next model call can overwrite it.
+            direct_p2 = pi05.model.paligemma_with_expert.embed_image(images[0]).clone()
+            prefix, _, _ = pi05.model.embed_prefix(
+                images, image_masks, language, language_masks
+            )
+            prefix_p2 = prefix[:, :256].clone()
+        p2_identity = pi05_p2_identity_metrics(
+            extractor=first.projected,
+            embed_image=direct_p2,
+            prefix=prefix_p2,
+        )
     expected_layers = 32 if args.model == "openvla" else 18
     if first.deep_identity.total_layers != expected_layers:
         raise RuntimeError(
@@ -267,12 +343,42 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise RuntimeError(f"repeat-forward determinism check failed: {determinism}")
 
+    reference_order: list[str] | None = None
+    reference_actions: dict[str, np.ndarray] | None = None
+    if args.reference_action_manifest is not None:
+        if args.model != "pi05":
+            raise ValueError("reference action comparison is PI0.5-only")
+        reference_order, reference_actions = _reference_actions(
+            args.reference_action_manifest
+        )
+        source_order = [record.sample_id for record in source.records]
+        if reference_order != source_order:
+            raise RuntimeError(
+                "reference action manifest sample ordering differs from collection"
+            )
+
     records: list[dict[str, Any]] = []
     node_identity = None
     selected_records = source.records[: args.max_observations]
+    action_differences: list[float] = []
     for index, record in enumerate(selected_records):
         observation = PilotObservation.load(record.resolved_observation_path)
         result = first if index == 0 else extract(observation, observation.sample_id)
+        if reference_actions is not None:
+            difference = float(
+                np.max(
+                    np.abs(
+                        result.deployed_action
+                        - reference_actions[observation.sample_id]
+                    )
+                )
+            )
+            action_differences.append(difference)
+            if difference > 1e-6:
+                raise RuntimeError(
+                    "corrected extraction changed action target for "
+                    f"{observation.sample_id}: {difference}"
+                )
         identity = result.deep_identity.__dict__
         if node_identity is None:
             node_identity = identity
@@ -283,7 +389,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         archive_path = features_dir / f"{observation.sample_id}.npz"
         _, noise_seed = _noise(args.seed, observation.sample_id)
         metadata = {
-            "schema_version": "phase2_action_representation_archive_v1",
+            "schema_version": (
+                "phase2_action_representation_archive_v2"
+                if args.model == "pi05"
+                else "phase2_action_representation_archive_v1"
+            ),
             "sample_id": observation.sample_id,
             "task_id": int(observation.task_id),
             "initial_state_id": observation.initial_state_id,
@@ -297,6 +407,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 else "current deployed PI0.5 action chunk first step, 7-D"
             ),
             "pi05_noise_seed": noise_seed if args.model == "pi05" else None,
+            "representation_definition_id": (
+                PI05_P2_DEFINITION_ID if args.model == "pi05" else None
+            ),
         }
         _save_archive(
             archive_path,
@@ -323,7 +436,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     manifest = {
-        "schema_version": "phase2_action_representation_manifest_v1",
+        "schema_version": (
+            CORRECTED_PI05_MANIFEST_SCHEMA
+            if args.model == "pi05"
+            else "phase2_action_representation_manifest_v1"
+        ),
+        "materialization_id": (
+            CORRECTED_PI05_MATERIALIZATION_ID if args.model == "pi05" else None
+        ),
         "status": "COMPLETE" if args.max_observations == 200 else "SMOKE_COMPLETE",
         "run_kind": "formal" if args.max_observations == 200 else "smoke",
         "model": args.model,
@@ -347,7 +467,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "capture_semantics": (
                     "multimodal projector output"
                     if args.model == "openvla"
-                    else "multimodal projector output divided by sqrt(PaliGemma hidden_size), matching embed_image"
+                    else "current PI0Pytorch base-camera embed_image() output; no additional manual scaling"
+                ),
+                "definition_id": (
+                    PI05_P2_DEFINITION_ID if args.model == "pi05" else None
                 ),
             },
             "deep": {
@@ -366,6 +489,23 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             else "first 7-D deployed action from the current PI0.5 action chunk"
         ),
         "pi05_noise_contract": noise_contract,
+        "pi05_p2_identity": p2_identity,
+        "action_identity": (
+            {
+                "reference_manifest": str(
+                    args.reference_action_manifest.expanduser().resolve(strict=True)
+                ),
+                "reference_manifest_sha256": _sha(
+                    args.reference_action_manifest.expanduser().resolve(strict=True)
+                ),
+                "compared_observations": len(action_differences),
+                "max_abs_action_difference": max(action_differences, default=0.0),
+                "tolerance": 1e-6,
+                "pass": bool(action_differences) and max(action_differences) <= 1e-6,
+            }
+            if reference_actions is not None
+            else None
+        ),
         "determinism": determinism,
         "probe_isolation": {
             "extraction_context": "torch.inference_mode",
