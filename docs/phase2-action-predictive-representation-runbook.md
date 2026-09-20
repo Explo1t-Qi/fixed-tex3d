@@ -2,13 +2,15 @@
 
 This stage measures whether model-specific deployed 7-D actions are linearly readable from four frozen representation nodes. It does not test causal action relevance, texture effectiveness, policy degradation, or transferability.
 
+> **PI0.5 P2 identity correction (2026-09-20).** The historical Phase 2A PI0.5 extractor divided the projector hook output by `sqrt(2048)` even though the current PI0Pytorch `embed_image()` returns `get_image_features()` directly. Historical PI0.5 P2 probe/stability artifacts and `phase2b-primary-action-probes-v2` are preserved for provenance but are superseded and invalid as Phase 3 runtime inputs. The corrected v2 representation manifest requires exact extractor/direct-`embed_image`/prefix identity and no manual scaling.
+
 ## Frozen representation contract
 
 | Model | Node | Definition | Shape per observation |
 |---|---|---|---:|
 | OpenVLA | O2 | Multimodal projector output before Llama | `[256,4096]` |
 | OpenVLA | O-deep | Output of the last block in the first half of the 32-layer Llama tower; zero-based layer 15; visual slice `[1:257]` | `[256,4096]` |
-| PI0.5 | P2 | `base_0_rgb` PaliGemma-ready projected visual tokens, including the official post-projector `1/sqrt(hidden_size)` scaling | `[256,2048]` |
+| PI0.5 | P2 | Current PI0Pytorch `paligemma_with_expert.embed_image(base_0_rgb)` output; no additional manual scaling | `[256,2048]` |
 | PI0.5 | P-deep | Output of the last block in the first half of the 18-layer PaliGemma prefix tower; zero-based layer 8; base-camera slice `[0:256]` | `[256,2048]` |
 
 The runtime derives the midpoint from the actual decoder depth and also checks the expected authoritative depths of 32 and 18. O2/O-deep are captured during one OpenVLA action generation. P2/P-deep are captured during one PI0Pytorch action inference.
@@ -72,7 +74,7 @@ No action dimension is near-constant overall or within a task. Probe optimizatio
 
 A subsequent CPU-only diagnostic refitted every node from seeds 1, 2, 3, 4, 5, and 7 under the unchanged protocol. O2, O-deep, and P2 predictions were stable, while P-deep held-out MSE had coefficient of variation `0.1139`. P2 produced a stable row space; O2 narrowly missed the projection-distance threshold; O-deep and P-deep produced materially initialization-dependent subspaces. The diagnostic status remains `NEEDS_REVIEW`; full results are recorded in `docs/phase2-action-probe-stability-report.md`.
 
-Phase 3 subsequently made an explicit primary-node decision: freeze the exact seed-7 O2/P2 probes under the unchanged protocol, retain the O2 projection-distance caveat, and leave both deeper nodes outside the primary texture objective. The Phase 2B promotion validates and copies only O2/P2 into `phase2b-primary-action-probes-v2`; it does not relabel the complete four-node stability diagnostic as `STABLE`.
+Phase 3 subsequently made an explicit primary-node decision: freeze the exact seed-7 O2/P2 probes under the unchanged protocol, retain the O2 projection-distance caveat, and leave both deeper nodes outside the primary texture objective. That historical promotion created `phase2b-primary-action-probes-v2`. Its OpenVLA O2 artifact remains valid; its PI0.5 P2 artifact is superseded by the identity correction above. A new v3 authority may be frozen only after corrected P2 extraction, unchanged-action validation, refitting, and six-seed stability pass.
 
 ## Server-only validation boundary
 

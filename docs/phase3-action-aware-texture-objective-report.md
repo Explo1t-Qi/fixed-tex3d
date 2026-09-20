@@ -2,7 +2,9 @@
 
 ## Status
 
-**IMPLEMENTATION_COMPLETE; authoritative CUDA smoke and source pilot pending.**
+**BLOCKED pending corrected PI0.5 P2 artifacts and repeated CUDA smoke.**
+
+The first 1-step/10-step smoke used a PI0.5 probe fitted on `P2 / sqrt(2048)` while the differentiable runtime supplied native `embed_image()` P2. Those smoke outputs and `phase2b-primary-action-probes-v2` are retained for provenance but are invalid for Phase 3 scientific interpretation. The corrected pipeline requires a new Phase 2B v3 artifact and an explicit clean-frame probe/runtime P2 identity gate before lambda calibration.
 
 This phase implements a source-model action-predictive texture objective. It does not establish held-out transfer, causal action relevance, decoded-action change, or policy degradation until the corresponding server runs are complete.
 
@@ -13,7 +15,7 @@ Phase 3 uses only the seed-7 primary projected nodes from the frozen Pilot v0.2 
 | Model | Node | Shape | Phase 2A held-out MSE | Frozen W SHA-256 |
 |---|---|---:|---:|---|
 | OpenVLA | O2 | `[256,4096]` | 0.619732 | `0377a285b180aaf80e7a038e6b036860389892b818368448c10966328eaed25c` |
-| PI0.5 | P2 | `[256,2048]` | 0.666358 | `ba2351f836bb8c58de28f7aa125b0f7b901c8b08bec2346c21ef2c9107200369` |
+| PI0.5 | P2 (historical, superseded) | `[256,2048]` | 0.666358 | `ba2351f836bb8c58de28f7aa125b0f7b901c8b08bec2346c21ef2c9107200369` |
 
 The Phase 2B promotion validates the original Phase 2A inventory, exact seed-7 probe configuration, split identity, stability provenance, and seed-7 weight equality before copying O2/P2 artifacts into a fresh authority directory. The Phase 2A source inventory was rehashed after promotion with zero mismatches.
 
@@ -32,7 +34,7 @@ probe_reg = 1e-4
 TRAIN / HELD-OUT = 160 / 40 observations
 ```
 
-The versioned local Phase 2B artifact is:
+The superseded historical Phase 2B artifact is:
 
 ```text
 experiment_inbox/shared-feature-phase3/phase2b-primary-action-probes-v2/

@@ -6,6 +6,8 @@ This experiment evaluates action predictability only. It does not establish caus
 
 This document records the Phase 2A dataset-sufficiency experiment. Its artifacts are candidates pending Phase 2B formal materialization; they are not yet authoritative Phase 3 inputs.
 
+> **Superseded PI0.5 P2 result.** The PI0.5 P2 rows below are historical evidence fitted from a representation that was inadvertently divided by `sqrt(2048)`. The fixed scalar does not remove representation information, but the artifact does not match the current native/runtime P2 and must not be used by Phase 3. OpenVLA rows and PI0.5 P-deep are unaffected. Corrected P2 results will be published as a new materialization rather than overwriting this report.
+
 Phase 2A result: `COMPLETE — Case A`. The existing 200-observation dataset has adequate action coverage and all four candidate representations show non-trivial held-out linear predictability. Dataset densification is not required before Phase 2B.
 
 ## 2. Dataset and split
@@ -43,7 +45,7 @@ Full mean, standard deviation, extrema, percentiles, near-zero fractions, task b
 |---|---|---|---:|
 | OpenVLA | O2 | Multimodal projector output before Llama | `[256,4096]` |
 | OpenVLA | O-deep | `language_model.model.layers[15]` output after the first 16 of 32 blocks; visual slice `[:,1:257,:]` | `[256,4096]` |
-| PI0.5 | P2 | Base-camera PaliGemma projector output with official `1/sqrt(hidden_size)` scaling | `[256,2048]` |
+| PI0.5 | P2 (historical, superseded) | Base-camera projector output incorrectly divided by `sqrt(2048)`; retained only for provenance | `[256,2048]` |
 | PI0.5 | P-deep | `paligemma_with_expert.paligemma.language_model.layers[8]` output after the first 9 of 18 prefix blocks; base-camera slice `[:,0:256,:]` | `[256,2048]` |
 
 The OpenVLA and PI0.5 repeat-forward checks produced maximum absolute differences of `0.0` for the projected node, deeper node, and decoded action. Extraction used `torch.inference_mode()` and populated no VLA parameter gradients.
