@@ -15,6 +15,7 @@ ROBOT_ROOT = Path(__file__).resolve().parents[2] / "openvla/experiments/robot"
 sys.path.insert(0, str(ROBOT_ROOT))
 
 from phase2_action_probe import (  # noqa: E402
+    EXPANDED_PROBE_SCHEMA_VERSION,
     PROBE_SCHEMA_VERSION,
     ActionProbeError,
     ProbeConfig,
@@ -282,3 +283,122 @@ def test_runner_writes_fresh_outputs_without_modifying_sources(
     )
     assert corrected_summary["selected_nodes"] == ["pi05/p2"]
     assert set(corrected_summary["nodes"]) == {"pi05/p2"}
+
+
+def test_stability_runner_accepts_expanded_group_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase2a = tmp_path / "phase2a-expanded"
+    openvla_root = tmp_path / "expanded" / "openvla"
+    pi05_root = tmp_path / "expanded" / "pi05"
+    for directory in (phase2a, openvla_root, pi05_root):
+        directory.mkdir(parents=True)
+    openvla_manifest = openvla_root / "representation_manifest.json"
+    pi05_manifest = pi05_root / "representation_manifest.json"
+    openvla_manifest.write_text("{}", encoding="utf-8")
+    pi05_manifest.write_text("{}", encoding="utf-8")
+
+    progress = (0.10, 0.25, 0.40, 0.55, 0.70, 0.90)
+    samples = [
+        SampleIdentity(
+            sample_id=f"t{task}-s{state}-p{index}",
+            task_id=task,
+            initial_state_id=state,
+            target_progress=value,
+        )
+        for task in range(10)
+        for state in range(2 + task % 2)
+        for index, value in enumerate(progress)
+    ]
+    split = build_group_split(samples, rule_id="pilot-v0.3-expanded-split-v1")
+    rng = np.random.default_rng(73)
+    features = {
+        "projected": rng.normal(size=(len(samples), 8)).astype(np.float32),
+        "deep": rng.normal(size=(len(samples), 8)).astype(np.float32),
+    }
+    actions = rng.normal(size=(len(samples), 7)).astype(np.float32)
+    train_index = np.asarray(
+        [
+            index
+            for index, sample in enumerate(samples)
+            if sample.sample_id in split["train_sample_ids"]
+        ]
+    )
+    stats = training_action_statistics(actions[train_index], epsilon=1e-6)
+    config = ProbeConfig(
+        seed=7,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        steps=2,
+        action_std_epsilon=1e-6,
+        probe_reg=1e-4,
+    )
+    monkeypatch.setattr(runner, "FROZEN_CONFIG", config)
+    metadata = {
+        "schema_version": EXPANDED_PROBE_SCHEMA_VERSION,
+        "stage": "phase2a",
+        "status": "PHASE_2A_COMPLETE",
+        "selected_nodes": ["openvla/o2", "pi05/p2"],
+        "dataset": {
+            "materialization": "Pilot v0.3 expanded manifest-driven collection",
+            "observation_count": len(samples),
+            "trajectory_group_count": 25,
+        },
+        "probe": {
+            "learning_rate": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "steps": config.steps,
+            "action_std_epsilon": config.action_std_epsilon,
+            "probe_reg": config.probe_reg,
+        },
+        "models": {
+            "openvla": {
+                "representation_manifest_sha256": sha256_file(openvla_manifest)
+            },
+            "pi05": {"representation_manifest_sha256": sha256_file(pi05_manifest)},
+        },
+    }
+    (phase2a / "metadata.json").write_text(
+        __import__("json").dumps(metadata), encoding="utf-8"
+    )
+    (phase2a / "split.json").write_text(
+        __import__("json").dumps(split), encoding="utf-8"
+    )
+    node_dir = phase2a / "pi05" / "p2"
+    node_dir.mkdir(parents=True)
+    np.savez(node_dir / "action_stats.npz", **stats)
+    torch.save(torch.zeros(7, 8), node_dir / "W.pt")
+
+    monkeypatch.setattr(
+        runner.materializer,
+        "_manifest",
+        lambda path, model: {"_path": path, "model": model},
+    )
+    monkeypatch.setattr(
+        runner.materializer,
+        "_load_model_data",
+        lambda _manifest, _model: (samples, features, actions),
+    )
+    monkeypatch.setattr(runner, "_head", lambda: "fixture-expanded")
+    output = tmp_path / "expanded-stability"
+    result = runner._run(
+        SimpleNamespace(
+            phase2a_dir=phase2a,
+            openvla_manifest=openvla_manifest,
+            pi05_manifest=pi05_manifest,
+            output_dir=output,
+            report_path=None,
+            seeds=[1, 2, 3, 4, 5, 7],
+            nodes=["pi05/p2"],
+        )
+    )
+    assert result["status"] in {
+        "CORRECTED_P2_STABLE",
+        "CORRECTED_P2_NEEDS_REVIEW",
+    }
+    summary = __import__("json").loads(
+        (output / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["train_observations"] == 15 * 6
+    assert summary["heldout_observations"] == 10 * 6
+    assert summary["nodes"]["pi05/p2"]["feature_matrix"]["rank"] == 8

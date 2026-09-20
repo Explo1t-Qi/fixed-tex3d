@@ -20,6 +20,7 @@ from phase2_action_probe import (  # noqa: E402
     SampleIdentity,
     action_distribution_audit,
     build_group_split,
+    feature_matrix_diagnostics,
     fit_linear_probe,
     materialize_action_projection,
     mean_pool_features,
@@ -53,6 +54,51 @@ def test_group_split_is_disjoint_balanced_and_deterministic() -> None:
     assert len(first["heldout_sample_ids"]) == 40
     assert not set(first["train_sample_ids"]) & set(first["heldout_sample_ids"])
     assert {row["task_id"] for row in first["heldout_groups"]} == set(range(10))
+
+
+def test_expanded_split_is_group_aware_deterministic_and_variable_per_task() -> None:
+    progress = (0.10, 0.25, 0.40, 0.55, 0.70, 0.90)
+    samples = [
+        SampleIdentity(
+            sample_id=f"t{task}-s{state}-p{index}",
+            task_id=task,
+            initial_state_id=state,
+            target_progress=value,
+        )
+        for task in range(10)
+        for state in range(7 + task % 3)
+        for index, value in enumerate(progress)
+    ]
+    first = build_group_split(samples, rule_id="pilot-v0.3-expanded-split-v1")
+    second = build_group_split(samples, rule_id="pilot-v0.3-expanded-split-v1")
+    assert first == second
+    assert first["counts"]["heldout_groups_per_task"] == {
+        str(task): 1 for task in range(10)
+    }
+    train_groups = {
+        (row["task_id"], row["initial_state_id"]) for row in first["train_groups"]
+    }
+    heldout_groups = {
+        (row["task_id"], row["initial_state_id"]) for row in first["heldout_groups"]
+    }
+    assert train_groups.isdisjoint(heldout_groups)
+    assert not set(first["train_sample_ids"]) & set(first["heldout_sample_ids"])
+
+
+def test_split_rejects_duplicate_sample_and_group_progress_identity() -> None:
+    samples = [
+        SampleIdentity("duplicate", 0, 0, 0.1),
+        SampleIdentity("duplicate", 0, 1, 0.1),
+    ]
+    with pytest.raises(Exception, match="sample IDs"):
+        build_group_split(samples, rule_id="pilot-v0.3-expanded-split-v1")
+
+    samples = [
+        SampleIdentity("first", 0, 0, 0.1),
+        SampleIdentity("second", 0, 0, 0.1),
+    ]
+    with pytest.raises(Exception, match="task,state,progress"):
+        build_group_split(samples, rule_id="pilot-v0.3-expanded-split-v1")
 
 
 def test_action_audit_has_required_overall_task_progress_and_gripper_stats() -> None:
@@ -115,6 +161,17 @@ def test_ridge_projection_shape_symmetry_and_reported_residual() -> None:
     assert metrics["idempotence_residual_fro"] >= 0
 
 
+def test_feature_matrix_diagnostics_reports_rank_condition_and_null_fraction() -> None:
+    features = np.eye(4, 7, dtype=np.float32)
+    weight = torch.zeros(7, 7)
+    weight[:, 4:] = 1.0
+    diagnostics = feature_matrix_diagnostics(features, weight=weight)
+    assert diagnostics["rank"] == 4
+    assert diagnostics["nullspace_dimension"] == 3
+    assert diagnostics["effective_condition_number"] == pytest.approx(1.0)
+    assert diagnostics["probe_weight_nullspace_norm_fraction"] == pytest.approx(1.0)
+
+
 def test_mean_predictor_is_zero_in_train_normalized_space() -> None:
     rng = np.random.default_rng(3)
     actions = rng.normal(size=(20, 7)).astype(np.float32)
@@ -156,6 +213,44 @@ def test_corrected_pi05_manifest_requires_runtime_identity_contract(
     manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
     with pytest.raises(Exception, match="representation identity"):
         materializer._manifest(manifest_path, "pi05")
+
+
+def test_expanded_corrected_manifest_uses_manifest_driven_cardinality(
+    tmp_path: Path,
+) -> None:
+    count = 120
+    manifest_path = tmp_path / "representation_manifest.json"
+    manifest = {
+        "schema_version": "phase2_action_representation_manifest_v3",
+        "status": "COMPLETE",
+        "model": "pi05",
+        "count": count,
+        "records": [
+            {"sample_id": f"sample-{index}", "archive": "unused", "sha256": "x"}
+            for index in range(count)
+        ],
+        "dataset_protocol": {
+            "collection_schema_version": "pilot_v0_3_expanded_collection_v1",
+            "protocol_id": "pilot-v0.3-expanded-v1",
+            "split_rule_id": "pilot-v0.3-expanded-split-v1",
+            "observation_count": count,
+            "trajectory_group_count": 20,
+            "observations_per_group": 6,
+            "target_relative_progress": [0.1, 0.25, 0.4, 0.55, 0.7, 0.9],
+            "accepted_groups_per_task": {str(task_id): 2 for task_id in range(10)},
+        },
+        "representation_nodes": {
+            "projected": {
+                "definition_id": "pi05_p2_embed_image_no_manual_scaling_v2",
+                "capture_semantics": "current PI0Pytorch base-camera embed_image() output; no additional manual scaling",
+            }
+        },
+        "pi05_p2_identity": {"identity_pass": True},
+        "action_identity": {"pass": True},
+    }
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+    loaded = materializer._manifest(manifest_path, "pi05")
+    assert loaded["count"] == count
 
 
 def test_materializer_writes_complete_reloadable_artifact_tree(

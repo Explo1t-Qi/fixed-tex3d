@@ -268,7 +268,6 @@ def test_extraction_cli_separates_one_observation_smoke_from_formal() -> None:
         "--checkpoint",
         "/tmp/model",
     ]
-    assert entrypoint._args(common).max_observations == 200
+    assert entrypoint._args(common).max_observations is None
     assert entrypoint._args([*common, "--max-observations", "1"]).max_observations == 1
-    with pytest.raises(SystemExit):
-        entrypoint._args([*common, "--max-observations", "2"])
+    assert entrypoint._args([*common, "--max-observations", "2"]).max_observations == 2

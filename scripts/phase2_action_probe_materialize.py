@@ -20,12 +20,15 @@ ROBOT_ROOT = PROJECT_ROOT / "openvla/experiments/robot"
 ALL_NODE_KEYS = ("openvla/o2", "openvla/deep", "pi05/p2", "pi05/deep")
 CORRECTED_PI05_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v2"
 CORRECTED_PI05_DEFINITION_ID = "pi05_p2_embed_image_no_manual_scaling_v2"
+EXPANDED_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v3"
+EXPANDED_ARCHIVE_SCHEMA = "phase2_action_representation_archive_v3"
 if str(ROBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ROBOT_ROOT))
 
 from phase2_action_probe import (  # noqa: E402
     NODE_WIDTHS,
     PROBE_SCHEMA_VERSION,
+    EXPANDED_PROBE_SCHEMA_VERSION,
     ActionProbeError,
     ProbeConfig,
     SampleIdentity,
@@ -33,6 +36,7 @@ from phase2_action_probe import (  # noqa: E402
     atomic_json,
     build_group_split,
     config_dict,
+    feature_matrix_diagnostics,
     fit_linear_probe,
     materialize_action_projection,
     mean_pool_features,
@@ -91,18 +95,58 @@ def _manifest(path: Path, model: str) -> dict[str, Any]:
         not in {
             "phase2_action_representation_manifest_v1",
             CORRECTED_PI05_MANIFEST_SCHEMA,
+            EXPANDED_MANIFEST_SCHEMA,
         }
         or value.get("status") != "COMPLETE"
         or value.get("model") != model
-        or value.get("count") != 200
-        or len(value.get("records", [])) != 200
+        or type(value.get("count")) is not int
+        or value.get("count") <= 0
+        or len(value.get("records", [])) != value.get("count")
     ):
         raise ActionProbeError(f"invalid {model} representation manifest")
-    if value.get("schema_version") == CORRECTED_PI05_MANIFEST_SCHEMA:
+    schema = value["schema_version"]
+    if schema != EXPANDED_MANIFEST_SCHEMA and value.get("count") != 200:
+        raise ActionProbeError(f"legacy {model} manifest must contain 200 records")
+    if schema == EXPANDED_MANIFEST_SCHEMA:
+        protocol = value.get("dataset_protocol")
+        groups_per_task = (
+            protocol.get("accepted_groups_per_task")
+            if isinstance(protocol, dict)
+            else None
+        )
+        progress = (
+            protocol.get("target_relative_progress")
+            if isinstance(protocol, dict)
+            else None
+        )
+        if (
+            not isinstance(protocol, dict)
+            or not isinstance(groups_per_task, dict)
+            or set(groups_per_task) != {str(index) for index in range(10)}
+            or any(
+                type(count) is not int or count < 2
+                for count in groups_per_task.values()
+            )
+            or not isinstance(progress, list)
+            or len(set(progress)) != len(progress)
+            or protocol.get("collection_schema_version")
+            != "pilot_v0_3_expanded_collection_v1"
+            or protocol.get("protocol_id") != "pilot-v0.3-expanded-v1"
+            or protocol.get("split_rule_id") != "pilot-v0.3-expanded-split-v1"
+            or protocol.get("observation_count") != value.get("count")
+            or protocol.get("trajectory_group_count") != sum(groups_per_task.values())
+            or protocol.get("observations_per_group") != len(progress)
+            or value.get("count")
+            != sum(groups_per_task.values()) * protocol.get("observations_per_group", 0)
+        ):
+            raise ActionProbeError(f"invalid expanded {model} dataset protocol")
+    if (
+        schema in {CORRECTED_PI05_MANIFEST_SCHEMA, EXPANDED_MANIFEST_SCHEMA}
+        and model == "pi05"
+    ):
         projected = value.get("representation_nodes", {}).get("projected", {})
         if (
-            model != "pi05"
-            or projected.get("definition_id") != CORRECTED_PI05_DEFINITION_ID
+            projected.get("definition_id") != CORRECTED_PI05_DEFINITION_ID
             or projected.get("capture_semantics")
             != "current PI0Pytorch base-camera embed_image() output; no additional manual scaling"
             or value.get("pi05_p2_identity", {}).get("identity_pass") is not True
@@ -137,14 +181,42 @@ def _load_model_data(
                 or metadata["model"] != model
             ):
                 raise ActionProbeError(f"archive identity mismatch: {path}")
-            if manifest.get("schema_version") == CORRECTED_PI05_MANIFEST_SCHEMA and (
-                metadata.get("schema_version")
-                != "phase2_action_representation_archive_v2"
-                or metadata.get("representation_definition_id")
-                != CORRECTED_PI05_DEFINITION_ID
+            source_hash = metadata.get("source_observation_sha256")
+            if (
+                not isinstance(source_hash, str)
+                or not source_hash.startswith("sha256:")
+                or len(source_hash) != 71
+            ):
+                raise ActionProbeError(f"invalid source observation hash: {path}")
+            schema = manifest.get("schema_version")
+            expected_archive_schema = (
+                EXPANDED_ARCHIVE_SCHEMA
+                if schema == EXPANDED_MANIFEST_SCHEMA
+                else "phase2_action_representation_archive_v2"
+            )
+            if (
+                schema
+                in {
+                    CORRECTED_PI05_MANIFEST_SCHEMA,
+                    EXPANDED_MANIFEST_SCHEMA,
+                }
+                and model == "pi05"
+                and (
+                    metadata.get("schema_version") != expected_archive_schema
+                    or metadata.get("representation_definition_id")
+                    != CORRECTED_PI05_DEFINITION_ID
+                )
             ):
                 raise ActionProbeError(
                     f"corrected PI0.5 archive schema mismatch: {path}"
+                )
+            if (
+                schema == EXPANDED_MANIFEST_SCHEMA
+                and model == "openvla"
+                and metadata.get("schema_version") != EXPANDED_ARCHIVE_SCHEMA
+            ):
+                raise ActionProbeError(
+                    f"expanded OpenVLA archive schema mismatch: {path}"
                 )
             samples.append(
                 SampleIdentity(
@@ -152,6 +224,7 @@ def _load_model_data(
                     task_id=int(metadata["task_id"]),
                     initial_state_id=int(metadata["initial_state_id"]),
                     target_progress=float(metadata["target_progress"]),
+                    source_observation_sha256=source_hash,
                 )
             )
             for key, width in widths.items():
@@ -222,7 +295,33 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise ActionProbeError(
             "representation manifests use different source collections"
         )
-    split = build_group_split(identities)
+    dataset_protocol = manifests["openvla"].get("dataset_protocol")
+    if dataset_protocol != manifests["pi05"].get("dataset_protocol"):
+        raise ActionProbeError(
+            "representation manifests use different dataset protocols"
+        )
+    expanded_dataset = all(
+        manifest.get("schema_version") == EXPANDED_MANIFEST_SCHEMA
+        for manifest in manifests.values()
+    )
+    split_rule = (
+        dataset_protocol["split_rule_id"]
+        if dataset_protocol is not None
+        else "pilot-v0.2-c5-split-v1"
+    )
+    heldout_fraction = (
+        float(dataset_protocol["heldout_fraction_per_task"])
+        if dataset_protocol is not None
+        else 0.20
+    )
+    split = build_group_split(
+        identities,
+        rule_id=split_rule,
+        heldout_fraction_per_task=heldout_fraction,
+    )
+    probe_schema = (
+        EXPANDED_PROBE_SCHEMA_VERSION if expanded_dataset else PROBE_SCHEMA_VERSION
+    )
     sample_index = {sample.sample_id: index for index, sample in enumerate(identities)}
     train_index = np.asarray(
         [sample_index[value] for value in split["train_sample_ids"]]
@@ -282,11 +381,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 },
             }
             weight = probe.weight.detach().float().cpu()
+            matrix_diagnostics = feature_matrix_diagnostics(
+                features[key][train_index], weight=weight
+            )
+            metrics["feature_matrix"] = matrix_diagnostics
+            metrics["train_heldout_mse_gap_normalized"] = float(
+                metrics["heldout"]["normalized"]["mse"]
+                - metrics["train"]["normalized"]["mse"]
+            )
             projection, projection_metrics = materialize_action_projection(
                 weight, probe_reg=config.probe_reg
             )
             state = {
-                "schema_version": PROBE_SCHEMA_VERSION,
+                "schema_version": probe_schema,
                 "state_dict": {"weight": weight},
                 "input_dimension": int(weight.shape[1]),
                 "output_dimension": 7,
@@ -345,11 +452,24 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "heldout_mae_normalized": metrics["heldout"]["normalized"]["mae"],
                     "probe_reload_max_abs": reload_max_abs,
                     "rank_W": projection_metrics["rank_W"],
+                    "feature_matrix_rank": matrix_diagnostics["rank"],
+                    "feature_matrix_condition_number": matrix_diagnostics[
+                        "effective_condition_number"
+                    ],
+                    "feature_matrix_nullspace_dimension": matrix_diagnostics[
+                        "nullspace_dimension"
+                    ],
+                    "probe_weight_nullspace_norm_fraction": matrix_diagnostics[
+                        "probe_weight_nullspace_norm_fraction"
+                    ],
+                    "train_heldout_mse_gap_normalized": metrics[
+                        "train_heldout_mse_gap_normalized"
+                    ],
                 }
             )
 
     metadata = {
-        "schema_version": PROBE_SCHEMA_VERSION,
+        "schema_version": probe_schema,
         "status": "PHASE_2A_COMPLETE"
         if args.stage == "phase2a"
         else "PHASE_2_COMPLETE",
@@ -363,18 +483,36 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "selected_nodes": list(selected_nodes),
         "code_commit": _head(),
         "dataset": {
-            "materialization": "Pilot v0.2 frozen 200-observation collection",
+            "materialization": (
+                "Pilot v0.3 expanded manifest-driven collection"
+                if expanded_dataset
+                else "Pilot v0.2 frozen 200-observation collection"
+            ),
             "collection_manifest_sha256": manifests["openvla"][
                 "collection_manifest_sha256"
             ],
-            "observation_count": 200,
-            "trajectory_group_count": 50,
+            "protocol": dataset_protocol,
+            "observation_count": len(identities),
+            "trajectory_group_count": len(
+                {(sample.task_id, sample.initial_state_id) for sample in identities}
+            ),
+            "accepted_groups_per_task": {
+                str(task): len(
+                    {
+                        sample.initial_state_id
+                        for sample in identities
+                        if sample.task_id == task
+                    }
+                )
+                for task in sorted({sample.task_id for sample in identities})
+            },
             "state_source": "successful OpenVLA on-policy trajectories",
         },
         "split": {
             "rule_id": split["rule_id"],
             "train_groups": split["train_groups"],
             "heldout_groups": split["heldout_groups"],
+            "counts": split.get("counts"),
         },
         "probe": {
             **config_dict(config),
@@ -429,9 +567,25 @@ def _write_report(path: Path, metadata: dict[str, Any]) -> None:
     rows = metadata["results"]
     selected_nodes = set(metadata["selected_nodes"])
     table = "\n".join(
-        f"| {r['model']} | {r['node']} | {r['dimension']} | {r['train_mse_normalized']:.6g} | {r['heldout_mse_normalized']:.6g} | {r['heldout_mean_baseline_mse_normalized']:.6g} |"
+        f"| {r['model']} | {r['node']} | {r['dimension']} | "
+        f"{r['feature_matrix_rank']} | {r['feature_matrix_condition_number']:.6g} | "
+        f"{r['train_mse_normalized']:.6g} | {r['heldout_mse_normalized']:.6g} | "
+        f"{r['heldout_mean_baseline_mse_normalized']:.6g} | "
+        f"{r['train_heldout_mse_gap_normalized']:.6g} | "
+        f"{r['probe_weight_nullspace_norm_fraction']:.6g} |"
         for r in rows
     )
+    split_counts = metadata["split"].get("counts")
+    if split_counts is None:
+        observations_per_group = 4
+        split_counts = {
+            "train_groups": len(metadata["split"]["train_groups"]),
+            "heldout_groups": len(metadata["split"]["heldout_groups"]),
+            "train_observations": len(metadata["split"]["train_groups"])
+            * observations_per_group,
+            "heldout_observations": len(metadata["split"]["heldout_groups"])
+            * observations_per_group,
+        }
     node_lines = []
     if "openvla/o2" in selected_nodes:
         node_lines.append("- OpenVLA O2: multimodal-projector output, `[256,4096]`.")
@@ -455,7 +609,7 @@ This experiment evaluates action predictability only. It does not establish caus
 
 ## 2. Dataset
 
-The experiment uses 200 frozen Pilot v0.2 observations from 50 successful OpenVLA on-policy LIBERO-Spatial trajectory groups. The deterministic group-aware split contains 40 TRAIN groups (160 observations) and 10 HELD-OUT groups (40 observations), with one held-out group per task. Model-specific action audits are stored under `action_audit/`.
+The experiment uses {metadata["dataset"]["observation_count"]} observations from {metadata["dataset"]["trajectory_group_count"]} successful clean OpenVLA on-policy LIBERO-Spatial trajectory groups. Split `{metadata["split"]["rule_id"]}` is deterministic, per-task stratified, and group-aware: {split_counts["train_groups"]} TRAIN groups / {split_counts["train_observations"]} observations and {split_counts["heldout_groups"]} HELD-OUT groups / {split_counts["heldout_observations"]} observations. Model-specific action audits are stored under `action_audit/`.
 
 ## 3. Representation Nodes
 
@@ -467,19 +621,19 @@ Each node is mean-pooled across all 256 visual tokens. A separate `Linear(D, 7, 
 
 ## 5. Results
 
-| Model | Node | D | Train MSE | Held-out MSE | Mean baseline MSE |
-|---|---|---:|---:|---:|---:|
+| Model | Node | D | TRAIN rank | Condition | Train MSE | Held-out MSE | Mean baseline MSE | Gap | W null fraction |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 {table}
 
-Per-action MSE, MAE, Pearson correlation, and R² are stored in each node's `metrics.json`.
+Per-action MSE, MAE, Pearson correlation, and R², plus singular-value diagnostics and W rank, are stored in each node's `metrics.json`.
 
 ## 6. Interpretation
 
 The table measures which representation contains more linearly readable action-predictive information under this fixed protocol. Weak or negative held-out evidence remains a valid scientific result. These measurements do not establish causal action relevance or controllability.
 
-## 7. Phase 3 Inputs
+## 7. Decision Boundary
 
-Each node directory contains frozen `probe.pt`, `W.pt`, `P_action.pt`, TRAIN action normalization in `action_stats.npz`, and `metrics.json`. Their provenance and exact representation nodes are recorded in `metadata.json`.
+Each node directory contains candidate `probe.pt`, `W.pt`, `P_action.pt`, TRAIN action normalization in `action_stats.npz`, and `metrics.json`. No Phase 2B freeze or Phase 3 step is implied by this Phase 2A materialization.
 """
     path.write_text(text, encoding="utf-8")
 

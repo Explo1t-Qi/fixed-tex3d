@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract action-paired O2/deep or P2/deep representations for Pilot v0.2."""
+"""Extract action-paired O2/deep or P2/deep Phase 2 representations."""
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ UNNORM_KEY = "libero_spatial_no_noops"
 PI05_CONFIG = "pi05_libero"
 CORRECTED_PI05_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v2"
 CORRECTED_PI05_MATERIALIZATION_ID = "pi05_p2_runtime_identity_v2"
+EXPANDED_MANIFEST_SCHEMA = "phase2_action_representation_manifest_v3"
+EXPANDED_ARCHIVE_SCHEMA = "phase2_action_representation_archive_v3"
+EXPANDED_COLLECTION_SCHEMA = "pilot_v0_3_expanded_collection_v1"
 
 
 def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -48,9 +51,10 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-observations",
         type=int,
-        choices=(1, 200),
-        default=200,
-        help="Use 1 only for a real-checkpoint smoke; formal extraction requires 200.",
+        help=(
+            "Optional positive prefix length for a smoke run. Omit to extract the "
+            "entire manifest-driven collection."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -132,8 +136,8 @@ def _reference_actions(path: Path) -> tuple[list[str], dict[str, np.ndarray]]:
     manifest_path = path.expanduser().resolve(strict=True)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     records = manifest.get("records", [])
-    if manifest.get("model") != "pi05" or len(records) != 200:
-        raise RuntimeError("reference action manifest must contain 200 PI0.5 records")
+    if manifest.get("model") != "pi05" or not records:
+        raise RuntimeError("reference action manifest must contain PI0.5 records")
     order: list[str] = []
     actions: dict[str, np.ndarray] = {}
     for record in records:
@@ -156,6 +160,8 @@ def _reference_actions(path: Path) -> tuple[list[str], dict[str, np.ndarray]]:
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.seed < 0:
         raise ValueError("seed must be non-negative")
+    if args.max_observations is not None and args.max_observations <= 0:
+        raise ValueError("--max-observations must be positive")
     checkpoint = args.checkpoint.expanduser().resolve(strict=True)
     shared = args.shared_feature_root.expanduser().resolve(strict=True)
     manifest_path = args.collection_manifest.expanduser().resolve(strict=True)
@@ -164,14 +170,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise FileExistsError(f"output directory must be fresh: {output}")
     if args.model == "pi05" and args.openpi_root is None:
         raise ValueError("--openpi-root is required for PI0.5 extraction")
-    if (
-        args.model == "pi05"
-        and args.max_observations == 200
-        and args.reference_action_manifest is None
-    ):
-        raise ValueError(
-            "formal corrected PI0.5 extraction requires --reference-action-manifest"
-        )
     if args.openpi_root is not None:
         args.openpi_root = args.openpi_root.expanduser().resolve(strict=True)
     _source_paths(args)
@@ -194,7 +192,46 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         pi05_p2_identity_metrics,
     )
 
-    source = common.load_source_collection(manifest_path)
+    collection_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    collection_schema = collection_manifest.get("schema_version")
+    if collection_schema == EXPANDED_COLLECTION_SCHEMA:
+        from phase2_expanded_dataset import validate_expanded_collection
+
+        source = validate_expanded_collection(manifest_path)
+        dataset_protocol = source.dataset_protocol
+    else:
+        source = common.load_source_collection(manifest_path)
+        dataset_protocol = {
+            "collection_schema_version": "pilot_v0_2_collection_v1",
+            "pilot_version": "0.2",
+            "protocol_id": "pilot-v0.2-c5",
+            "split_rule_id": "pilot-v0.2-c5-split-v1",
+            "heldout_fraction_per_task": 0.20,
+            "observation_count": len(source.records),
+            "trajectory_group_count": 50,
+            "observations_per_group": 4,
+            "target_relative_progress": [0.10, 0.40, 0.70, 0.90],
+            "accepted_groups_per_task": {str(index): 5 for index in range(10)},
+        }
+    selected_count = (
+        len(source.records) if args.max_observations is None else args.max_observations
+    )
+    if selected_count > len(source.records):
+        raise ValueError(
+            "--max-observations exceeds source collection count: "
+            f"{selected_count} > {len(source.records)}"
+        )
+    formal = selected_count == len(source.records)
+    if (
+        args.model == "pi05"
+        and formal
+        and collection_schema != EXPANDED_COLLECTION_SCHEMA
+        and args.reference_action_manifest is None
+    ):
+        raise ValueError(
+            "formal legacy corrected PI0.5 extraction requires "
+            "--reference-action-manifest"
+        )
     progress = _target_progress(manifest_path)
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -373,7 +410,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     records: list[dict[str, Any]] = []
     node_identity = None
-    selected_records = source.records[: args.max_observations]
+    selected_records = source.records[:selected_count]
     action_differences: list[float] = []
     for index, record in enumerate(selected_records):
         observation = PilotObservation.load(record.resolved_observation_path)
@@ -404,9 +441,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         _, noise_seed = _noise(args.seed, observation.sample_id)
         metadata = {
             "schema_version": (
-                "phase2_action_representation_archive_v2"
-                if args.model == "pi05"
-                else "phase2_action_representation_archive_v1"
+                EXPANDED_ARCHIVE_SCHEMA
+                if collection_schema == EXPANDED_COLLECTION_SCHEMA
+                else (
+                    "phase2_action_representation_archive_v2"
+                    if args.model == "pi05"
+                    else "phase2_action_representation_archive_v1"
+                )
             ),
             "sample_id": observation.sample_id,
             "task_id": int(observation.task_id),
@@ -451,15 +492,29 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     manifest = {
         "schema_version": (
-            CORRECTED_PI05_MANIFEST_SCHEMA
-            if args.model == "pi05"
-            else "phase2_action_representation_manifest_v1"
+            EXPANDED_MANIFEST_SCHEMA
+            if collection_schema == EXPANDED_COLLECTION_SCHEMA
+            else (
+                CORRECTED_PI05_MANIFEST_SCHEMA
+                if args.model == "pi05"
+                else "phase2_action_representation_manifest_v1"
+            )
         ),
         "materialization_id": (
-            CORRECTED_PI05_MATERIALIZATION_ID if args.model == "pi05" else None
+            (
+                "pi05_p2_expanded_runtime_identity_v3"
+                if collection_schema == EXPANDED_COLLECTION_SCHEMA
+                else CORRECTED_PI05_MATERIALIZATION_ID
+            )
+            if args.model == "pi05"
+            else (
+                "openvla_o2_expanded_v3"
+                if collection_schema == EXPANDED_COLLECTION_SCHEMA
+                else None
+            )
         ),
-        "status": "COMPLETE" if args.max_observations == 200 else "SMOKE_COMPLETE",
-        "run_kind": "formal" if args.max_observations == 200 else "smoke",
+        "status": "COMPLETE" if formal else "SMOKE_COMPLETE",
+        "run_kind": "formal" if formal else "smoke",
         "model": args.model,
         "backend": backend,
         "model_identity": model_identity,
@@ -469,6 +524,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "shared_feature_commit": _git_head(shared),
         "collection_manifest": str(manifest_path),
         "collection_manifest_sha256": _sha(manifest_path),
+        "dataset_protocol": dataset_protocol,
         "count": len(records),
         "source_collection_count": len(source.records),
         "projected_node": "O2" if args.model == "openvla" else "P2",
@@ -518,7 +574,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "pass": bool(action_differences) and max(action_differences) <= 1e-6,
             }
             if reference_actions is not None
-            else None
+            else (
+                {
+                    "reference_kind": "same_input_repeat_forward",
+                    "sample_id": first_observation.sample_id,
+                    "compared_observations": 1,
+                    "max_abs_action_difference": determinism["action_max_abs"],
+                    "tolerance": determinism["action_atol"],
+                    "pass": determinism["action_max_abs"] <= determinism["action_atol"],
+                }
+                if args.model == "pi05"
+                and collection_schema == EXPANDED_COLLECTION_SCHEMA
+                else None
+            )
         ),
         "determinism": determinism,
         "probe_isolation": {

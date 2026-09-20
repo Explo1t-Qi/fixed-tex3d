@@ -27,10 +27,12 @@ import phase2_action_probe_materialize as materializer  # noqa: E402
 from phase2_action_probe import (  # noqa: E402
     ACTION_NAMES,
     PROBE_SCHEMA_VERSION,
+    EXPANDED_PROBE_SCHEMA_VERSION,
     ActionProbeError,
     ProbeConfig,
     atomic_json,
     build_group_split,
+    feature_matrix_diagnostics,
     fit_linear_probe,
     materialize_action_projection,
     prediction_metrics,
@@ -106,7 +108,8 @@ def _validate_phase2a(
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     split = json.loads((directory / "split.json").read_text(encoding="utf-8"))
     if (
-        metadata.get("schema_version") != PROBE_SCHEMA_VERSION
+        metadata.get("schema_version")
+        not in {PROBE_SCHEMA_VERSION, EXPANDED_PROBE_SCHEMA_VERSION}
         or metadata.get("stage") != "phase2a"
         or metadata.get("status") != "PHASE_2A_COMPLETE"
     ):
@@ -168,11 +171,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         openvla_manifest=openvla_manifest_path,
         pi05_manifest=pi05_manifest_path,
     )
-    if selected_nodes != NODE_CHOICES and metadata.get("selected_nodes") != list(
-        selected_nodes
+    materialized_nodes = metadata.get("selected_nodes", list(NODE_CHOICES))
+    if not isinstance(materialized_nodes, list) or not set(selected_nodes).issubset(
+        materialized_nodes
     ):
         raise ActionProbeError(
-            "selected stability nodes differ from Phase 2A materialization"
+            "selected stability nodes are not a subset of Phase 2A materialization"
         )
     source_roots = {
         "phase2a": phase2a,
@@ -192,7 +196,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     identities = loaded["openvla"][0]
     if identities != loaded["pi05"][0]:
         raise ActionProbeError("OpenVLA and PI0.5 sample identities/order differ")
-    split = build_group_split(identities)
+    split = build_group_split(
+        identities,
+        rule_id=frozen_split["rule_id"],
+        heldout_fraction_per_task=float(
+            frozen_split.get("heldout_fraction_per_task", 0.20)
+        ),
+    )
     if split != frozen_split:
         raise ActionProbeError("diagnostic split differs from Phase 2A split")
     sample_index = {sample.sample_id: index for index, sample in enumerate(identities)}
@@ -212,6 +222,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             continue
         _, features, actions = loaded[model]
         node_features = features[feature_key]
+        train_features = node_features[train_index]
+        matrix_diagnostics = feature_matrix_diagnostics(train_features)
+        _, _, vh = np.linalg.svd(
+            np.asarray(train_features, dtype=np.float64), full_matrices=False
+        )
+        rank = matrix_diagnostics["rank"]
+        row_basis = vh[:rank]
         weights: dict[int, torch.Tensor] = {}
         heldout_mse: dict[int, float] = {}
         heldout_r2: dict[int, dict[str, float | None]] = {}
@@ -271,6 +288,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "rank_W": projection_metrics["rank_W"],
                 "singular_values_W": projection_metrics["singular_values_W"],
                 "projection": projection_metrics,
+                "feature_matrix": matrix_diagnostics,
+                "train_heldout_mse_gap_normalized": float(
+                    heldout_metrics["normalized"]["mse"]
+                    - train_metrics["normalized"]["mse"]
+                ),
+                "probe_weight_nullspace_norm_fraction": _nullspace_fraction(
+                    weight, row_basis
+                ),
                 "W_path": str((seed_dir / "W.pt").relative_to(output)),
                 "P_action_path": str((seed_dir / "P_action.pt").relative_to(output)),
             }
@@ -293,11 +318,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "display_name": display_name,
             "input_dimension": int(node_features.shape[1]),
             "phase2a_seed7_weight_max_abs_difference": reference_weight_difference,
+            "feature_matrix": matrix_diagnostics,
             "seeds": node_seeds,
         }
         similarity_nodes[node_key] = {
             "display_name": display_name,
             "phase2a_seed7_weight_max_abs_difference": reference_weight_difference,
+            "feature_matrix": matrix_diagnostics,
+            "probe_weight_nullspace_norm_fraction": {
+                str(seed): node_seeds[str(seed)]["probe_weight_nullspace_norm_fraction"]
+                for seed in seeds
+            },
             **pairwise_stability(
                 weights,
                 heldout_mse,
@@ -342,6 +373,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "split_rule": frozen_split["rule_id"],
         "train_observations": len(train_index),
         "heldout_observations": len(heldout_index),
+        "train_trajectory_groups": len(frozen_split["train_groups"]),
+        "heldout_trajectory_groups": len(frozen_split["heldout_groups"]),
+        "split_counts": frozen_split.get("counts"),
         "seeds": list(seeds),
         "reference_seed": REFERENCE_SEED,
         "probe": {
@@ -364,6 +398,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "principal_angle_cosine": value["principal_angle_cosine"],
                 "projection_relative_frobenius_distance": value[
                     "projection_relative_frobenius_distance"
+                ],
+                "action_row_signed_cosine": value["action_row_signed_cosine"],
+                "all_pairwise_diagnostics": value["pairs"],
+                "per_action_r2": value["per_action_r2"],
+                "feature_matrix": value["feature_matrix"],
+                "probe_weight_nullspace_norm_fraction": value[
+                    "probe_weight_nullspace_norm_fraction"
                 ],
                 "phase2a_seed7_weight_max_abs_difference": value[
                     "phase2a_seed7_weight_max_abs_difference"
@@ -419,6 +460,12 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "predictive signal, but the corresponding high-dimensional direction is "
         "under-determined and should be reviewed before Phase 2B freeze."
     )
+    dataset = summary["dataset"]
+    dataset_name = dataset.get("materialization", "manifest-driven Phase 2 dataset")
+    dataset_groups = dataset.get(
+        "trajectory_group_count",
+        summary["train_trajectory_groups"] + summary["heldout_trajectory_groups"],
+    )
     text = f"""# Phase 2 — Action-Probe Stability Diagnostic
 
 ## Scope
@@ -427,8 +474,8 @@ This CPU-only diagnostic measures prediction stability and candidate action-pred
 
 ## Frozen protocol
 
-- Dataset: frozen Pilot v0.2, 200 observations.
-- Split: `pilot-v0.2-c5-split-v1`, 160 TRAIN and 40 HELD-OUT observations.
+- Dataset: {dataset_name}, {dataset["observation_count"]} observations across {dataset_groups} trajectory groups.
+- Split: `{summary["split_rule"]}`, {summary["train_observations"]} TRAIN and {summary["heldout_observations"]} HELD-OUT observations.
 - Probe: `Linear(D,7,bias=False)`.
 - AdamW: learning rate `1e-3`, weight decay `1e-4`, 2,000 steps.
 - Action normalization: TRAIN statistics only, epsilon `1e-6`.
@@ -456,6 +503,19 @@ Status: `{summary["status"]}`. Nodes requiring review: {failed or "none"}.
 The source artifact trees were hash-snapshotted before and after the diagnostic and remained unchanged.
 """
     path.write_text(text, encoding="utf-8")
+
+
+def _nullspace_fraction(weight: torch.Tensor, row_basis: np.ndarray) -> float | None:
+    value = weight.detach().cpu().numpy().astype(np.float64, copy=False)
+    row_component = (
+        (value @ row_basis.T) @ row_basis if len(row_basis) else np.zeros_like(value)
+    )
+    denominator = float(np.linalg.norm(value))
+    return (
+        float(np.linalg.norm(value - row_component) / denominator)
+        if denominator
+        else None
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

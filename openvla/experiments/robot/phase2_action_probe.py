@@ -23,8 +23,10 @@ NODE_WIDTHS = {
     ("pi05", "deep"): 2048,
 }
 SPLIT_RULE_ID = "pilot-v0.2-c5-split-v1"
+EXPANDED_SPLIT_RULE_ID = "pilot-v0.3-expanded-split-v1"
 SCHEMA_VERSION = "phase2_action_representation_v1"
 PROBE_SCHEMA_VERSION = "phase2_action_probe_v1"
+EXPANDED_PROBE_SCHEMA_VERSION = "phase2_action_probe_v2"
 
 
 class ActionProbeError(RuntimeError):
@@ -37,6 +39,7 @@ class SampleIdentity:
     task_id: int
     initial_state_id: int
     target_progress: float
+    source_observation_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,20 +70,54 @@ def sha256_file(path: str | Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def split_digest(task_id: int, initial_state_id: int) -> str:
-    canonical = f"{SPLIT_RULE_ID}|task_id={task_id}|initial_state_id={initial_state_id}"
+def split_digest(
+    task_id: int, initial_state_id: int, *, rule_id: str = SPLIT_RULE_ID
+) -> str:
+    canonical = f"{rule_id}|task_id={task_id}|initial_state_id={initial_state_id}"
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def build_group_split(
     samples: Sequence[SampleIdentity],
+    *,
+    rule_id: str = SPLIT_RULE_ID,
+    heldout_fraction_per_task: float = 0.20,
 ) -> dict[str, Any]:
+    if rule_id not in {SPLIT_RULE_ID, EXPANDED_SPLIT_RULE_ID}:
+        raise ActionProbeError(f"unsupported split rule: {rule_id}")
+    if not 0 < heldout_fraction_per_task < 1:
+        raise ActionProbeError("heldout fraction must be within (0,1)")
+    sample_ids = [sample.sample_id for sample in samples]
+    sample_identities = [
+        (sample.task_id, sample.initial_state_id, sample.target_progress)
+        for sample in samples
+    ]
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ActionProbeError("sample IDs must be unique")
+    if len(set(sample_identities)) != len(sample_identities):
+        raise ActionProbeError("(task,state,progress) identities must be unique")
     groups = sorted({(sample.task_id, sample.initial_state_id) for sample in samples})
     tasks = sorted({task for task, _ in groups})
     heldout: set[tuple[int, int]] = set()
     for task in tasks:
         candidates = [(task_id, state) for task_id, state in groups if task_id == task]
-        heldout.add(min(candidates, key=lambda group: (split_digest(*group), group[1])))
+        if rule_id == SPLIT_RULE_ID:
+            count = 1
+        else:
+            if len(candidates) < 2:
+                raise ActionProbeError(
+                    f"expanded split requires at least two groups for task {task}"
+                )
+            count = max(1, math.floor(len(candidates) * heldout_fraction_per_task))
+            count = min(count, len(candidates) - 1)
+        ordered = sorted(
+            candidates,
+            key=lambda group: (
+                split_digest(*group, rule_id=rule_id),
+                group[1],
+            ),
+        )
+        heldout.update(ordered[:count])
     train = [group for group in groups if group not in heldout]
     held = [group for group in groups if group in heldout]
     train_ids = [
@@ -91,29 +128,50 @@ def build_group_split(
     ]
     if set(train_ids) & set(held_ids):
         raise ActionProbeError("TRAIN and HELD-OUT sample identities overlap")
-    if len(tasks) == 10 and (
-        len(train) != 40
-        or len(held) != 10
-        or len(train_ids) != 160
-        or len(held_ids) != 40
+    if (
+        rule_id == SPLIT_RULE_ID
+        and len(tasks) == 10
+        and (
+            len(train) != 40
+            or len(held) != 10
+            or len(train_ids) != 160
+            or len(held_ids) != 40
+        )
     ):
         raise ActionProbeError(
             "Pilot v0.2 split must be 40/10 groups and 160/40 observations"
         )
-    return {
-        "rule_id": SPLIT_RULE_ID,
-        "train_groups": [_group_json(group) for group in train],
-        "heldout_groups": [_group_json(group) for group in held],
+    result = {
+        "rule_id": rule_id,
+        "train_groups": [_group_json(group, rule_id=rule_id) for group in train],
+        "heldout_groups": [_group_json(group, rule_id=rule_id) for group in held],
         "train_sample_ids": train_ids,
         "heldout_sample_ids": held_ids,
     }
+    if rule_id == EXPANDED_SPLIT_RULE_ID:
+        result["heldout_fraction_per_task"] = heldout_fraction_per_task
+        result["counts"] = {
+            "train_groups": len(train),
+            "heldout_groups": len(held),
+            "train_observations": len(train_ids),
+            "heldout_observations": len(held_ids),
+            "train_groups_per_task": {
+                str(task): sum(group[0] == task for group in train) for task in tasks
+            },
+            "heldout_groups_per_task": {
+                str(task): sum(group[0] == task for group in held) for task in tasks
+            },
+        }
+    return result
 
 
-def _group_json(group: tuple[int, int]) -> dict[str, Any]:
+def _group_json(
+    group: tuple[int, int], *, rule_id: str = SPLIT_RULE_ID
+) -> dict[str, Any]:
     return {
         "task_id": group[0],
         "initial_state_id": group[1],
-        "digest": split_digest(*group),
+        "digest": split_digest(*group, rule_id=rule_id),
     }
 
 
@@ -170,7 +228,7 @@ def action_distribution_audit(
         )
         for task in sorted({s.task_id for s in samples})
     }
-    targets = (0.10, 0.40, 0.70, 0.90)
+    targets = tuple(sorted({sample.target_progress for sample in samples}))
     by_progress = {
         f"{target:.2f}": summarize(
             np.asarray(
@@ -189,6 +247,50 @@ def action_distribution_audit(
         "by_task_id": by_task,
         "by_target_progress": by_progress,
     }
+
+
+def feature_matrix_diagnostics(
+    train_features: np.ndarray,
+    *,
+    weight: torch.Tensor | np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Describe TRAIN identifiability without changing the fitted solver."""
+
+    value = np.asarray(train_features, dtype=np.float64)
+    if value.ndim != 2 or not value.size or not np.all(np.isfinite(value)):
+        raise ActionProbeError("TRAIN feature matrix must be finite non-empty [N,D]")
+    _, singular, vh = np.linalg.svd(value, full_matrices=False)
+    tolerance = float(singular[0] * max(value.shape) * np.finfo(value.dtype).eps)
+    rank = int(np.sum(singular > tolerance))
+    condition = float(singular[0] / singular[rank - 1]) if rank else float("inf")
+    result: dict[str, Any] = {
+        "shape": list(value.shape),
+        "rank": rank,
+        "nullspace_dimension": int(value.shape[1] - rank),
+        "rank_tolerance": tolerance,
+        "effective_condition_number": condition,
+        "largest_singular_value": float(singular[0]),
+        "smallest_nonzero_singular_value": (
+            float(singular[rank - 1]) if rank else None
+        ),
+    }
+    if weight is not None:
+        w = np.asarray(
+            weight.detach().cpu().numpy()
+            if isinstance(weight, torch.Tensor)
+            else weight,
+            dtype=np.float64,
+        )
+        if w.ndim != 2 or w.shape[1] != value.shape[1] or not np.all(np.isfinite(w)):
+            raise ActionProbeError("probe weight must be finite [7,D]")
+        row_basis = vh[:rank]
+        row_component = (w @ row_basis.T) @ row_basis if rank else np.zeros_like(w)
+        null_component = w - row_component
+        denominator = float(np.linalg.norm(w))
+        result["probe_weight_nullspace_norm_fraction"] = (
+            float(np.linalg.norm(null_component) / denominator) if denominator else None
+        )
+    return result
 
 
 def _actions(value: np.ndarray) -> np.ndarray:
