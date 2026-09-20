@@ -13,7 +13,9 @@ manual scaling = none
 definition_id = pi05_p2_embed_image_no_manual_scaling_v2
 ```
 
-Formal extraction validates the Phase 2 hook output against both direct `embed_image()` and the base-camera slice of the official prefix path. It also compares all 200 deployed first-step actions against the historical extraction under the same deterministic per-sample diffusion noise and blocks on a difference above `1e-6`.
+Formal extraction saves the direct official `embed_image(base_0_rgb)` output. It validates that independently extracted tensor against a second direct `embed_image()` call and the base-camera slice of the official prefix path. It also compares all 200 deployed first-step actions against the historical extraction under the same deterministic per-sample diffusion noise and blocks on a difference above `1e-6`.
+
+The first corrected CUDA smoke showed that direct `embed_image()` and the official prefix slice were bit-identical, while the projector hook inside compiled `policy.infer()` differed by relative L2 `0.006723` (maximum absolute difference `3.0`). This was not a fixed scaling: all three norms were approximately `4033`. The corrected extractor therefore uses the direct official path as its representation source instead of relaxing the identity tolerance for the compiled hook.
 
 ## Historical status
 

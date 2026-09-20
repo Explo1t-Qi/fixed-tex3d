@@ -203,7 +203,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         extract_pi05_p2_autograd,
     )
     from phase2_action_representation import (
-        extract_pi05_action_representation,
+        extract_pi05_official_p2,
     )
     from phase2_native_gradient_ensemble import (
         DualVLANativeFeatureAdapter,
@@ -554,14 +554,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 clean = pipeline.clean_reference(clean_image)
                 if state_id == 0:
-                    authoritative = extract_pi05_action_representation(
-                        policy=pi05.policy,
+                    authoritative = extract_pi05_official_p2(
                         model=pi05.model,
-                        raw_observation=pi05_policy_input,
-                        noise=np.zeros((10, 32), dtype=np.float32),
+                        observation=pi_inputs.clean_observation,
                     )
                     phase3_pi05_p2_identity = validate_pi05_probe_runtime_identity(
-                        authoritative.projected,
+                        authoritative,
                         clean.p2,
                     )
                 frame_type = ActionPredictiveTrainingFrame

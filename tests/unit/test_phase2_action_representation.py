@@ -17,6 +17,7 @@ from phase2_action_representation import (  # noqa: E402
     ActionRepresentationError,
     extract_openvla_action_representation,
     extract_pi05_action_representation,
+    extract_pi05_official_p2,
     midpoint_layer_index,
     pi05_p2_identity_metrics,
 )
@@ -119,6 +120,23 @@ class _PiPolicy:
         return {"actions": np.arange(70, dtype=np.float32).reshape(10, 7)}
 
 
+class _OfficialP2Wrapper:
+    def embed_image(self, image: torch.Tensor) -> torch.Tensor:
+        return image[:, :1, :1, :1].reshape(1, 1, 1).expand(1, 256, 2048)
+
+
+class _OfficialP2Model:
+    def __init__(self) -> None:
+        self.paligemma_with_expert = _OfficialP2Wrapper()
+
+    def _preprocess_observation(self, observation, *, train: bool):
+        assert observation == "fixture-observation"
+        assert train is False
+        images = [torch.full((1, 3, 224, 224), value) for value in (3.0, 4.0, 5.0)]
+        masks = [torch.ones(1, dtype=torch.bool) for _ in images]
+        return images, masks, torch.zeros(1, 2), torch.ones(1, 2), torch.zeros(1, 32)
+
+
 class _OverwritingPiPolicy(_PiPolicy):
     def __init__(self, model: _PiModel) -> None:
         super().__init__(model)
@@ -141,21 +159,31 @@ class _OverwritingPiPolicy(_PiPolicy):
         return {"actions": np.arange(70, dtype=np.float32).reshape(10, 7)}
 
 
-def test_pi05_capture_uses_first_projector_slot_and_midpoint_prefix() -> None:
+def test_pi05_uses_authoritative_p2_provider_and_midpoint_prefix() -> None:
     model = _PiModel()
     result = extract_pi05_action_representation(
         policy=_PiPolicy(model),
         model=model,
         raw_observation={},
         noise=np.zeros((10, 32), dtype=np.float32),
+        authoritative_p2_provider=lambda: torch.full((1, 256, 2048), 2.0),
     )
     assert result.projected.shape == (1, 256, 2048)
-    assert result.projected[0, 0, 0].item() == pytest.approx(1.0)
+    assert result.projected[0, 0, 0].item() == pytest.approx(2.0)
     assert result.deep.shape == (1, 256, 2048)
     assert torch.all(result.deep == 9)
     assert result.deep_identity.total_layers == 18
     assert result.deep_identity.zero_based_layer_index == 8
     assert np.array_equal(result.deployed_action, np.arange(7, dtype=np.float32))
+
+
+def test_pi05_official_p2_uses_base_camera_embed_image_without_scaling() -> None:
+    result = extract_pi05_official_p2(
+        model=_OfficialP2Model(), observation="fixture-observation"
+    )
+
+    assert result.shape == (1, 256, 2048)
+    assert torch.all(result == 3.0)
 
 
 def test_pi05_p2_identity_has_no_manual_sqrt_scaling() -> None:
@@ -190,6 +218,7 @@ def test_pi05_deep_capture_owns_storage_across_repeated_inference() -> None:
         model=model,
         raw_observation={},
         noise=noise,
+        authoritative_p2_provider=lambda: torch.ones(1, 256, 2048),
     )
     first_snapshot = first.deep.clone()
     repeated = extract_pi05_action_representation(
@@ -197,6 +226,7 @@ def test_pi05_deep_capture_owns_storage_across_repeated_inference() -> None:
         model=model,
         raw_observation={},
         noise=noise,
+        authoritative_p2_provider=lambda: torch.ones(1, 256, 2048),
     )
 
     assert torch.equal(first.deep, first_snapshot)

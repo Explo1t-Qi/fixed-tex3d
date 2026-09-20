@@ -206,12 +206,12 @@ def extract_pi05_action_representation(
     model: Any,
     raw_observation: dict[str, Any],
     noise: np.ndarray,
+    authoritative_p2_provider: Callable[[], torch.Tensor],
 ) -> ModelActionRepresentation:
-    """Infer one PI0.5 action chunk while capturing base-camera P2/P-deep."""
+    """Infer one PI0.5 action chunk and pair it with official base-camera P2."""
 
     try:
         paligemma = model.paligemma_with_expert.paligemma
-        projector = paligemma.model.multi_modal_projector
         layers = paligemma.language_model.layers
     except AttributeError as error:
         raise ActionRepresentationError(
@@ -219,21 +219,14 @@ def extract_pi05_action_representation(
         ) from error
     total_layers = len(layers)
     layer_index = midpoint_layer_index(total_layers)
-    projected: list[torch.Tensor] = []
     prefix_hidden: list[torch.Tensor] = []
-
-    def capture_projected(_module: Any, _inputs: Any, output: Any) -> None:
-        projected.append(_tensor_output(output, name="PI0.5 P2"))
 
     def capture_deep(_module: Any, _inputs: Any, output: Any) -> None:
         hidden = _tensor_output(output, name="PI0.5 P-deep")
         if hidden.ndim == 3 and hidden.shape[1] >= 3 * NUM_VISUAL_TOKENS:
             prefix_hidden.append(hidden[:, :NUM_VISUAL_TOKENS, :])
 
-    handles = (
-        projector.register_forward_hook(capture_projected),
-        layers[layer_index].register_forward_hook(capture_deep),
-    )
+    handles = (layers[layer_index].register_forward_hook(capture_deep),)
     try:
         with torch.inference_mode():
             output = policy.infer(raw_observation, noise=noise)
@@ -241,12 +234,6 @@ def extract_pi05_action_representation(
         for handle in reversed(handles):
             handle.remove()
 
-    # Official prefix order is base, left wrist, right wrist. The projector is
-    # called once per image slot and the primary camera is therefore capture 0.
-    if len(projected) != 3:
-        raise ActionRepresentationError(
-            f"PI0.5 image-projector capture count must be 3, got {len(projected)}"
-        )
     if len(prefix_hidden) != 1:
         raise ActionRepresentationError(
             f"PI0.5 P-deep prefix capture count must be 1, got {len(prefix_hidden)}"
@@ -256,10 +243,12 @@ def extract_pi05_action_representation(
         raise ActionRepresentationError(
             f"PI0.5 PaliGemma hidden size must be 2048, got {hidden_size}"
         )
-    # Current PI0Pytorch embed_image() returns get_image_features() directly.
-    # Own the hook output because compiled inference may reuse static buffers;
-    # no manual scaling is part of the authoritative P2 definition.
-    p2 = _validate_feature(projected[0].clone(), name="PI0.5 P2", width=2048)
+    if not callable(authoritative_p2_provider):
+        raise ActionRepresentationError("PI0.5 P2 provider must be callable")
+    with torch.inference_mode():
+        p2 = _validate_feature(
+            authoritative_p2_provider().clone(), name="PI0.5 P2", width=2048
+        )
     # PI0Pytorch inference is torch.compile'd with CUDA Graphs. Decoder-layer
     # outputs can therefore alias a static output buffer that the next infer()
     # call overwrites. Take ownership after infer() returns (outside the
@@ -289,3 +278,21 @@ def extract_pi05_action_representation(
             visual_token_slice="prefix hidden_state[:, 0:256, :] (base_0_rgb)",
         ),
     )
+
+
+def extract_pi05_official_p2(*, model: Any, observation: Any) -> torch.Tensor:
+    """Extract current PI0Pytorch base-camera ``embed_image()`` P2."""
+
+    with torch.inference_mode():
+        prepared = model._preprocess_observation(observation, train=False)
+        if not isinstance(prepared, tuple) or len(prepared) != 5:
+            raise ActionRepresentationError(
+                "PI0Pytorch preprocessing must return the five-value contract"
+            )
+        images = prepared[0]
+        if not isinstance(images, list) or len(images) != 3:
+            raise ActionRepresentationError(
+                "PI0Pytorch preprocessing must preserve three image slots"
+            )
+        value = model.paligemma_with_expert.embed_image(images[0]).clone()
+    return _validate_feature(value, name="PI0.5 official P2", width=PI05_P2_WIDTH)

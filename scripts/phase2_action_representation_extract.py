@@ -190,6 +190,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         PI05_P2_DEFINITION_ID,
         extract_openvla_action_representation,
         extract_pi05_action_representation,
+        extract_pi05_official_p2,
         pi05_p2_identity_metrics,
     )
 
@@ -273,11 +274,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         def extract(observation: Any, sample_id: str) -> Any:
             raw = pi05_raw(observation)
             noise, _ = _noise(args.seed, sample_id)
+            adapter = Pi05BaseImageAdapter(
+                policy=pi05.policy,
+                observation_type=pi05.observation_type,
+                policy_input=raw,
+                device=device,
+            )
             return extract_pi05_action_representation(
                 policy=pi05.policy,
                 model=pi05.model,
                 raw_observation=raw,
                 noise=noise,
+                authoritative_p2_provider=lambda: extract_pi05_official_p2(
+                    model=pi05.model,
+                    observation=adapter.clean_observation,
+                ),
             )
 
         backend = "PI0Pytorch"
@@ -308,7 +319,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             images, image_masks, language, language_masks, _ = prepared
             # torch.compile/CUDA Graph paths may reuse static output buffers.
             # Own each witness before the next model call can overwrite it.
-            direct_p2 = pi05.model.paligemma_with_expert.embed_image(images[0]).clone()
+            direct_p2 = extract_pi05_official_p2(
+                model=pi05.model,
+                observation=adapter.clean_observation,
+            )
             prefix, _, _ = pi05.model.embed_prefix(
                 images, image_masks, language, language_masks
             )

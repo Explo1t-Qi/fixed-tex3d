@@ -131,8 +131,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     from phase2_action_representation import (
         extract_openvla_action_representation,
         extract_pi05_action_representation,
+        extract_pi05_official_p2,
     )
     from phase2_multilevel_gradient_diagnostic import load_texture_parameter
+    from phase2_shared_gradient import Pi05BaseImageAdapter
     from phase2_shared_gradient_smoke import (
         _client_image,
         _load_pi05,
@@ -344,21 +346,43 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "prompt": str(task_description),
                 }
 
+            clean_raw = pi_raw(clean_rgb)
+            clean_adapter = Pi05BaseImageAdapter(
+                policy=pi05.policy,
+                observation_type=pi05.observation_type,
+                policy_input=clean_raw,
+                device=pi05_device,
+            )
             clean_pi = extract_pi05_action_representation(
                 policy=pi05.policy,
                 model=pi05.model,
-                raw_observation=pi_raw(clean_rgb),
+                raw_observation=clean_raw,
                 noise=clean_noise,
+                authoritative_p2_provider=lambda: extract_pi05_official_p2(
+                    model=pi05.model,
+                    observation=clean_adapter.clean_observation,
+                ),
             )
             with torch.no_grad():
                 z_p_clean = (
                     probes.pi05(clean_pi.projected).detach().float().cpu().numpy()[0]
                 )
+            adv_raw = pi_raw(adv_rgb)
+            adv_adapter = Pi05BaseImageAdapter(
+                policy=pi05.policy,
+                observation_type=pi05.observation_type,
+                policy_input=adv_raw,
+                device=pi05_device,
+            )
             adv_pi = extract_pi05_action_representation(
                 policy=pi05.policy,
                 model=pi05.model,
-                raw_observation=pi_raw(adv_rgb),
+                raw_observation=adv_raw,
                 noise=adv_noise,
+                authoritative_p2_provider=lambda: extract_pi05_official_p2(
+                    model=pi05.model,
+                    observation=adv_adapter.clean_observation,
+                ),
             )
             if (
                 hashlib.sha256(np.ascontiguousarray(clean_noise).tobytes()).hexdigest()
