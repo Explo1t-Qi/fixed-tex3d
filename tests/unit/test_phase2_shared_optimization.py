@@ -213,6 +213,84 @@ def test_multilevel_native_mode_does_not_require_shared_artifacts(
     assert "mapping" not in paths
 
 
+def test_phase3_mode_requires_only_primary_probe_artifact(
+    tmp_path: Path,
+) -> None:
+    existing = {}
+    for name in (
+        "openpi",
+        "openvla-checkpoint",
+        "pi05-checkpoint",
+        "libero",
+        "probes",
+    ):
+        existing[name] = tmp_path / name
+        existing[name].mkdir()
+    arguments = [
+        "--objective",
+        "action_predictive_gradient_ensemble",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--openpi-root",
+        str(existing["openpi"]),
+        "--openvla-checkpoint",
+        str(existing["openvla-checkpoint"]),
+        "--pi05-checkpoint",
+        str(existing["pi05-checkpoint"]),
+        "--libero-root",
+        str(existing["libero"]),
+    ]
+    missing = training_entrypoint._args(arguments)
+    with pytest.raises(ValueError, match="probe-artifact-dir"):
+        training_entrypoint._validate_paths(missing)
+
+    args = training_entrypoint._args(
+        [*arguments, "--probe-artifact-dir", str(existing["probes"])]
+    )
+    paths = training_entrypoint._validate_paths(args)
+
+    assert paths["probes"] == existing["probes"].resolve()
+    assert "shared" not in paths and "mapping" not in paths
+
+
+def test_phase3_smoke_batch_is_explicitly_non_authoritative_and_bounded(
+    tmp_path: Path,
+) -> None:
+    existing = {}
+    for name in (
+        "openpi",
+        "openvla-checkpoint",
+        "pi05-checkpoint",
+        "libero",
+        "probes",
+    ):
+        existing[name] = tmp_path / name
+        existing[name].mkdir()
+    base = [
+        "--objective",
+        "action_predictive_gradient_ensemble",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--openpi-root",
+        str(existing["openpi"]),
+        "--openvla-checkpoint",
+        str(existing["openvla-checkpoint"]),
+        "--pi05-checkpoint",
+        str(existing["pi05-checkpoint"]),
+        "--libero-root",
+        str(existing["libero"]),
+        "--probe-artifact-dir",
+        str(existing["probes"]),
+        "--phase3-smoke-frame-limit",
+        "1",
+    ]
+    valid = training_entrypoint._args([*base, "--iterations", "1"])
+    training_entrypoint._validate_paths(valid)
+    invalid = training_entrypoint._args([*base, "--iterations", "11"])
+    with pytest.raises(ValueError, match="at most 10"):
+        training_entrypoint._validate_paths(invalid)
+
+
 def test_native_source_paths_exclude_shared_feature_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

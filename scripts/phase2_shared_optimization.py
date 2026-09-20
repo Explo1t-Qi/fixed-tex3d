@@ -29,10 +29,12 @@ MAPPING_ID = "phase1_o2_p2_pi05_torch_v1"
 SHARED_CCA_OBJECTIVE = "shared_cca"
 NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE = "native_gradient_ensemble"
 MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE = "multilevel_native_gradient_ensemble"
+ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE = "action_predictive_gradient_ensemble"
 OBJECTIVES = (
     SHARED_CCA_OBJECTIVE,
     NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE,
     MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE,
+    ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE,
 )
 
 
@@ -42,6 +44,7 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--shared-feature-root", type=Path)
     parser.add_argument("--mapping-dir", type=Path)
+    parser.add_argument("--probe-artifact-dir", type=Path)
     parser.add_argument("--openpi-root", type=Path, required=True)
     parser.add_argument("--openvla-checkpoint", type=Path, required=True)
     parser.add_argument("--pi05-checkpoint", type=Path, required=True)
@@ -59,6 +62,14 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-frames-per-state", type=int, default=1)
     parser.add_argument("--num-frames-to-attack", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--phase3-smoke-frame-limit",
+        type=int,
+        choices=(1, 10),
+        help=(
+            "Non-authoritative Phase 3 smoke batch; accepted only for <=10 iterations."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -147,6 +158,19 @@ def _validate_paths(args: argparse.Namespace) -> dict[str, Path]:
             )
         paths["shared"] = args.shared_feature_root.expanduser().resolve(strict=True)
         paths["mapping"] = args.mapping_dir.expanduser().resolve(strict=True)
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        if args.probe_artifact_dir is None:
+            raise ValueError(
+                "action_predictive_gradient_ensemble requires --probe-artifact-dir"
+            )
+        paths["probes"] = args.probe_artifact_dir.expanduser().resolve(strict=True)
+    elif args.probe_artifact_dir is not None:
+        raise ValueError("--probe-artifact-dir is only valid for the Phase 3 objective")
+    if args.phase3_smoke_frame_limit is not None:
+        if args.objective != ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+            raise ValueError("--phase3-smoke-frame-limit is Phase 3 only")
+        if args.iterations > 10:
+            raise ValueError("Phase 3 smoke mode is limited to at most 10 iterations")
     output = args.output_dir.expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"output directory must be fresh: {output}")
@@ -189,6 +213,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         extract_openvla_o1_o2_autograd,
         extract_pi05_p1_p2_autograd,
         train_multilevel_native_gradient_ensemble,
+    )
+    from phase3_action_predictive_objective import (
+        ActionPredictiveTrainingFrame,
+        DualVLAActionPredictiveAdapter,
+        calibrate_lambda_dir,
+        load_frozen_primary_probes,
+        train_action_predictive_gradient_ensemble,
     )
     from phase2_shared_optimization import (
         FrozenCleanReference,
@@ -257,6 +288,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
+    frozen_probes = None
+    frozen_probe_weight_snapshot = None
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        frozen_probes = load_frozen_primary_probes(
+            paths["probes"],
+            openvla_device=openvla_device,
+            pi05_device=pi05_device,
+        )
+        frozen_probe_weight_snapshot = (
+            frozen_probes.openvla.weight.detach().clone(),
+            frozen_probes.pi05.weight.detach().clone(),
+        )
+
     output = paths["output"]
     output.mkdir(parents=True)
     config_path = output / "training_config.json"
@@ -276,6 +320,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "openvla_device": str(openvla_device),
         "pi05_device": str(pi05_device),
         "uses_shared_feature_artifact": args.objective == SHARED_CCA_OBJECTIVE,
+        "phase3_smoke_frame_limit": args.phase3_smoke_frame_limit,
+        "authoritative_pilot": args.phase3_smoke_frame_limit is None,
     }
     if args.objective == SHARED_CCA_OBJECTIVE:
         config.update(
@@ -293,7 +339,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "model_normalization": "g / (mean(abs(g)) + 1e-12)",
             "model_aggregation": "(g_o_normalized + g_p_normalized) / 2",
         }
-    else:
+    elif args.objective == MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
         config["multilevel_native_gradient_ensemble"] = {
             "openvla_loss": "-(MSE(O1-S_adv, O1-S_clean) + MSE(O2_adv, O2_clean))",
             "pi05_loss": "-(MSE(P1_adv, P1_clean) + MSE(P2_adv, P2_clean))",
@@ -302,6 +348,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "frame_aggregation": "mean within each model before normalization",
             "model_normalization": "g / (mean(abs(g)) + 1e-12)",
             "model_aggregation": "(g_o_normalized + g_p_normalized) / 2",
+        }
+    else:
+        assert frozen_probes is not None
+        config["action_predictive_gradient_ensemble"] = {
+            "coordinates": "Z = mean_token(F) @ W.T",
+            "openvla_node": "O2",
+            "pi05_node": "P2",
+            "magnitude_loss": "-MSE(Z_adv, Z_clean)",
+            "direction_loss": "cosine_similarity(Z_adv, Z_clean, eps=1e-8)",
+            "combined_loss": "L_mag + lambda_dir * L_dir",
+            "action_coordinate_weights": [1.0] * 7,
+            "frame_aggregation": "mean within each model before normalization",
+            "model_normalization": "g / (mean(abs(g)) + 1e-12)",
+            "model_aggregation": "(g_o_normalized + g_p_normalized) / 2",
+            "probe_artifact_dir": str(paths["probes"]),
+            "probe_hashes": frozen_probes.hashes,
         }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
@@ -377,7 +439,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             return extract_openvla_o1_o2_autograd(openvla_model, pixels)
 
     frames: list[
-        SharedTrainingFrame | NativeTrainingFrame | MultiLevelNativeTrainingFrame
+        SharedTrainingFrame
+        | NativeTrainingFrame
+        | MultiLevelNativeTrainingFrame
+        | ActionPredictiveTrainingFrame
     ] = []
     frame_contract = []
     calibration_count = 0
@@ -449,7 +514,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 clean = pipeline.clean_reference(clean_image)
                 frame_type = NativeTrainingFrame
                 clean_reference_space = "native_o2_p2"
-            else:
+            elif args.objective == MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
                 pipeline = DualVLAMultiLevelNativeFeatureAdapter(
                     openvla_path=openvla_multilevel_path,
                     pi05_path=pi05_multilevel_path,
@@ -459,6 +524,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 clean = pipeline.clean_reference(clean_image)
                 frame_type = MultiLevelNativeTrainingFrame
                 clean_reference_space = "native_o1s_o2_p1_p2"
+            else:
+                assert frozen_probes is not None
+                native_pipeline = DualVLANativeFeatureAdapter(
+                    openvla_path=openvla_path,
+                    pi05_path=pi05_path,
+                    openvla_device=openvla_device,
+                    pi05_device=pi05_device,
+                )
+                pipeline = DualVLAActionPredictiveAdapter(
+                    native_adapter=native_pipeline,
+                    probes=frozen_probes,
+                )
+                clean = pipeline.clean_reference(clean_image)
+                frame_type = ActionPredictiveTrainingFrame
+                clean_reference_space = "native_o2_p2_action_predictive_coordinates"
             poses = find_target_body_poses(
                 env,
                 object_config["search"],
@@ -533,7 +613,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     def render_frame(
         frame: SharedTrainingFrame
         | NativeTrainingFrame
-        | MultiLevelNativeTrainingFrame,
+        | MultiLevelNativeTrainingFrame
+        | ActionPredictiveTrainingFrame,
     ):
         images = _build_adv_samples(renderer, frame.payload["renderer_frame"], 512)
         if len(images) != 1:
@@ -554,6 +635,31 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     def forward_multilevel_native_frame(frame: MultiLevelNativeTrainingFrame):
         image = render_frame(frame)
         return frame.payload["pipeline"].losses(image, frame.clean)[0], image
+
+    phase3_lambda_dir = 1.0
+
+    def forward_action_predictive_frame(frame: ActionPredictiveTrainingFrame):
+        image = render_frame(frame)
+        return (
+            frame.payload["pipeline"].losses(
+                image, frame.clean, lambda_dir=phase3_lambda_dir
+            )[0],
+            image,
+        )
+
+    calibration = None
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        calibration = calibrate_lambda_dir(
+            renderer=renderer,
+            frames=frames,
+            forward_frame=forward_action_predictive_frame,
+        )
+        phase3_lambda_dir = float(calibration["lambda_dir"])
+        (output / "lambda_calibration.json").write_text(
+            json.dumps(calibration, indent=2, sort_keys=True) + "\n"
+        )
+        config["action_predictive_gradient_ensemble"]["lambda_dir"] = phase3_lambda_dir
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     checkpoint_artifacts: list[dict[str, Any]] = []
 
@@ -578,7 +684,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "renderer": renderer,
         "frames": frames,
         "iterations": protocol.attack_iterations,
-        "requested_batch_size": protocol.num_frames_to_attack,
+        "requested_batch_size": (
+            args.phase3_smoke_frame_limit
+            if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
+            and args.phase3_smoke_frame_limit is not None
+            else protocol.num_frames_to_attack
+        ),
         "pgd_step": protocol.pgd_step,
         "seed": protocol.seed,
         "metrics_path": output / "step_metrics.jsonl",
@@ -598,14 +709,75 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
         loss_history = np.asarray([[row["loss_o"], row["loss_p"]] for row in history])
         loss_history_fields = ["loss_o", "loss_p"]
-    else:
+    elif args.objective == MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
         history = train_multilevel_native_gradient_ensemble(
             forward_frame=forward_multilevel_native_frame,
             **training_arguments,
         )
         loss_history = np.asarray([[row["loss_o"], row["loss_p"]] for row in history])
         loss_history_fields = ["loss_o", "loss_p"]
+    else:
+        history = train_action_predictive_gradient_ensemble(
+            forward_frame=forward_action_predictive_frame,
+            lambda_dir=phase3_lambda_dir,
+            **training_arguments,
+        )
+        loss_history = np.asarray([[row["loss_o"], row["loss_p"]] for row in history])
+        loss_history_fields = ["loss_o", "loss_p"]
+        diagnostics_dir = output / "diagnostics"
+        diagnostics_dir.mkdir()
+        (diagnostics_dir / "component_gradients.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "iteration": row["iteration"],
+                        "component_gradient_diagnostic": row[
+                            "component_gradient_diagnostic"
+                        ],
+                    }
+                    for row in history
+                    if "component_gradient_diagnostic" in row
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        (diagnostics_dir / "action_coordinate_metrics.json").write_text(
+            json.dumps(
+                [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key.startswith("openvla_")
+                        or key.startswith("pi05_")
+                        or key
+                        in {
+                            "iteration",
+                            "action_mse_o",
+                            "action_mse_p",
+                            "loss_dir_o",
+                            "loss_dir_p",
+                            "delta_z_o_norm",
+                            "delta_z_p_norm",
+                        }
+                    }
+                    for row in history
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     maximum = validate_texture_budget(renderer)
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        assert frozen_probes is not None and frozen_probe_weight_snapshot is not None
+        if not torch.equal(
+            frozen_probe_weight_snapshot[0], frozen_probes.openvla.weight
+        ) or not torch.equal(
+            frozen_probe_weight_snapshot[1], frozen_probes.pi05.weight
+        ):
+            raise RuntimeError("frozen Phase 2B probe weight changed during training")
     parameter_path = output / "final_vertex_noise.pt"
     texture_path = output / "final_attack_texture.png"
     torch.save(renderer.get_texture_param().detach().cpu(), parameter_path)
@@ -624,17 +796,36 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             MULTILEVEL_NATIVE_GRADIENT_ENSEMBLE_OBJECTIVE: (
                 "Phase 2 Multi-Level Native Gradient Ensemble Optimization — COMPLETE"
             ),
+            ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE: (
+                "Phase 3 Action-Predictive Gradient Ensemble Optimization — COMPLETE"
+            ),
         }[args.objective],
-        "phase2_4_training_result": "PASS",
+        "phase2_4_training_result": (
+            "PASS"
+            if args.objective != ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
+            else None
+        ),
+        "phase3_training_result": (
+            "PASS"
+            if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
+            else None
+        ),
         "objective": args.objective,
         "uses_shared_feature_artifact": args.objective == SHARED_CCA_OBJECTIVE,
         "run_configuration": run_configuration,
         "iterations_completed": len(history),
         "texture_updates": len(history),
         "frame_pool_size": len(frames),
-        "effective_batch_size": len(frames),
+        "effective_batch_size": min(
+            int(training_arguments["requested_batch_size"]), len(frames)
+        ),
         "training_state_ids": list(range(protocol.num_train_init_states)),
         "clean_reference_forward_count": len(frames),
+        "lambda_dir": (
+            phase3_lambda_dir
+            if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
+            else None
+        ),
         "loss_history_fields": loss_history_fields,
         "final_diagnostics": history[-1],
         "maximum_texture_perturbation": maximum,
@@ -662,11 +853,44 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "source-model hierarchical-native-gradient-ensemble texture training; "
                 "no rollout claim"
             ),
+            ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE: (
+                "source-model action-predictive texture training; no held-out transfer claim"
+            ),
         }[args.objective],
     }
     (output / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
+    if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
+        assert frozen_probes is not None and calibration is not None
+        metadata = {
+            "schema_version": "phase3_action_aware_texture_v1",
+            "status": (
+                "SMOKE_COMPLETE"
+                if args.phase3_smoke_frame_limit is not None
+                else "TRAINING_COMPLETE_PENDING_SOURCE_ROLLOUT"
+            ),
+            "objective": args.objective,
+            "tex3d_commit": _git_head(PROJECT_ROOT),
+            "phase2b_probe_artifact": str(paths["probes"]),
+            "phase2b_probe_hashes": frozen_probes.hashes,
+            "lambda_calibration": calibration,
+            "training_summary": summary,
+        }
+        (output / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+        )
+        inventory = {
+            str(path.relative_to(output)): {
+                "sha256": _sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+            for path in sorted(output.rglob("*"))
+            if path.is_file() and path.name != "artifact_inventory.json"
+        }
+        (output / "artifact_inventory.json").write_text(
+            json.dumps(inventory, indent=2, sort_keys=True) + "\n"
+        )
     return summary
 
 
@@ -677,12 +901,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as error:
         output = args.output_dir.expanduser().resolve()
         output.mkdir(parents=True, exist_ok=True)
+        is_phase3 = args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE
         (output / "failure.json").write_text(
             json.dumps(
                 {
-                    "status": "Phase 2 Source-Feature Optimization — BLOCKED",
+                    "status": (
+                        "Phase 3 Action-Predictive Optimization — BLOCKED"
+                        if is_phase3
+                        else "Phase 2 Source-Feature Optimization — BLOCKED"
+                    ),
                     "objective": args.objective,
-                    "phase2_4_training_result": "BLOCKED",
+                    "phase2_4_training_result": None if is_phase3 else "BLOCKED",
+                    "phase3_training_result": "BLOCKED" if is_phase3 else None,
                     "error_type": type(error).__name__,
                     "error": str(error),
                 },
