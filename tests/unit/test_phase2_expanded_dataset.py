@@ -15,12 +15,14 @@ sys.path.insert(0, str(ROBOT_ROOT))
 from phase2_expanded_dataset import (  # noqa: E402
     CHECKPOINT_IDENTITY,
     COLLECTION_SCHEMA_VERSION,
+    ExpandedDatasetError,
     HELDOUT_FRACTION,
     PILOT_VERSION,
     PROTOCOL_ID,
     SPLIT_RULE_ID,
     TARGET_PROGRESS,
     capacity_report,
+    collect_expanded_observations,
     sample_indices,
     validate_expanded_collection,
 )
@@ -210,3 +212,381 @@ def test_expanded_manifest_rejects_duplicate_task_state_progress_identity(
     path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(Exception, match="progress set differs"):
         validate_expanded_collection(path, observation_type=_Observation)
+
+
+class _CollectionSuite:
+    def __init__(self, counts: list[int]) -> None:
+        self.counts = counts
+
+    def get_num_tasks(self) -> int:
+        return 10
+
+    def get_task_init_states(self, task_id: int) -> list[tuple[int, int]]:
+        return [(task_id, state_id) for state_id in range(self.counts[task_id])]
+
+    def get_task(self, task_id: int) -> SimpleNamespace:
+        return SimpleNamespace(language=f"task {task_id}")
+
+
+class _CollectionObservation:
+    save_calls = 0
+    fail_on_save_call: int | None = None
+
+    def __init__(self, **values: object) -> None:
+        self.__dict__.update(values)
+
+    def save(self, path: Path) -> None:
+        type(self).save_calls += 1
+        with path.open("wb") as stream:
+            np.savez(
+                stream,
+                sample_id=np.array(self.sample_id),
+                task_id=np.array(self.task_id),
+                initial_state_id=np.array(self.initial_state_id),
+                episode_id=np.array(self.episode_id),
+                step_id=np.array(self.step_id),
+                episode_success=np.array(self.episode_success),
+                base_rgb_raw=self.base_rgb_raw,
+            )
+        if type(self).save_calls == type(self).fail_on_save_call:
+            raise RuntimeError("injected partial group write")
+
+    @classmethod
+    def load(cls, path: Path) -> SimpleNamespace:
+        with np.load(path, allow_pickle=False) as archive:
+            return SimpleNamespace(
+                sample_id=str(archive["sample_id"]),
+                task_id=str(archive["task_id"]),
+                initial_state_id=int(archive["initial_state_id"]),
+                episode_id=int(archive["episode_id"]),
+                step_id=int(archive["step_id"]),
+                episode_success=bool(archive["episode_success"]),
+                base_rgb_raw=archive["base_rgb_raw"].copy(),
+            )
+
+
+class _FakeCollector:
+    PILOT_SUITE = "libero_spatial"
+    _CAMERA_RESOLUTION = 256
+    _NUM_DUMMY_STEPS = 10
+    _MAX_POLICY_ACTIONS = 520
+
+    class _EpisodeCollectionError(RuntimeError):
+        category = "fixture"
+
+    def __init__(self, *, interrupt_at: tuple[int, int] | None = None) -> None:
+        self.interrupt_at = interrupt_at
+        self.calls: list[tuple[int, int]] = []
+
+    @staticmethod
+    def _OpenVLAActionConfig(**values: object) -> SimpleNamespace:
+        return SimpleNamespace(**values)
+
+    def _collect_episode(self, **values: object) -> tuple[list[SimpleNamespace], bool]:
+        pair = (int(values["task_id"]), int(values["initial_state_id"]))
+        self.calls.append(pair)
+        if pair == self.interrupt_at:
+            raise KeyboardInterrupt
+        trajectory = [
+            SimpleNamespace(
+                step_id=step_id,
+                base_rgb_raw=np.full((2, 2, 3), sum(pair), dtype=np.uint8),
+                wrist_rgb_raw=np.full((2, 2, 3), step_id, dtype=np.uint8),
+                state=np.array([*pair, step_id], dtype=np.float32),
+            )
+            for step_id in range(20)
+        ]
+        return trajectory, True
+
+
+class _FinalValidationFailObservation(_CollectionObservation):
+    @classmethod
+    def load(cls, path: Path) -> SimpleNamespace:
+        del path
+        raise RuntimeError("injected final validation failure")
+
+
+class _ProgressRecorder:
+    def __init__(self, *, total: int, initial: int = 0) -> None:
+        self.total = total
+        self.n = initial
+        self.messages: list[str] = []
+        self.postfixes: list[dict[str, object]] = []
+
+    def set_postfix(self, values: dict[str, object], *, refresh: bool = False) -> None:
+        del refresh
+        self.postfixes.append(dict(values))
+
+    def update(self, count: int = 1) -> None:
+        self.n += count
+
+    def write(self, message: str) -> None:
+        self.messages.append(message)
+
+    def close(self) -> None:
+        pass
+
+
+def _run_fixture_collection(
+    *,
+    root: Path,
+    checkpoint: Path,
+    suite: _CollectionSuite,
+    collector: _FakeCollector,
+    resume: bool = False,
+    code_commit: str = "a" * 40,
+    libero_revision: str = "fixture-revision",
+    progress_instances: list[_ProgressRecorder] | None = None,
+) -> object:
+    def progress_factory(*, total: int, initial: int) -> _ProgressRecorder:
+        progress = _ProgressRecorder(total=total, initial=initial)
+        if progress_instances is not None:
+            progress_instances.append(progress)
+        return progress
+
+    return collect_expanded_observations(
+        model=object(),
+        processor=object(),
+        pretrained_checkpoint=checkpoint,
+        libero_revision=libero_revision,
+        code_commit=code_commit,
+        shared_feature_commit="b" * 40,
+        output_dir=root,
+        resume=resume,
+        progress_factory=progress_factory,
+        _collector=collector,
+        _runtime=object(),
+        _suite=suite,
+        _observation_type=_CollectionObservation,
+    )
+
+
+def test_collection_progress_total_uses_actual_suite_capacity(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    progress_instances: list[_ProgressRecorder] = []
+    counts = [2, *([1] * 9)]
+    _CollectionObservation.save_calls = 0
+    _CollectionObservation.fail_on_save_call = None
+
+    result = _run_fixture_collection(
+        root=tmp_path / "collection",
+        checkpoint=checkpoint,
+        suite=_CollectionSuite(counts),
+        collector=_FakeCollector(),
+        progress_instances=progress_instances,
+    )
+
+    assert result.status == "EXPANDED_COLLECTION_COMPLETE"
+    assert progress_instances[0].total == sum(counts) == 11
+    assert progress_instances[0].n == sum(counts)
+    assert set(progress_instances[0].postfixes[-1]) == {
+        "task",
+        "state",
+        "accepted",
+        "policy_failed",
+        "sampling_rejected",
+    }
+
+
+def test_fresh_collection_rejects_nonempty_output(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output = tmp_path / "collection"
+    output.mkdir()
+    (output / "existing").write_text("fixture", encoding="utf-8")
+
+    with pytest.raises(ExpandedDatasetError, match="must be fresh"):
+        _run_fixture_collection(
+            root=output,
+            checkpoint=checkpoint,
+            suite=_CollectionSuite([1] * 10),
+            collector=_FakeCollector(),
+        )
+
+
+def _make_interrupted_collection(
+    tmp_path: Path,
+) -> tuple[Path, Path, _CollectionSuite]:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output = tmp_path / "collection"
+    suite = _CollectionSuite([2, *([1] * 9)])
+    _CollectionObservation.save_calls = 0
+    _CollectionObservation.fail_on_save_call = None
+    with pytest.raises(KeyboardInterrupt):
+        _run_fixture_collection(
+            root=output,
+            checkpoint=checkpoint,
+            suite=suite,
+            collector=_FakeCollector(interrupt_at=(0, 1)),
+        )
+    progress = json.loads(
+        (output / "collection_progress.json").read_text(encoding="utf-8")
+    )
+    assert progress["status"] == "INTERRUPTED_RESUMABLE"
+    assert progress["counts"]["completed"] == 1
+    assert not (output / "collection_manifest.json").exists()
+    return checkpoint, output, suite
+
+
+def test_resume_skips_verified_state_without_duplicates_and_matches_clean_run(
+    tmp_path: Path,
+) -> None:
+    checkpoint, output, suite = _make_interrupted_collection(tmp_path)
+    resumed_collector = _FakeCollector()
+    resumed = _run_fixture_collection(
+        root=output,
+        checkpoint=checkpoint,
+        suite=suite,
+        collector=resumed_collector,
+        resume=True,
+    )
+    assert (0, 0) not in resumed_collector.calls
+
+    clean = _run_fixture_collection(
+        root=tmp_path / "clean",
+        checkpoint=checkpoint,
+        suite=suite,
+        collector=_FakeCollector(),
+    )
+    resumed_manifest = json.loads(resumed.manifest_path.read_text(encoding="utf-8"))
+    clean_manifest = json.loads(clean.manifest_path.read_text(encoding="utf-8"))
+    for key in (
+        "protocol",
+        "provenance",
+        "rollout",
+        "runtime",
+        "feasibility",
+        "coverage",
+        "task_results",
+    ):
+        assert resumed_manifest[key] == clean_manifest[key]
+    sample_ids = [
+        sample["sample_id"]
+        for row in resumed_manifest["task_results"]
+        for group in row["accepted_groups"]
+        for sample in group["samples"]
+    ]
+    assert len(sample_ids) == len(set(sample_ids)) == len(resumed.sample_paths)
+    assert resumed_manifest["execution"] == {
+        "completed_state_count": 11,
+        "progress_schema_version": "pilot_v0_3_collection_progress_v1",
+        "resume_count": 1,
+        "resumed": True,
+    }
+
+
+def test_resume_rejects_corrupted_observation_hash(tmp_path: Path) -> None:
+    checkpoint, output, suite = _make_interrupted_collection(tmp_path)
+    observation = next((output / "observations").glob("*.npz"))
+    with observation.open("ab") as stream:
+        stream.write(b"corruption")
+
+    with pytest.raises(ExpandedDatasetError, match="hash differs"):
+        _run_fixture_collection(
+            root=output,
+            checkpoint=checkpoint,
+            suite=suite,
+            collector=_FakeCollector(),
+            resume=True,
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["protocol", "commit", "revision", "checkpoint"])
+def test_resume_rejects_identity_mismatch(tmp_path: Path, mismatch: str) -> None:
+    checkpoint, output, suite = _make_interrupted_collection(tmp_path)
+    code_commit = "a" * 40
+    libero_revision = "fixture-revision"
+    if mismatch == "protocol":
+        progress_path = output / "collection_progress.json"
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress["protocol_id"] = "different-protocol"
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    elif mismatch == "commit":
+        code_commit = "c" * 40
+    elif mismatch == "revision":
+        libero_revision = "different-revision"
+    else:
+        checkpoint = tmp_path / "different-checkpoint"
+        checkpoint.mkdir()
+
+    with pytest.raises(ExpandedDatasetError, match="resume identity mismatch"):
+        _run_fixture_collection(
+            root=output,
+            checkpoint=checkpoint,
+            suite=suite,
+            collector=_FakeCollector(),
+            resume=True,
+            code_commit=code_commit,
+            libero_revision=libero_revision,
+        )
+
+
+def test_partial_group_is_not_completed_and_is_rerun_on_resume(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output = tmp_path / "collection"
+    suite = _CollectionSuite([1] * 10)
+    _CollectionObservation.save_calls = 0
+    _CollectionObservation.fail_on_save_call = 3
+
+    with pytest.raises(RuntimeError, match="partial group"):
+        _run_fixture_collection(
+            root=output,
+            checkpoint=checkpoint,
+            suite=suite,
+            collector=_FakeCollector(),
+        )
+    progress = json.loads(
+        (output / "collection_progress.json").read_text(encoding="utf-8")
+    )
+    assert progress["counts"]["completed"] == 0
+    assert list((output / "observations").iterdir()) == []
+
+    _CollectionObservation.save_calls = 0
+    _CollectionObservation.fail_on_save_call = None
+    resumed_collector = _FakeCollector()
+    result = _run_fixture_collection(
+        root=output,
+        checkpoint=checkpoint,
+        suite=suite,
+        collector=resumed_collector,
+        resume=True,
+    )
+    assert resumed_collector.calls[0] == (0, 0)
+    assert result.status == "EXPANDED_COLLECTION_COMPLETE"
+
+
+def test_final_validation_failure_does_not_leave_completed_manifest(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output = tmp_path / "collection"
+    _FinalValidationFailObservation.save_calls = 0
+    _FinalValidationFailObservation.fail_on_save_call = None
+
+    with pytest.raises(RuntimeError, match="final validation failure"):
+        collect_expanded_observations(
+            model=object(),
+            processor=object(),
+            pretrained_checkpoint=checkpoint,
+            libero_revision="fixture-revision",
+            code_commit="a" * 40,
+            shared_feature_commit="b" * 40,
+            output_dir=output,
+            progress_factory=lambda **values: _ProgressRecorder(**values),
+            _collector=_FakeCollector(),
+            _runtime=object(),
+            _suite=_CollectionSuite([1] * 10),
+            _observation_type=_FinalValidationFailObservation,
+        )
+
+    assert not (output / "collection_manifest.json").exists()
+    assert not (output / "feasibility_report.json").exists()
+    progress = json.loads(
+        (output / "collection_progress.json").read_text(encoding="utf-8")
+    )
+    assert progress["status"] == "INTERRUPTED_RESUMABLE"
+    assert progress["counts"]["completed"] == 10

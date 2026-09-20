@@ -48,6 +48,18 @@ successful clean trajectories, policy failures, rejected states, accepted
 unique groups, and exact samples. Each observation archive has a recorded
 SHA-256, and the manifest records the exact Tex3D, shared-feature, and LIBERO
 commits. Collection attempts every available state.
+
+Collection execution is state-checkpointed in `collection_progress.json`.
+Without `--resume`, the output directory must be fresh. With explicit
+`--resume`, the collector first verifies the protocol, commits, checkpoint,
+LIBERO revision, canonical state prefix, sample identities, observation files,
+and SHA-256 values. Only verified completed states are skipped; an interrupted
+group is removed and rerun as a unit. The state-granularity progress display
+uses the capacity discovered from the live suite and reports task/state,
+accepted groups, policy failures, sampling rejects, elapsed time, rate, and
+ETA. Resume counters live under `execution` and do not change the scientific
+dataset identity or protocol.
+
 Formal fitting stops if any task has fewer than two accepted groups. Otherwise,
 the split deterministically assigns `floor(0.20 * accepted_groups)` groups per
 task to HELD-OUT, with a minimum of one and at least one TRAIN group. With 50

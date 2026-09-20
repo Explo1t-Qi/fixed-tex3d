@@ -42,6 +42,11 @@ def _args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     collect.add_argument("--pretrained-checkpoint", type=Path, required=True)
     collect.add_argument("--libero-revision", required=True)
     collect.add_argument("--output-dir", type=Path, required=True)
+    collect.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume an existing collection after strict checkpoint validation",
+    )
     return parser.parse_args(argv)
 
 
@@ -63,13 +68,33 @@ def _git_head(path: Path) -> str:
     ).stdout.strip()
 
 
+def _interruption_status(args: argparse.Namespace) -> str:
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is None:
+        return "INTERRUPTED"
+    progress_path = output_dir.expanduser().resolve() / "collection_progress.json"
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "INTERRUPTED"
+    if progress.get("status") == "INTERRUPTED_RESUMABLE":
+        return "INTERRUPTED_RESUMABLE"
+    return "INTERRUPTED"
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     shared = _prepare_source(args.shared_feature_root)
     from shared_feature import libero_collector as collector
 
+    print("runtime initialization started", flush=True)
     runtime = collector._load_official_runtime()
     suite = runtime.benchmark.get_benchmark_dict()[collector.PILOT_SUITE]()
     audit = capacity_report(suite, libero_revision=args.libero_revision)
+    print(
+        "runtime initialization completed: "
+        f"tasks={suite.get_num_tasks()} states={audit['maximum_unique_groups']}",
+        flush=True,
+    )
     if args.command == "audit":
         output = args.output_path.expanduser().resolve()
         if output.exists():
@@ -96,14 +121,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         unnorm_key=UNNORM_KEY,
         center_crop=True,
     )
+    print("model loading started", flush=True)
+    model = get_model(config)
+    processor = get_processor(config)
+    print("model loading completed", flush=True)
     result = collect_expanded_observations(
-        model=get_model(config),
-        processor=get_processor(config),
+        model=model,
+        processor=processor,
         pretrained_checkpoint=checkpoint,
         libero_revision=args.libero_revision,
         code_commit=_git_head(PROJECT_ROOT),
         shared_feature_commit=_git_head(shared),
         output_dir=args.output_dir,
+        resume=args.resume,
+        _collector=collector,
+        _runtime=runtime,
+        _suite=suite,
     )
     return {
         "status": result.status,
@@ -119,8 +152,36 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    result = _run(_args(argv))
-    print(json.dumps(result, sort_keys=True))
+    args = _args(argv)
+    try:
+        result = _run(args)
+    except KeyboardInterrupt:
+        print(
+            json.dumps(
+                {
+                    "status": _interruption_status(args),
+                    "output_dir": str(getattr(args, "output_dir", "")),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 130
+    except Exception as error:
+        status = _interruption_status(args)
+        print(
+            json.dumps(
+                {
+                    "status": status if status == "INTERRUPTED_RESUMABLE" else "FAILED",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise
+    print(json.dumps(result, sort_keys=True), flush=True)
     return 0
 
 
