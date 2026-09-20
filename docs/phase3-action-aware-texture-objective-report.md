@@ -2,9 +2,18 @@
 
 ## Status
 
-**BLOCKED pending corrected PI0.5 P2 artifacts and repeated CUDA smoke.**
+**BLOCKED after corrected representation extraction; corrected probe/stability and Phase 2B v3 remain pending.**
 
 The first 1-step/10-step smoke used a PI0.5 probe fitted on `P2 / sqrt(2048)` while the differentiable runtime supplied native `embed_image()` P2. Those smoke outputs and `phase2b-primary-action-probes-v2` are retained for provenance but are invalid for Phase 3 scientific interpretation. The corrected pipeline requires a new Phase 2B v3 artifact and an explicit clean-frame probe/runtime P2 identity gate before lambda calibration.
+
+The corrected 200-observation PI0.5 representation extraction has completed and
+passed. Corrected seed-7 probe fitting and corrected six-seed stability have not
+yet completed, so `phase2b-primary-action-probes-v3` has not been created. The
+server currently contains only `phase2b-primary-action-probes-v2`, which is
+superseded for Phase 3. Consequently, no corrected lambda calibration, corrected
+1-step smoke, corrected 10-step smoke, or corrected probe/action consistency
+result exists yet. An output directory created by an attempted corrected
+10-step invocation does not change this status.
 
 This phase implements a source-model action-predictive texture objective. It does not establish held-out transfer, causal action relevance, decoded-action change, or policy degradation until the corresponding server runs are complete.
 
@@ -79,7 +88,9 @@ r_m=\operatorname{median}_{frames}
 
 Calibration is read-only and verifies exact texture-parameter equality before and after. Missing, disconnected, zero, or non-finite component gradients block the run. The selected value and all frame-level loss, norm, mean-absolute-gradient, and component-cosine diagnostics are written to `lambda_calibration.json`.
 
-No empirical `lambda_dir` is reported yet because the real dual-GPU calibration has not run.
+No corrected empirical `lambda_dir` is reported. The historical value from the
+invalid v2-probe smoke must not be reused; calibration will be rerun only after a
+validated Phase 2B v3 exists.
 
 ## Training
 
@@ -109,7 +120,7 @@ The dedicated entry point is:
 scripts/phase3_action_aware_optimization.py
 ```
 
-The first server run uses one selected training frame for one update while still materializing the frozen ten-frame substrate and calibrating on all ten frames. The second run uses all ten frames for ten updates. These outputs are explicitly marked non-authoritative. A 500-step run is started only after both pass.
+The first corrected server run will use one selected training frame for one update while still materializing the frozen ten-frame substrate and calibrating on all ten frames. The second corrected run will use all ten frames for ten updates. These outputs are explicitly marked non-authoritative. Neither corrected run has completed. A 500-step run starts only after both and the paired-noise consistency diagnostic pass.
 
 Expected evidence includes frozen-probe hashes, clean-reference detachment, finite/nonzero per-model and ensemble gradients, one update per iteration, unchanged W buffers, texture-budget compliance, and no retained-graph memory growth.
 

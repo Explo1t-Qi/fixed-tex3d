@@ -4,6 +4,14 @@ This stage measures whether model-specific deployed 7-D actions are linearly rea
 
 > **PI0.5 P2 identity correction (2026-09-20).** The historical Phase 2A PI0.5 extractor divided the projector hook output by `sqrt(2048)` even though the current PI0Pytorch `embed_image()` returns `get_image_features()` directly. Historical PI0.5 P2 probe/stability artifacts and `phase2b-primary-action-probes-v2` are preserved for provenance but are superseded and invalid as Phase 3 runtime inputs. The corrected v2 representation manifest requires exact extractor/direct-`embed_image`/prefix identity and no manual scaling.
 
+The corrected 200-observation representation extraction is now complete and
+passed exact P2 identity, action identity, determinism, archive-shape, and
+finite-value checks. Its manifest is
+`experiment_inbox/shared-feature-phase2/phase2-pi05-p2-identity-correction-v1/pi05-representations/representation_manifest.json`
+(SHA-256 `40c2b489b537f24b06c098398f82e89791cb6054797f5e56f48573a78cd2002f`).
+Corrected P2 probe fitting and corrected six-seed stability have not yet been
+executed, so no Phase 2B v3 authority exists.
+
 ## Frozen representation contract
 
 | Model | Node | Definition | Shape per observation |
@@ -74,8 +82,8 @@ No action dimension is near-constant overall or within a task. Probe optimizatio
 
 A subsequent CPU-only diagnostic refitted every node from seeds 1, 2, 3, 4, 5, and 7 under the unchanged protocol. O2, O-deep, and P2 predictions were stable, while P-deep held-out MSE had coefficient of variation `0.1139`. P2 produced a stable row space; O2 narrowly missed the projection-distance threshold; O-deep and P-deep produced materially initialization-dependent subspaces. The diagnostic status remains `NEEDS_REVIEW`; full results are recorded in `docs/phase2-action-probe-stability-report.md`.
 
-Phase 3 subsequently made an explicit primary-node decision: freeze the exact seed-7 O2/P2 probes under the unchanged protocol, retain the O2 projection-distance caveat, and leave both deeper nodes outside the primary texture objective. That historical promotion created `phase2b-primary-action-probes-v2`. Its OpenVLA O2 artifact remains valid; its PI0.5 P2 artifact is superseded by the identity correction above. A new v3 authority may be frozen only after corrected P2 extraction, unchanged-action validation, refitting, and six-seed stability pass.
+Phase 3 subsequently made an explicit primary-node decision: freeze the exact seed-7 O2/P2 probes under the unchanged protocol, retain the O2 projection-distance caveat, and leave both deeper nodes outside the primary texture objective. That historical promotion created `phase2b-primary-action-probes-v2`. Its OpenVLA O2 artifact remains valid; its PI0.5 P2 artifact is superseded by the identity correction above. Corrected extraction and unchanged-action validation now pass. A new v3 authority may be frozen only after corrected seed-7 P2 refitting and corrected six-seed stability pass.
 
 ## Server-only validation boundary
 
-Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. That extraction and Phase 2A candidate materialization have completed. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, projection construction, and multi-seed subspace diagnostics. The primary O2/P2 Phase 2B promotion is complete locally with source hashes unchanged; Phase 3 CUDA calibration and gradient closure remain server-only.
+Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. Historical Phase 2A extraction/materialization and corrected PI0.5 representation extraction have completed. Local tests cover capture semantics with synthetic towers, split integrity, audits, normalization, probe fitting, metrics, serialization, projection construction, and multi-seed subspace diagnostics. Historical Phase 2B v2 is preserved but is invalid as a corrected Phase 3 input. Corrected probe fitting, corrected stability, Phase 2B v3 promotion, and corrected Phase 3 CUDA calibration/gradient closure remain outstanding.

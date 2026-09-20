@@ -8,6 +8,12 @@ This document records the Phase 2A dataset-sufficiency experiment. Its artifacts
 
 > **Superseded PI0.5 P2 result.** The PI0.5 P2 rows below are historical evidence fitted from a representation that was inadvertently divided by `sqrt(2048)`. The fixed scalar does not remove representation information, but the artifact does not match the current native/runtime P2 and must not be used by Phase 3. OpenVLA rows and PI0.5 P-deep are unaffected. Corrected P2 results will be published as a new materialization rather than overwriting this report.
 
+The corrected runtime-compatible P2 representation has since been re-extracted
+for all 200 observations with exact extractor/direct-`embed_image`/prefix
+identity and unchanged action targets. Corrected probe metrics are still pending;
+therefore every PI0.5 P2 probe number in this report remains historical rather
+than corrected evidence. See `docs/pi05-p2-representation-identity-correction.md`.
+
 Phase 2A result: `COMPLETE — Case A`. The existing 200-observation dataset has adequate action coverage and all four candidate representations show non-trivial held-out linear predictability. Dataset densification is not required before Phase 2B.
 
 ## 2. Dataset and split

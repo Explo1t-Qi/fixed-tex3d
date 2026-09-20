@@ -1,5 +1,26 @@
 # PI0.5 P2 Representation Identity Correction
 
+## Current status
+
+**Corrected representation extraction: COMPLETE / PASS.**
+
+**Corrected probe, stability, Phase 2B v3, and corrected Phase 3 smoke: PENDING.**
+
+The formal corrected extraction completed on all 200 frozen Pilot v0.2
+observations at code commit `8f1b51cc86a38f9565daa7c7e3dbb0b7f7c13869`.
+The synchronized evidence is:
+
+```text
+experiment_inbox/shared-feature-phase2/
+  phase2-pi05-p2-identity-correction-v1/
+    pi05-representations/
+```
+
+Its representation manifest has SHA-256
+`40c2b489b537f24b06c098398f82e89791cb6054797f5e56f48573a78cd2002f`,
+schema `phase2_action_representation_manifest_v2`, and materialization ID
+`pi05_p2_runtime_identity_v2`.
+
 ## Scope
 
 This correction aligns the Phase 2 action-probe representation with current authoritative PI0Pytorch runtime semantics. It does not change OpenVLA, P-deep, the Phase 3 loss, renderer, gradient ensemble, or texture update.
@@ -17,16 +38,77 @@ Formal extraction saves the direct official `embed_image(base_0_rgb)` output. It
 
 The first corrected CUDA smoke showed that direct `embed_image()` and the official prefix slice were bit-identical, while the projector hook inside compiled `policy.infer()` differed by relative L2 `0.006723` (maximum absolute difference `3.0`). This was not a fixed scaling: all three norms were approximately `4033`. The corrected extractor therefore uses the direct official path as its representation source instead of relaxing the identity tolerance for the compiled hook.
 
+The subsequent formal extraction confirmed exact identity on its required
+reference observation:
+
+| Comparison with direct `embed_image()` | Maximum absolute difference | Mean absolute difference | Relative L2 error |
+|---|---:|---:|---:|
+| Corrected Phase 2 extractor | 0 | 0 | 0 |
+| Official prefix base-camera slice | 0 | 0 | 0 |
+
+All three BF16 tensors had L2 norm `4033.727294921875`. All 200 archives have
+unique sample identities, finite `projected [256,2048]`, `deep [256,2048]`, and
+`action [7]` arrays, and preserve the collection ordering. Compared with the
+historical manifest under the same deterministic per-sample noise, all 200
+deployed actions were identical (`max_abs_action_difference = 0.0`). The repeat
+forward check also reported zero maximum absolute difference for projected,
+deep, and action outputs. Extraction ran under `torch.inference_mode()` and left
+zero model parameters with gradients.
+
 ## Historical status
 
 The historical Phase 2A PI0.5 P2 archives, stability run, Phase 2B v2 artifact, and initial Phase 3 smoke are preserved unchanged. Their P2 definition used an erroneous extra `1/sqrt(2048)` factor and they are superseded for Phase 3 use. This fixed scaling does not itself change theoretical information content, but it changes finite-step AdamW fitting and made the frozen probe incompatible with native runtime P2.
 
 ## Required corrected pipeline
 
-1. Re-extract only PI0.5 P2/P-deep/actions into a fresh v2 representation materialization.
-2. Fit only corrected PI0.5 P2 with the frozen seed-7 protocol.
-3. Run only corrected PI0.5 P2 seeds `1,2,3,4,5,7` through the frozen stability diagnostic.
-4. If status is `CORRECTED_P2_STABLE`, create Phase 2B v3 by copying OpenVLA O2 byte-identically from Phase 2B v2 and corrected PI0.5 P2 from the new materialization.
-5. Re-run lambda calibration, 1-step smoke, 10-step smoke, and paired-noise probe/action consistency.
+1. ~~Re-extract PI0.5 P2/P-deep/actions into a fresh v2 representation materialization.~~ **PASS**
+2. Fit only corrected PI0.5 P2 with the frozen seed-7 protocol. **PENDING**
+3. Run only corrected PI0.5 P2 seeds `1,2,3,4,5,7` through the frozen stability diagnostic. **PENDING**
+4. If status is `CORRECTED_P2_STABLE`, create Phase 2B v3 by copying OpenVLA O2 byte-identically from Phase 2B v2 and corrected PI0.5 P2 from the new materialization. **PENDING**
+5. Re-run lambda calibration, 1-step smoke, 10-step smoke, and paired-noise probe/action consistency. **PENDING**
 
 The 500-step pilot remains blocked until these gates pass. Runtime results belong in a follow-up result commit; this document does not predeclare them.
+
+No directory named `phase2b-primary-action-probes-v3` currently exists on the
+server. `phase2b-primary-action-probes-v2` remains historical and must not be
+passed to corrected Phase 3 runs. A directory created for an attempted corrected
+10-step command is not scientific evidence when v3 is absent and the run did not
+produce a validated training summary.
+
+## Server path facts
+
+The following paths were confirmed by the server operator and supersede guessed
+paths in earlier command drafts:
+
+```text
+fixed-tex3d repository:
+  /data/xiaomengqi/src/tex3d-fixed
+
+OpenPI repository:
+  /data/xiaomengqi/src/openpi
+
+shared-feature repository / joint Python environment:
+  /data/xiaomengqi/src/shared-feature-tex3d
+  /data/xiaomengqi/src/shared-feature-tex3d/.venv-joint/bin/python
+
+authoritative OpenVLA checkpoint:
+  /data/huangsimin/openvla-7b-finetuned-libero-spatial
+
+authoritative PI0Pytorch checkpoint:
+  /data/xiaomengqi/checkpoints/pi05_libero_pytorch
+
+LIBERO root:
+  /data/xiaomengqi/src/LIBERO-joint
+```
+
+`/data/xiaomengqi/checkpoints/openvla-7b-finetuned-libero-spatial` does not
+exist. The local `openvla-7b-oft-finetuned-libero-spatial` directory is a
+different checkpoint and is not a substitute for the authoritative OpenVLA
+checkpoint in this protocol.
+
+For JSON validation, the corrected representation manifest uses
+`pi05_p2_identity` and `action_identity.compared_observations`. Phase 3 runtime
+identity, once a valid corrected run exists, is stored in
+`training_config.json` under
+`action_predictive_gradient_ensemble.pi05_p2_runtime_identity`. The key
+`representation_identity` is not part of either contract.
