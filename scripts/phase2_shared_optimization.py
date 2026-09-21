@@ -368,6 +368,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "model_aggregation": "(g_o_normalized + g_p_normalized) / 2",
             "probe_artifact_dir": str(paths["probes"]),
             "probe_hashes": frozen_probes.hashes,
+            "probe_artifact_schema": frozen_probes.metadata["schema_version"],
+            "probe_artifact_status": frozen_probes.metadata["status"],
         }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
@@ -909,8 +911,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "objective": args.objective,
             "tex3d_commit": _git_head(PROJECT_ROOT),
-            "phase2b_probe_artifact": str(paths["probes"]),
-            "phase2b_probe_hashes": frozen_probes.hashes,
+            "phase2_probe_artifact": str(paths["probes"]),
+            "phase2_probe_hashes": frozen_probes.hashes,
+            "phase2_probe_schema": frozen_probes.metadata["schema_version"],
+            "phase2_probe_status": frozen_probes.metadata["status"],
             "lambda_calibration": calibration,
             "training_summary": summary,
         }

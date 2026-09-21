@@ -2,33 +2,56 @@
 
 ## Status
 
-**BLOCKED after corrected representation extraction; corrected probe/stability and Phase 2B v3 remain pending.**
+**EXPLORATORY PIPELINE-FEASIBILITY AUTHORIZED with a fixed expanded seed-7
+provisional probe artifact. Authoritative Phase 2B v3 remains NOT FROZEN /
+BLOCKED.**
 
-The first 1-step/10-step smoke used a PI0.5 probe fitted on `P2 / sqrt(2048)` while the differentiable runtime supplied native `embed_image()` P2. Those smoke outputs and `phase2b-primary-action-probes-v2` are retained for provenance but are invalid for Phase 3 scientific interpretation. The corrected pipeline requires a new Phase 2B v3 artifact and an explicit clean-frame probe/runtime P2 identity gate before lambda calibration.
+The first historical 1-step/10-step smoke used a PI0.5 probe fitted on
+`P2 / sqrt(2048)` while the differentiable runtime supplied native `embed_image()`
+P2. Those smoke outputs and `phase2b-primary-action-probes-v2` are retained for
+provenance but are invalid for corrected Phase 3 scientific interpretation.
 
-The corrected 200-observation PI0.5 representation extraction has completed and
-passed. Corrected seed-7 probe fitting and corrected six-seed stability have not
-yet completed, so `phase2b-primary-action-probes-v3` has not been created. The
-server currently contains only `phase2b-primary-action-probes-v2`, which is
-superseded for Phase 3. Consequently, no corrected lambda calibration, corrected
-1-step smoke, corrected 10-step smoke, or corrected probe/action consistency
-result exists yet. An output directory created by an attempted corrected
-10-step invocation does not change this status.
+Expanded Pilot v0.3 has now completed corrected O2/P2 extraction, seed-7 probe
+fitting, and corrected-P2 six-seed stability. The seed-7 probes have strong
+held-out action predictivity, but stability failed (`CV=0.05564`, minimum
+principal cosine `0.65546`, maximum projection distance `0.61612`). This is a
+full-subspace reproducibility limitation, not an artifact/provenance failure.
+Therefore `phase2b-primary-action-probes-v3` has not been created.
+
+The next phase is explicitly **fixed-seed-7 exploratory Phase 3 pipeline
+feasibility** using only
+`phase2-expanded-seed7-provisional-action-probes-v1`. Its question is whether a
+fixed action-predictive probe can drive the complete representation-objective →
+gradient aggregation → texture optimization → policy-evaluation pipeline to a
+meaningful behavioral effect. It does not establish general probe stability,
+unique action-subspace identification, held-out VLA transfer, or general seed
+robustness. These unresolved Phase 2 limits remain attached even if an
+exploratory Phase 3 run succeeds.
 
 This phase implements a source-model action-predictive texture objective. It does not establish held-out transfer, causal action relevance, decoded-action change, or policy degradation until the corresponding server runs are complete.
 
 ## Phase 2 provenance
 
-Phase 3 uses only the seed-7 primary projected nodes from the frozen Pilot v0.2 dataset and `pilot-v0.2-c5-split-v1` split:
+The current exploratory Phase 3 handoff uses only the exact seed-7 primary
+projected nodes from Expanded Pilot v0.3 and
+`pilot-v0.3-expanded-split-v1`:
 
-| Model | Node | Shape | Phase 2A held-out MSE | Frozen W SHA-256 |
-|---|---|---:|---:|---|
-| OpenVLA | O2 | `[256,4096]` | 0.619732 | `0377a285b180aaf80e7a038e6b036860389892b818368448c10966328eaed25c` |
-| PI0.5 | P2 (historical, superseded) | `[256,2048]` | 0.666358 | `ba2351f836bb8c58de28f7aa125b0f7b901c8b08bec2346c21ef2c9107200369` |
+| Model | Node | Shape | Phase 2A held-out MSE | Mean baseline MSE | W TRAIN-nullspace fraction |
+|---|---|---:|---:|---:|---:|
+| OpenVLA | O2 | `[256,4096]` | 0.29370 | 0.99444 | 0.38858 |
+| PI0.5 | corrected P2 | `[256,2048]` | 0.32206 | 1.00244 | 0.22191 |
 
-The Phase 2B promotion validates the original Phase 2A inventory, exact seed-7 probe configuration, split identity, stability provenance, and seed-7 weight equality before copying O2/P2 artifacts into a fresh authority directory. The Phase 2A source inventory was rehashed after promotion with zero mismatches.
+The provisional promotion validates the expanded Phase 2A inventory, exact
+seed-7 configuration, split identity, collection and representation-manifest
+hashes, corrected P2 identity, stability provenance, source artifact invariance,
+and byte-identical O2/P2 copies. It performs no probe refitting. The output
+inventory records SHA-256 for every copied file.
 
-The stability result remains qualified. P2 passed all registered prediction/subspace checks. O2 passed prediction-CV and principal-angle checks, while its maximum ridge-projection relative distance (0.3342) exceeded the diagnostic threshold of 0.25. The Phase 3 task explicitly selects seed-7 O2/P2; this report preserves the O2 caveat rather than relabeling the complete Phase 2 diagnostic as stable.
+The stability result remains a failed/unresolved qualification. Corrected P2
+held-out predictivity is strong, but all three frozen stability checks fail.
+The Phase 3 task explicitly selects the fixed seed-7 O2/P2 artifact for
+pipeline feasibility only; it does not relabel the complete Phase 2 diagnostic
+as stable or create authoritative Phase 2B v3.
 
 Frozen probe protocol:
 
@@ -40,13 +63,19 @@ weight_decay = 1e-4
 steps = 2000
 action_std_epsilon = 1e-6
 probe_reg = 1e-4
-TRAIN / HELD-OUT = 160 / 40 observations
+TRAIN / HELD-OUT = 1914 / 456 observations
 ```
 
-The superseded historical Phase 2B artifact is:
+The superseded historical Phase 2B artifact is retained only for provenance:
 
 ```text
 experiment_inbox/shared-feature-phase3/phase2b-primary-action-probes-v2/
+```
+
+The current exploratory artifact is:
+
+```text
+phase2-expanded-seed7-provisional-action-probes-v1/
 ```
 
 ## Objective
@@ -89,8 +118,8 @@ r_m=\operatorname{median}_{frames}
 Calibration is read-only and verifies exact texture-parameter equality before and after. Missing, disconnected, zero, or non-finite component gradients block the run. The selected value and all frame-level loss, norm, mean-absolute-gradient, and component-cosine diagnostics are written to `lambda_calibration.json`.
 
 No corrected empirical `lambda_dir` is reported. The historical value from the
-invalid v2-probe smoke must not be reused; calibration will be rerun only after a
-validated Phase 2B v3 exists.
+invalid v2-probe smoke must not be reused. Calibration will be rerun against the
+validated provisional seed-7 artifact before the first corrected smoke.
 
 ## Training
 

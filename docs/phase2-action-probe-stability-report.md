@@ -1,5 +1,37 @@
 # Phase 2 — Action-Probe Stability Diagnostic
 
+## Authoritative addendum — Expanded corrected PI0.5 P2 (2026-09-21)
+
+The historical Pilot v0.2 diagnostic below remains provenance only. The current
+corrected-P2 diagnostic used Expanded Pilot v0.3: 395 groups / 2,370
+observations, the `pilot-v0.3-expanded-split-v1` split (319 TRAIN groups / 1,914
+observations; 76 HELD-OUT groups / 456 observations), and the unchanged seeds
+`1,2,3,4,5,7` plus frozen AdamW protocol.
+
+| Check | Threshold | Expanded corrected-P2 result | Decision |
+|---|---:|---:|---|
+| Held-out MSE CV | ≤ 0.05 | 0.05564 | FAIL |
+| Minimum principal cosine | ≥ 0.90 | 0.65546 | FAIL |
+| Maximum projection relative Frobenius distance | ≤ 0.25 | 0.61612 | FAIL |
+
+The status is `CORRECTED_P2_NEEDS_REVIEW`. The exact seed-7 Phase 2A W was
+reproduced by the stability run (`max_abs_difference=0.0`), and source artifacts
+were unchanged. Hence this is not an artifact/provenance failure.
+
+Corrected P2 prediction remains strong: seed-7 held-out normalized MSE is
+`0.32206` against a `1.00244` mean baseline, and all seven held-out coordinate
+R² values are positive. However, the full rank-7 row space is not reproducibly
+identified under seed changes. The TRAIN matrix has shape `[1914,2048]`, rank
+1914, a 134-dimensional strict nullspace, and effective condition number
+`3.079e7`; the fitted W nullspace fraction is `0.22191`–`0.23209` across seeds.
+The weakest principal directions are unstable, while corresponding action-row
+cosines remain relatively high. Expanded data therefore improved predictivity
+and generalization without resolving full-subspace initialization stability.
+
+This leaves authoritative Phase 2B v3 **NOT FROZEN / BLOCKED**. A separately
+named seed-7 provisional artifact is authorized only for exploratory Phase 3
+pipeline-feasibility experiments; it does not relabel this failed stability gate.
+
 ## Scope
 
 This CPU-only diagnostic measures prediction stability and candidate action-predictive subspace stability across random probe initializations. It does not establish causal action relevance, action controllability, texture effectiveness, or transferability, and it does not modify the Phase 2A/2B protocol.
@@ -7,8 +39,8 @@ This CPU-only diagnostic measures prediction stability and candidate action-pred
 > **Historical PI0.5 P2 diagnostic.** The P2 rows in this report were computed
 > from the superseded `P2 / sqrt(2048)` Phase 2A archive. They remain provenance
 > for that fitting condition and are not evidence that the corrected native P2
-> probe is stable. The corrected 200-observation P2 representation archive now
-> passes identity validation, but its six-seed diagnostic is still pending.
+> probe is stable. The current corrected expanded result is recorded in the
+> authoritative addendum above; this historical section is unchanged context.
 
 ## Frozen protocol
 
@@ -50,7 +82,14 @@ Per-action R² is stable for O2 and P2. O-deep shows only small variation. P-dee
 | PI0.5 P2 | 0.9909–0.9963 | 0.9736 | 0.9915 | 0.9492 | 0.2268 |
 | PI0.5 P-deep | 0.1050–0.4881 | -0.1429 | 0.3570 | 0.0023 | 1.3081 |
 
-Historical scaled PI0.5 P2 is stable under every predeclared criterion for that superseded fitting condition. This result must be rerun on corrected native P2 before Phase 2B v3. OpenVLA O2 has highly consistent action rows and principal angles, but its maximum ridge-projection distance of `0.3342` exceeds the `0.25` threshold. OpenVLA O-deep produces stable predictions from only moderately stable row spaces. Its gripper direction is the least consistent action row, and its minimum principal cosine is `0.6958`.
+Historical scaled PI0.5 P2 is stable under every predeclared criterion for that
+superseded fitting condition. The required corrected rerun has since completed
+on Expanded Pilot v0.3 and failed the full-subspace gate; see the authoritative
+addendum above. OpenVLA O2 has highly consistent action rows and principal
+angles, but its maximum ridge-projection distance of `0.3342` exceeds the `0.25`
+threshold. OpenVLA O-deep produces stable predictions from only moderately
+stable row spaces. Its gripper direction is the least consistent action row, and
+its minimum principal cosine is `0.6958`.
 
 PI0.5 P-deep is strongly under-determined. Its gripper row cosine has pairwise mean `0.1050` and reaches `-0.1429`; the minimum principal cosine is nearly zero and the projection distance is close to the maximum expected for distinct equal-rank subspaces. This is not solely a consequence of seed 3 failing to converge: seeds 1, 2, 4, and 5 each have mean principal cosine only about `0.34–0.35` relative to seed 7.
 
@@ -87,7 +126,13 @@ The predeclared `STABLE` rule requires every node to have held-out MSE coefficie
 
 Status: `NEEDS_REVIEW`. Nodes requiring review: ['openvla/o2', 'openvla/deep', 'pi05/deep'].
 
-The historical Phase 2A action-predictability conclusion remains supported for its recorded fitting condition. The concrete candidate direction/subspace is not equally reproducible across nodes. The historical scaled PI0.5 P2 result passed this diagnostic, but corrected native P2 is not yet classified. OpenVLA O2 is close but misses the projection-distance criterion; O-deep and especially P-deep are under-determined in the current high-dimensional, small-sample fitting setup.
+The historical Phase 2A action-predictability conclusion remains supported for
+its recorded fitting condition. The concrete candidate direction/subspace is not
+equally reproducible across nodes. The historical scaled PI0.5 P2 result passed
+this diagnostic, whereas the current corrected expanded P2 result is classified
+`CORRECTED_P2_NEEDS_REVIEW` in the addendum. OpenVLA O2 is close but misses the
+projection-distance criterion; O-deep and especially P-deep are under-determined
+in the current high-dimensional, small-sample fitting setup.
 
 Phase 2B freeze should therefore remain paused for method review. The diagnostic does not select or apply a remedy. Stronger regularization, a closed-form ridge/minimum-norm probe, or more observations are follow-up candidates that require an explicit protocol decision and a new controlled experiment.
 

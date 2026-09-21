@@ -1,5 +1,53 @@
 # Phase 2 — Action-Predictive Representation Report
 
+## Authoritative update — Expanded Pilot v0.3 (2026-09-21)
+
+This section is the current Phase 2 result for the primary nodes. The historical
+Pilot v0.2 sections below are retained unchanged for provenance and must not be
+read as the current corrected-P2 decision.
+
+Expanded Pilot v0.3 contains 395 successful clean OpenVLA trajectory groups and
+2,370 frozen paired observations. Its deterministic group-aware split is
+`pilot-v0.3-expanded-split-v1`: 319 TRAIN groups / 1,914 observations and 76
+HELD-OUT groups / 456 observations. The primary representations are OpenVLA O2
+`[256,4096]` and corrected PI0.5 P2 `[256,2048]`. Corrected P2 is the native
+`paligemma_with_expert.embed_image(base_0_rgb)` output with no additional manual
+`1/sqrt(2048)` scaling.
+
+The frozen seed-7 probe remains `Linear(D,7,bias=False)` with AdamW, learning
+rate `1e-3`, weight decay `1e-4`, 2,000 steps, TRAIN-only action normalization,
+`action_std_epsilon=1e-6`, and `probe_reg=1e-4`.
+
+| Model | Node | TRAIN MSE | HELD-OUT MSE | Mean baseline MSE | Feature rank | W TRAIN-nullspace fraction |
+|---|---|---:|---:|---:|---:|---:|
+| OpenVLA | O2 | 0.13429 | 0.29370 | 0.99444 | 1914 / 4096 | 0.38858 |
+| PI0.5 | corrected P2 | 0.23880 | 0.32206 | 1.00244 | 1914 / 2048 | 0.22191 |
+
+For corrected P2, every held-out action-coordinate R² is positive
+(`0.48401`–`0.85314`), `rank_W=7`, and serialization/reload is exact. Thus the
+Phase 2 action-predictive signal is **PASS / strongly supported**, and the exact
+seed-7 O2/P2 probes are valid fixed candidate artifacts. This is predictivity
+evidence only; it does not establish causal relevance, transfer, or a uniquely
+identified action subspace.
+
+The six-seed corrected-P2 stability diagnostic (`1,2,3,4,5,7`) is separately
+`CORRECTED_P2_NEEDS_REVIEW`: held-out MSE CV `0.05564 > 0.05`, minimum principal
+cosine `0.65546 < 0.90`, and maximum projection distance `0.61612 > 0.25`.
+Prediction/generalization improved substantially versus Pilot v0.2, but the
+complete rank-7 action-predictive row space is not reproducibly identified across
+probe initialization seeds under the frozen finite-step AdamW protocol. This is
+not an artifact, path, pairing, or provenance failure, and it does not make the
+expanded collection unsuccessful.
+
+Scientific status:
+
+- Phase 2 action-predictive signal: `PASS / strongly supported`.
+- Seed-7 probe usability: `PASS as a fixed candidate artifact`.
+- Cross-seed full-subspace reproducibility: `FAIL / unresolved`.
+- Authoritative Phase 2B v3: `NOT FROZEN / BLOCKED`.
+- Exploratory Phase 3 pipeline feasibility: authorized only with the exact fixed
+  seed-7 provisional artifact described in the Phase 2→3 handoff.
+
 ## 1. Scope and status
 
 This experiment evaluates action predictability only. It does not establish causal action relevance, texture effectiveness, controllability, policy degradation, or transferability.

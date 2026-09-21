@@ -32,6 +32,12 @@ ACTION_DIMENSION = 7
 DIRECTION_EPS = 1e-8
 CALIBRATION_EPS = 1e-12
 PHASE2B_SCHEMA = "phase2b_primary_action_probes_v2"
+PHASE2_EXPANDED_SEED7_PROVISIONAL_SCHEMA = (
+    "phase2_expanded_seed7_provisional_action_probes_v1"
+)
+PHASE2_EXPANDED_SEED7_PROVISIONAL_STATUS = (
+    "PHASE2_EXPANDED_SEED7_PROVISIONAL_FROZEN"
+)
 
 
 class ActionPredictiveObjectiveError(RuntimeError):
@@ -194,13 +200,26 @@ def load_frozen_primary_probes(
     inventory_path = root / "artifact_inventory.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    if (
-        metadata.get("schema_version") != PHASE2B_SCHEMA
-        or metadata.get("status") != "PHASE_2B_PRIMARY_FROZEN"
-        or metadata.get("seed") != 7
-        or metadata.get("split_rule") != "pilot-v0.2-c5-split-v1"
-    ):
-        raise ActionPredictiveObjectiveError("invalid Phase 2B primary metadata")
+    historical_phase2b = (
+        metadata.get("schema_version") == PHASE2B_SCHEMA
+        and metadata.get("status") == "PHASE_2B_PRIMARY_FROZEN"
+        and metadata.get("split_rule") == "pilot-v0.2-c5-split-v1"
+    )
+    expanded_provisional = (
+        metadata.get("schema_version") == PHASE2_EXPANDED_SEED7_PROVISIONAL_SCHEMA
+        and metadata.get("status") == PHASE2_EXPANDED_SEED7_PROVISIONAL_STATUS
+        and metadata.get("artifact_id")
+        == "phase2-expanded-seed7-provisional-action-probes-v1"
+        and metadata.get("split_rule") == "pilot-v0.3-expanded-split-v1"
+        and metadata.get("phase2_status", {}).get("authoritative_phase2b_v3")
+        == "NOT_FROZEN_BLOCKED"
+        and metadata.get("phase2_status", {}).get(
+            "phase3_exploratory_pipeline_feasibility"
+        )
+        == "AUTHORIZED_FIXED_SEED7_ONLY"
+    )
+    if not (historical_phase2b or expanded_provisional) or metadata.get("seed") != 7:
+        raise ActionPredictiveObjectiveError("invalid Phase 2 probe metadata")
     pi05_projected = (
         metadata.get("models", {})
         .get("pi05", {})
@@ -210,10 +229,20 @@ def load_frozen_primary_probes(
     if (
         pi05_projected.get("definition_id")
         != "pi05_p2_embed_image_no_manual_scaling_v2"
-        or metadata.get("provenance", {}).get("openvla_W_unchanged") is not True
     ):
         raise ActionPredictiveObjectiveError(
-            "Phase 2B PI0.5 P2 is not runtime-identity-corrected"
+            "Phase 2 PI0.5 P2 is not runtime-identity-corrected"
+        )
+    if (
+        historical_phase2b
+        and metadata.get("provenance", {}).get("openvla_W_unchanged") is not True
+    ):
+        raise ActionPredictiveObjectiveError("historical Phase 2B O2 provenance failed")
+    if expanded_provisional and metadata.get("provenance", {}).get("promotion") != (
+        "byte-identical copy; no probe refitting"
+    ):
+        raise ActionPredictiveObjectiveError(
+            "expanded provisional probe provenance failed"
         )
     expected_probe = {
         "architecture": "Linear(D,7,bias=False)",

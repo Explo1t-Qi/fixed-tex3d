@@ -115,9 +115,45 @@ of W norm in the TRAIN feature nullspace. Stability outputs retain all signed
 corresponding action-row cosines, all principal-angle cosines, projection
 distances, six-seed MSE CV, and per-seed nullspace fractions.
 
-Phase 2B v3 freeze and all Phase 3 commands are blocked until the user reviews
-the expanded corrected-P2 stability result. Stability thresholds and frozen
-probe hyperparameters remain unchanged.
+## Expanded Pilot v0.3 result and authority boundary (2026-09-21)
+
+The complete expanded pipeline above has now run. It produced 395 accepted
+groups / 2,370 observations, with 319 TRAIN groups / 1,914 observations and 76
+HELD-OUT groups / 456 observations. The seed-7 primary probes support action
+predictivity for both O2 and corrected P2:
+
+| Model | Node | TRAIN MSE | HELD-OUT MSE | Baseline MSE | Rank | W nullspace fraction |
+|---|---|---:|---:|---:|---:|---:|
+| OpenVLA | O2 | 0.13429 | 0.29370 | 0.99444 | 1914 / 4096 | 0.38858 |
+| PI0.5 | corrected P2 | 0.23880 | 0.32206 | 1.00244 | 1914 / 2048 | 0.22191 |
+
+Corrected P2 has positive held-out R² for all seven action coordinates
+(`0.48401`–`0.85314`), rank-7 W, and exact serialization/reload. These are valid
+fixed seed-7 candidate probes, not an automatic Phase 2B promotion.
+
+The frozen six-seed P2 stability decision is
+`CORRECTED_P2_NEEDS_REVIEW`: held-out MSE CV `0.05564` exceeds `0.05`; minimum
+principal cosine `0.65546` is below `0.90`; and maximum projection distance
+`0.61612` exceeds `0.25`. Thresholds and probe hyperparameters remain unchanged.
+The expanded collection improved predictive generalization, but did not resolve
+full rank-7 initialization stability. This is an identification limitation under
+the current fitting protocol, not a collection or provenance failure.
+
+Accordingly, `phase2b-primary-action-probes-v3` remains **NOT FROZEN / BLOCKED**.
+The only permitted Phase 3 handoff is the explicit provisional artifact
+`phase2-expanded-seed7-provisional-action-probes-v1`: a byte-identical O2/P2
+seed-7 copy for exploratory pipeline-feasibility work. It records source hashes,
+expanded split/dataset provenance, representation-manifest hashes, metrics, and
+the corrected P2 identity. It must never be described as Phase 2B v3 or as
+evidence of cross-seed full-subspace reproducibility.
+
+The exploratory order is fixed seed-7 probes → fresh `lambda_dir` recalibration
+→ corrected 1-step smoke → corrected 10-step smoke → probe-vs-actual-action
+consistency diagnostic → exploratory full optimization pilot → source-policy
+rollout evaluation. Historical lambda values from the superseded scaled P2
+definition are invalid here. No calibration or smoke result establishes general
+probe stability, unique subspace identification, held-out VLA transfer, or seed
+robustness.
 
 ## Real-checkpoint extraction smoke status
 
@@ -160,4 +196,13 @@ Phase 3 subsequently made an explicit primary-node decision: freeze the exact se
 
 ## Server-only validation boundary
 
-Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints, CUDA, and the complete OpenPI runtime. Historical Phase 2A extraction/materialization and corrected PI0.5 representation extraction have completed. Local tests cover collection-schema validation, configurable sampling, variable group counts, split integrity, audits, normalization, probe fitting, metrics, serialization, projection construction, and multi-seed subspace diagnostics. Historical Phase 2B v2 is preserved but is invalid as a corrected Phase 3 input. Expanded collection, expanded O2/P2 extraction, expanded seed-7 probes, and expanded corrected-P2 stability remain server-only work. Phase 2B v3 and every Phase 3 operation remain paused pending review of those results.
+Complete extraction requires the authoritative OpenVLA and PI0Pytorch checkpoints,
+CUDA, and the complete OpenPI runtime. Expanded collection, O2/P2 extraction,
+seed-7 probes, and corrected-P2 stability have now completed on the server and
+their synchronized artifacts passed the corresponding integrity checks. Local
+tests cover collection-schema validation, configurable sampling, variable group
+counts, split integrity, audits, normalization, probe fitting, metrics,
+serialization, projection construction, and multi-seed subspace diagnostics.
+Historical Phase 2B v2 remains provenance only and is invalid as a corrected
+Phase 3 input. Phase 2B v3 remains blocked; only the documented provisional
+seed-7 Phase 3 calibration and 1-step smoke are authorized next.
