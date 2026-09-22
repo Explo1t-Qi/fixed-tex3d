@@ -252,6 +252,21 @@ class Pi05BaseImageAdapter:
         return observation
 
 
+def extract_pi05_p2_from_preprocessed_base_image(
+    model: Any, base_image: torch.Tensor
+) -> torch.Tensor:
+    """Run the live P2 implementation on an already-preprocessed base image."""
+
+    try:
+        p2 = model.paligemma_with_expert.embed_image(base_image)
+    except Exception as error:
+        raise Phase2GradientClosureError(
+            "PI0Pytorch base_0_rgb image-to-P2 forward failed"
+        ) from error
+    _validate_finite_feature(p2, name="PI0Pytorch P2", expected_tail=P2_SHAPE)
+    return p2
+
+
 def extract_pi05_p2_autograd(model: Any, observation: Any) -> torch.Tensor:
     """Return live base-camera P2 without no-grad, detach, pooling, or reordering."""
 
@@ -290,14 +305,7 @@ def extract_pi05_p2_autograd(model: Any, observation: Any) -> torch.Tensor:
             raise Phase2GradientClosureError(
                 f"PI0Pytorch preprocessing changed {key} mask semantics"
             )
-    try:
-        p2 = model.paligemma_with_expert.embed_image(images[0])
-    except Exception as error:
-        raise Phase2GradientClosureError(
-            "PI0Pytorch base_0_rgb image-to-P2 forward failed"
-        ) from error
-    _validate_finite_feature(p2, name="PI0Pytorch P2", expected_tail=P2_SHAPE)
-    return p2
+    return extract_pi05_p2_from_preprocessed_base_image(model, images[0])
 
 
 @dataclass(frozen=True)

@@ -202,9 +202,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         Pi05BaseImageAdapter,
         extract_pi05_p2_autograd,
     )
-    from phase2_action_representation import (
-        extract_pi05_official_p2,
-    )
     from phase2_native_gradient_ensemble import (
         DualVLANativeFeatureAdapter,
         NativeTrainingFrame,
@@ -222,6 +219,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         DualVLAActionPredictiveAdapter,
         calibrate_lambda_dir,
         load_frozen_primary_probes,
+        pi05_preprocessing_input_difference,
         train_action_predictive_gradient_ensemble,
         validate_pi05_probe_runtime_identity,
     )
@@ -463,6 +461,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     frame_contract = []
     calibration_count = 0
     phase3_pi05_p2_identity = None
+    phase3_pi05_preprocessing_difference = None
     for state_id in range(protocol.num_train_init_states):
         env, task_description = get_libero_env(task, "openvla", resolution=512)
         try:
@@ -556,13 +555,39 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 clean = pipeline.clean_reference(clean_image)
                 if state_id == 0:
-                    authoritative = extract_pi05_official_p2(
-                        model=pi05.model,
-                        observation=pi_inputs.clean_observation,
-                    )
-                    phase3_pi05_p2_identity = validate_pi05_probe_runtime_identity(
-                        authoritative,
-                        clean.p2,
+                    with torch.no_grad():
+                        official_input = pi05.model._preprocess_observation(
+                            pi_inputs.clean_observation, train=False
+                        )[0][0]
+                        differentiable_observation = (
+                            pi_inputs.observation_for_base_image(clean_image)
+                        )
+                        differentiable_input = pi05.model._preprocess_observation(
+                            differentiable_observation, train=False
+                        )[0][0]
+                        phase3_pi05_preprocessing_difference = (
+                            pi05_preprocessing_input_difference(
+                                official_input, differentiable_input
+                            )
+                        )
+                        config["action_predictive_gradient_ensemble"][
+                            "pi05_preprocessing_input_difference"
+                        ] = phase3_pi05_preprocessing_difference
+                        config_path.write_text(
+                            json.dumps(config, indent=2, sort_keys=True) + "\n"
+                        )
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            phase3_pi05_p2_identity = (
+                                validate_pi05_probe_runtime_identity(
+                                    model=pi05.model,
+                                    preprocessed_base_image=differentiable_input,
+                                )
+                            )
+                    config["action_predictive_gradient_ensemble"][
+                        "pi05_p2_runtime_identity"
+                    ] = phase3_pi05_p2_identity
+                    config_path.write_text(
+                        json.dumps(config, indent=2, sort_keys=True) + "\n"
                     )
                 frame_type = ActionPredictiveTrainingFrame
                 clean_reference_space = "native_o2_p2_action_predictive_coordinates"
@@ -634,7 +659,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "frozen frame-pool/calibration contract was not materialized"
         )
     if args.objective == ACTION_PREDICTIVE_GRADIENT_ENSEMBLE_OBJECTIVE:
-        if phase3_pi05_p2_identity is None:
+        if (
+            phase3_pi05_p2_identity is None
+            or phase3_pi05_preprocessing_difference is None
+        ):
             raise RuntimeError("Phase 3 PI0.5 P2 runtime identity was not checked")
         config["action_predictive_gradient_ensemble"]["pi05_p2_runtime_identity"] = (
             phase3_pi05_p2_identity

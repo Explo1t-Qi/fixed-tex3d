@@ -22,7 +22,12 @@ from phase2_native_gradient_ensemble import (
     _model_gradient,
     _scalar,
 )
-from phase2_shared_gradient import O2_SHAPE, P2_SHAPE, _validate_finite_feature
+from phase2_shared_gradient import (
+    O2_SHAPE,
+    P2_SHAPE,
+    _validate_finite_feature,
+    extract_pi05_p2_from_preprocessed_base_image,
+)
 from phase2_shared_optimization import sign_pgd_update, validate_texture_budget
 from phase2_action_representation import pi05_p2_identity_metrics
 
@@ -45,20 +50,62 @@ class ActionPredictiveObjectiveError(RuntimeError):
 
 
 def validate_pi05_probe_runtime_identity(
-    authoritative_p2: torch.Tensor, runtime_p2: torch.Tensor
+    *, model: Any, preprocessed_base_image: torch.Tensor
 ) -> dict[str, Any]:
-    """Gate Phase 3 on corrected probe/runtime PI0.5 P2 identity."""
+    """Gate native and live P2 on the *same* model input and autocast context."""
 
     try:
-        return pi05_p2_identity_metrics(
+        with torch.no_grad():
+            authoritative_p2 = model.paligemma_with_expert.embed_image(
+                preprocessed_base_image
+            )
+            runtime_p2 = extract_pi05_p2_from_preprocessed_base_image(
+                model, preprocessed_base_image
+            )
+        result = pi05_p2_identity_metrics(
             extractor=authoritative_p2,
             embed_image=runtime_p2,
             prefix=authoritative_p2,
         )
+        result["comparison_input"] = "same_preprocessed_base_0_rgb_tensor"
+        return result
     except Exception as error:
         raise ActionPredictiveObjectiveError(
             "Phase 3 PI0.5 probe/runtime P2 identity mismatch"
         ) from error
+
+
+def pi05_preprocessing_input_difference(
+    official_base_image: torch.Tensor, differentiable_base_image: torch.Tensor
+) -> dict[str, Any]:
+    """Report preprocessing gap; this is not a P2 implementation gate."""
+
+    if (
+        not isinstance(official_base_image, torch.Tensor)
+        or not isinstance(differentiable_base_image, torch.Tensor)
+        or official_base_image.shape != differentiable_base_image.shape
+        or not official_base_image.is_floating_point()
+        or not differentiable_base_image.is_floating_point()
+        or not bool(torch.isfinite(official_base_image).all())
+        or not bool(torch.isfinite(differentiable_base_image).all())
+    ):
+        raise ActionPredictiveObjectiveError(
+            "PI0.5 preprocessing inputs must be finite, floating, and shape-matched"
+        )
+    official = official_base_image.detach().float()
+    difference = differentiable_base_image.detach().float() - official
+    return {
+        "shape": list(official.shape),
+        "official_dtype": str(official_base_image.dtype),
+        "differentiable_dtype": str(differentiable_base_image.dtype),
+        "max_abs_difference": float(difference.abs().max()),
+        "mean_abs_difference": float(difference.abs().mean()),
+        "relative_l2_error": float(
+            torch.linalg.vector_norm(difference)
+            / torch.linalg.vector_norm(official).clamp_min(1e-12)
+        ),
+        "hard_gate": False,
+    }
 
 
 def _sha256(path: Path) -> str:

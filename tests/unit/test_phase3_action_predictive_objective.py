@@ -25,6 +25,7 @@ from phase3_action_predictive_objective import (  # noqa: E402
     action_predictive_losses,
     calibrate_lambda_dir,
     load_frozen_primary_probes,
+    pi05_preprocessing_input_difference,
     validate_pi05_probe_runtime_identity,
     train_action_predictive_gradient_ensemble,
 )
@@ -96,16 +97,70 @@ def test_primary_probe_artifact_loads_with_hash_validation(tmp_path: Path) -> No
         load_frozen_primary_probes(root, openvla_device="cpu", pi05_device="cpu")
 
 
-def test_pi05_probe_runtime_identity_rejects_fixed_scaling() -> None:
-    authoritative = torch.randn(1, 256, 2048, dtype=torch.bfloat16)
-    result = validate_pi05_probe_runtime_identity(authoritative, authoritative.clone())
+class _FakeImageEmbedder:
+    def __init__(self) -> None:
+        self.inputs: list[torch.Tensor] = []
+
+    def embed_image(self, image: torch.Tensor) -> torch.Tensor:
+        self.inputs.append(image)
+        return image.mean(dim=(1, 2, 3), keepdim=True).reshape(-1, 1, 1).expand(
+            -1, 256, 2048
+        )
+
+
+class _FakePi05Model:
+    def __init__(self) -> None:
+        self.paligemma_with_expert = _FakeImageEmbedder()
+
+
+def test_pi05_probe_runtime_identity_uses_same_preprocessed_tensor() -> None:
+    preprocessed = torch.ones(1, 3, 224, 224, dtype=torch.bfloat16)
+    model = _FakePi05Model()
+    result = validate_pi05_probe_runtime_identity(
+        model=model, preprocessed_base_image=preprocessed
+    )
     assert result["identity_pass"] is True
+    assert len(model.paligemma_with_expert.inputs) == 2
+    assert all(
+        value is preprocessed for value in model.paligemma_with_expert.inputs
+    )
+    assert result["comparison_input"] == "same_preprocessed_base_0_rgb_tensor"
+    assert result["definition_id"] == "pi05_p2_embed_image_no_manual_scaling_v2"
+    assert result["comparisons_to_embed_image"]["phase2_extractor"][
+        "max_abs_difference"
+    ] == 0.0
+
+
+def test_pi05_preprocessing_gap_is_diagnostic_not_identity_failure() -> None:
+    official = torch.ones(1, 3, 224, 224)
+    differentiable = official * 0.75
+    diagnostic = pi05_preprocessing_input_difference(official, differentiable)
+    assert diagnostic["max_abs_difference"] == pytest.approx(0.25)
+    assert diagnostic["mean_abs_difference"] == pytest.approx(0.25)
+    assert diagnostic["relative_l2_error"] == pytest.approx(0.25)
+    assert diagnostic["hard_gate"] is False
+    assert validate_pi05_probe_runtime_identity(
+        model=_FakePi05Model(), preprocessed_base_image=differentiable
+    )["identity_pass"] is True
+
+
+def test_pi05_probe_runtime_identity_rejects_fixed_scaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _FakePi05Model()
+    preprocessed = torch.ones(1, 3, 224, 224, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        phase3,
+        "extract_pi05_p2_from_preprocessed_base_image",
+        lambda model, image: model.paligemma_with_expert.embed_image(image)
+        / np.sqrt(2048),
+    )
 
     with pytest.raises(
         phase3.ActionPredictiveObjectiveError, match="probe/runtime P2 identity"
     ):
         validate_pi05_probe_runtime_identity(
-            authoritative, authoritative * np.sqrt(2048)
+            model=model, preprocessed_base_image=preprocessed
         )
 
 
