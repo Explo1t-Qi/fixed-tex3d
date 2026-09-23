@@ -12,9 +12,8 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from phase2_action_representation import pi05_p2_identity_metrics
 from phase2_native_gradient_ensemble import (
     ModelGradientAccumulator,
     NativeFeatures,
@@ -29,8 +28,7 @@ from phase2_shared_gradient import (
     extract_pi05_p2_from_preprocessed_base_image,
 )
 from phase2_shared_optimization import sign_pgd_update, validate_texture_budget
-from phase2_action_representation import pi05_p2_identity_metrics
-
+from torch import nn
 
 ACTION_NAMES = ("x", "y", "z", "rot_x", "rot_y", "rot_z", "gripper")
 ACTION_DIMENSION = 7
@@ -40,9 +38,7 @@ PHASE2B_SCHEMA = "phase2b_primary_action_probes_v2"
 PHASE2_EXPANDED_SEED7_PROVISIONAL_SCHEMA = (
     "phase2_expanded_seed7_provisional_action_probes_v1"
 )
-PHASE2_EXPANDED_SEED7_PROVISIONAL_STATUS = (
-    "PHASE2_EXPANDED_SEED7_PROVISIONAL_FROZEN"
-)
+PHASE2_EXPANDED_SEED7_PROVISIONAL_STATUS = "PHASE2_EXPANDED_SEED7_PROVISIONAL_FROZEN"
 
 
 class ActionPredictiveObjectiveError(RuntimeError):
@@ -190,6 +186,105 @@ class FrozenProbeArtifact:
     openvla: FrozenActionLinearProbe
     pi05: FrozenActionLinearProbe
     hashes: dict[str, str]
+
+
+@dataclass(frozen=True)
+class FrozenOpenVLAProbeArtifact:
+    root: Path
+    metadata: dict[str, Any]
+    openvla: FrozenActionLinearProbe
+    hashes: dict[str, str]
+
+
+def load_frozen_openvla_probe(
+    artifact_dir: str | Path, *, device: torch.device | str
+) -> FrozenOpenVLAProbeArtifact:
+    """Load only O2 from the expanded provisional authority; never load P2."""
+    root = Path(artifact_dir).expanduser().resolve(strict=True)
+    metadata_path = root / "metadata.json"
+    inventory = json.loads((root / "artifact_inventory.json").read_text())
+    metadata = json.loads(metadata_path.read_text())
+    if (
+        metadata.get("schema_version") != PHASE2_EXPANDED_SEED7_PROVISIONAL_SCHEMA
+        or metadata.get("status") != PHASE2_EXPANDED_SEED7_PROVISIONAL_STATUS
+        or metadata.get("artifact_id")
+        != "phase2-expanded-seed7-provisional-action-probes-v1"
+        or metadata.get("split_rule") != "pilot-v0.3-expanded-split-v1"
+        or metadata.get("seed") != 7
+        or metadata.get("provenance", {}).get("promotion")
+        != "byte-identical copy; no probe refitting"
+        or metadata.get("phase2_status", {}).get("authoritative_phase2b_v3")
+        != "NOT_FROZEN_BLOCKED"
+        or metadata.get("dataset", {}).get("protocol", {}).get("protocol_id")
+        != "pilot-v0.3-expanded-v1"
+        or metadata.get("train_observations") != 1914
+        or metadata.get("heldout_observations") != 456
+        or metadata.get("train_trajectory_groups") != 319
+        or metadata.get("heldout_trajectory_groups") != 76
+    ):
+        raise ActionPredictiveObjectiveError(
+            "invalid expanded seed-7 provisional authority"
+        )
+    expected_probe = {
+        "architecture": "Linear(D,7,bias=False)",
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "steps": 2000,
+        "action_std_epsilon": 1e-6,
+        "probe_reg": 1e-4,
+    }
+    if any(
+        metadata.get("probe", {}).get(key) != value
+        for key, value in expected_probe.items()
+    ):
+        raise ActionPredictiveObjectiveError("frozen probe protocol mismatch")
+    projected = (
+        metadata.get("models", {})
+        .get("openvla", {})
+        .get("representation_nodes", {})
+        .get("projected", {})
+    )
+    if projected.get("name") != "O2" or projected.get("shape") != [256, 4096]:
+        raise ActionPredictiveObjectiveError(
+            "OpenVLA O2 representation contract mismatch"
+        )
+    for relative in ("metadata.json", "split.json"):
+        path = root / relative
+        if not path.is_file() or inventory.get(relative, {}).get("sha256") != _sha256(
+            path
+        ):
+            raise ActionPredictiveObjectiveError(
+                f"probe authority hash mismatch: {relative}"
+            )
+    probe, hashes = _load_probe_node(
+        root,
+        model="openvla",
+        node="o2",
+        device=torch.device(device),
+        inventory=inventory,
+    )
+    expected_files = metadata["models"]["openvla"]["artifacts"]
+    for filename, expected_hash in expected_files.items():
+        relative = f"openvla/o2/{filename}"
+        if inventory.get(relative, {}).get("sha256") != expected_hash:
+            raise ActionPredictiveObjectiveError(
+                f"O2 copied artifact provenance mismatch: {relative}"
+            )
+        if (
+            filename in {"W.pt", "action_stats.npz", "probe.pt", "metrics.json"}
+            and hashes[relative] != expected_hash
+        ):
+            raise ActionPredictiveObjectiveError(f"O2 probe hash mismatch: {relative}")
+    return FrozenOpenVLAProbeArtifact(
+        root=root,
+        metadata=metadata,
+        openvla=probe,
+        hashes={
+            "metadata.json": _sha256(metadata_path),
+            "split.json": _sha256(root / "split.json"),
+            **hashes,
+        },
+    )
 
 
 def _load_probe_node(
@@ -353,7 +448,7 @@ class FrozenActionPredictiveReference:
         p2: torch.Tensor,
         z_o: torch.Tensor,
         z_p: torch.Tensor,
-    ) -> "FrozenActionPredictiveReference":
+    ) -> FrozenActionPredictiveReference:
         _validate_finite_feature(o2, name="clean O2", expected_tail=O2_SHAPE)
         _validate_finite_feature(p2, name="clean P2", expected_tail=P2_SHAPE)
         for name, value in (("Z_O", z_o), ("Z_P", z_p)):
